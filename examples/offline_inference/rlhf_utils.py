@@ -36,9 +36,19 @@ class WorkerExtension:
     should pass the full qualified name as `worker_extension_cls` argument.
     """
 
-    def init_weight_update_group(
+    def init_weight_transfer(
         self, master_address, master_port, rank_offset, world_size
     ):
+        """
+        Initialize weight transfer mechanism.
+        For NCCL backend, this creates a process group with the trainer.
+
+        Args:
+            master_address: IP address of the trainer (rank 0)
+            master_port: Port for the trainer
+            rank_offset: Rank offset for this worker in the process group
+            world_size: Total world size including trainer and all workers
+        """
         from vllm.distributed.parallel_state import get_world_group
 
         rank = get_world_group().rank + rank_offset
@@ -50,23 +60,48 @@ class WorkerExtension:
             self.device,
         )
 
-    def update_weight(self, name, dtype_name, shape):
-        dtype = getattr(torch, dtype_name)
-        weight = torch.empty(shape, dtype=dtype, device="cuda")
-        self.model_update_group.broadcast(
-            weight, src=0, stream=torch.cuda.current_stream()
+    def update_weights(self, names, dtype_names, shapes):
+        """
+        Batched weight update from the trainer.
+
+        Args:
+            names: List of weight parameter names
+            dtype_names: List of dtype names (e.g., ['float32', 'float16'])
+            shapes: List of weight shapes
+        """
+        # Receive all weights via NCCL broadcast
+        weights = []
+        for name, dtype_name, shape in zip(names, dtype_names, shapes):
+            dtype = getattr(torch, dtype_name)
+            weight = torch.empty(shape, dtype=dtype, device="cuda")
+            self.model_update_group.broadcast(
+                weight, src=0, stream=torch.cuda.current_stream()
+            )
+            weights.append((name, weight))
+
+        # Load all weights at once
+        self.model_runner.model.load_weights(weights=weights)
+
+        # Clean up
+        del weights
+
+    def finalize_weight_update(self):
+        """
+        Finalize the weight update by processing weights for quantization/kernel format.
+        This should be called after all weight updates are complete.
+        """
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+        process_weights_after_loading(
+            self.model_runner.model, self.model_config, self.device
         )
-
-        self.model_runner.model.load_weights(weights=[(name, weight)])
-
-        del weight
 
     def check_weights_changed(self):
         """
         Check if the weights are updated to 0.
         """
         weights_updated = True
-        for name, p in self.model_runner.model.named_parameters():
+        for _, p in self.model_runner.model.named_parameters():
             weights_updated = weights_updated and torch.allclose(p, torch.zeros_like(p))
         return weights_updated
 
@@ -163,6 +198,6 @@ class ColocateWorkerExtension:
         Check if the weights are updated to 0.
         """
         weights_updated = True
-        for name, p in self.model_runner.model.named_parameters():
+        for _, p in self.model_runner.model.named_parameters():
             weights_updated = weights_updated and torch.allclose(p, torch.zeros_like(p))
         return weights_updated

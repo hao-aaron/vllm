@@ -40,6 +40,7 @@ from .parallel import ParallelConfig
 from .scheduler import SchedulerConfig
 from .speculative import SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
+from .weight_transfer import WeightTransferConfig
 from .utils import SupportsHash, config
 
 if TYPE_CHECKING:
@@ -116,6 +117,9 @@ class VllmConfig:
     you are using. Contents must be hashable."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
+
+    weight_transfer_config: WeightTransferConfig | None = None
+    """The configurations for weight transfer during RL training."""
 
     def compute_hash(self) -> str:
         """

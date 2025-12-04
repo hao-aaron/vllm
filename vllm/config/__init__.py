@@ -27,6 +27,7 @@ from vllm.config.scheduler import SchedulerConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.speech_to_text import SpeechToTextConfig
 from vllm.config.structured_outputs import StructuredOutputsConfig
+from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.utils import (
     ConfigType,
     SupportsMetricsInfo,
@@ -99,4 +100,5 @@ __all__ = [
     "get_current_vllm_config",
     "set_current_vllm_config",
     "get_layers_from_vllm_config",
+    "WeightTransferConfig",
 ]

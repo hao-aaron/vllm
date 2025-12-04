@@ -51,46 +51,75 @@ class MyLLM(LLM):
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         super().__init__(*args, **kwargs)
 
+def get_physical_gpu_id():
+    import torch
+
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return str(props.uuid)
 
 # Load the OPT-125M model onto GPU 0 for the training workload.
-train_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
-train_model.to("cuda:0")
 
-# Initialize Ray and set the visible devices. The vLLM engine will
-# be placed on GPUs 1 and 2.
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
+@ray.remote
+class TrainModel:
+    def __init__(self):
+        self.train_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
+        self.train_model.to("cuda:0")
+    
+    def init_weight_transfer(self):
+        # Set up the communication channel between the training process and the
+        # inference engine.
+        pass
+
+    def broadcast_weights(self, llm_handle: ray.ObjectRef):
+        self.llm_handle = llm_handle
+        names, dtypes, shapes, ipc_handles = [], [], [], []
+
+        for name, p in self.train_model.named_parameters():
+            names.append(name)
+            dtypes.append(str(p.dtype).split(".")[-1])
+            shapes.append(p.shape)
+
+            from torch.multiprocessing.reductions import reduce_tensor
+
+            weight = p.detach().contiguous()
+            ipc_handle = reduce_tensor(weight)
+            ipc_handle = {get_physical_gpu_id(): ipc_handle}
+            ipc_handles.append(ipc_handle)
+
+        ray.get(self.llm_handle.collective_rpc.remote(
+            "update_weights", args=(names, dtypes, shapes, ipc_handles)))
+
 ray.init(runtime_env={"excludes": [".git/objects/pack/"]})
-# ray.init()
 
 # Create a placement group that reserves GPU 1–2 for the vLLM inference engine.
 # Learn more about Ray placement groups:
-# https://docs.ray.io/en/latest/ray-core/scheduling/placement-group.html
-pg_training = placement_group([{"GPU": 1, "CPU": 0}])
-ray.get(pg_training.ready())
+# https://docs.ray.io/en/latest/placement-groups.html
 
-pg_inference = placement_group([{"GPU": 1, "CPU": 0}] * 2)
-ray.get(pg_inference.ready())
-scheduling_inference = PlacementGroupSchedulingStrategy(
-    placement_group=pg_inference,
-    placement_group_capture_child_tasks=True,
-    placement_group_bundle_index=0,
-)
+pg_colocate = placement_group([{"GPU": 1, "CPU": 0}])
+ray.get(pg_colocate.ready())
 
-# Launch the vLLM inference engine. The `enforce_eager` flag reduces
-# start-up latency.
-# Note: Weight transfer APIs (init_weight_transfer, update_weights,
-# finalize_weight_update) are now native to vLLM workers.
+
+
 llm = ray.remote(
     num_cpus=0,
-    num_gpus=0,
-    scheduling_strategy=scheduling_inference,
+    num_gpus=0.4,
+    scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg_colocate,
+            placement_group_capture_child_tasks=True,
+    ),
 )(MyLLM).remote(
     model="facebook/opt-125m",
     enforce_eager=True,
-    tensor_parallel_size=2,
+    tensor_parallel_size=1,
     distributed_executor_backend="ray",
-    weight_transfer_config=WeightTransferConfig(backend="nccl"),
+    gpu_memory_utilization=0.7,
+    weight_transfer_config=WeightTransferConfig(backend="ipc"),
 )
+
+train_model = TrainModel.options(num_gpus=0.1, num_cpus=0, scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg_colocate, placement_group_capture_child_tasks=True)).remote(llm)
+
+
 
 # Generate text from the prompts.
 prompts = [
@@ -111,19 +140,7 @@ for output in outputs:
     print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
     print("-" * 50)
 
-# Set up the communication channel between the training process and the
-# inference engine.
-master_address = get_ip()
-master_port = get_open_port()
-
-handle = llm.collective_rpc.remote(
-    "init_weight_transfer", args=(master_address, master_port, 1, 3)
-)
-
-model_update_group = stateless_init_process_group(
-    master_address, master_port, 0, 3, torch.device("cuda:0")
-)
-ray.get(handle)
+ray.get(train_model.init_weight_transfer.remote())
 
 # Simulate a training step by zeroing out all model weights.
 # In a real RLHF training loop the weights would be updated using the gradient
@@ -132,25 +149,7 @@ for name, p in train_model.named_parameters():
     p.data.zero_()
 
 # Synchronize the updated weights to the inference engine using batched API.
-# Collect all weight metadata
-names = []
-dtype_names = []
-shapes = []
-for name, p in train_model.named_parameters():
-    names.append(name)
-    dtype_names.append(str(p.dtype).split(".")[-1])
-    shapes.append(p.shape)
-
-# Issue batched RPC call to workers
-handle = llm.collective_rpc.remote(
-    "update_weights", args=(names, dtype_names, shapes)
-)
-
-# Broadcast all weights from trainer
-for name, p in train_model.named_parameters():
-    model_update_group.broadcast(p, src=0, stream=torch.cuda.current_stream())
-
-ray.get(handle)
+ray.get(train_model.broadcast_weights.remote(llm))
 
 # Finalize the weight update (processes weights for quantization/kernel format)
 ray.get(llm.collective_rpc.remote("finalize_weight_update"))

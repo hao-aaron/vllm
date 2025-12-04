@@ -54,6 +54,7 @@ from vllm.config import (
     StructuredOutputsConfig,
     VllmConfig,
     get_attr_docs,
+    WeightTransferConfig,
 )
 from vllm.config.cache import (
     BlockSize,
@@ -574,6 +575,8 @@ class EngineArgs:
         CacheConfig.kv_offloading_backend
     )
     tokens_only: bool = False
+
+    weight_transfer_config: WeightTransferConfig | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
