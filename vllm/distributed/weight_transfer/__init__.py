@@ -4,10 +4,14 @@
 
 from vllm.distributed.weight_transfer.base import WeightTransferEngine
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine
 
+from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.config.parallel import ParallelConfig
 
 WEIGHT_TRANSFER_ENGINE_REGISTRY = {
     "nccl": NCCLWeightTransferEngine,
+    "ipc": IPCWeightTransferEngine,
 }
 
 def register_weight_transfer_engine(name: str, engine: type[WeightTransferEngine]) -> None:
@@ -15,8 +19,20 @@ def register_weight_transfer_engine(name: str, engine: type[WeightTransferEngine
         raise ValueError(f"Weight transfer engine {name} already registered")
     WEIGHT_TRANSFER_ENGINE_REGISTRY[name] = engine
 
+
+def init_transfer_engine(config: WeightTransferConfig, parallel_config: ParallelConfig) -> WeightTransferEngine:
+    if config.backend == "nccl":
+        return NCCLWeightTransferEngine(config, parallel_config)
+    elif config.backend == "ipc":
+        return IPCWeightTransferEngine(config, parallel_config)
+    else:
+        raise ValueError(f"Invalid weight transfer backend: {config.backend}")
+
+
 __all__ = [
     "WeightTransferEngine",
     "NCCLWeightTransferEngine",
     "register_weight_transfer_engine",
+    "WEIGHT_TRANSFER_ENGINE_MAP",
+    "IPCWeightTransferEngine",
 ]

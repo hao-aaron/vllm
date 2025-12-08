@@ -1801,6 +1801,7 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,
             additional_config=self.additional_config,
+            weight_transfer_config=self.weight_transfer_config,
         )
 
         return config

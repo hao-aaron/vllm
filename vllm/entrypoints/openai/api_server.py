@@ -1144,6 +1144,32 @@ if envs.VLLM_SERVER_DEV_MODE:
                 response.append(str(result))
         return JSONResponse(content={"results": response})
 
+@router.post("/init_weight_transfer")
+async def init_weight_transfer(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
+    await engine_client(raw_request).init_weight_transfer(**body)
+    return JSONResponse(content={"message": "Weight transfer initialized"})
+
+@router.post("/update_weights")
+async def update_weights(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
+    await engine_client(raw_request).update_weights(**body)
+    return JSONResponse(content={"message": "Weights updated"})
+
+@router.post("/finalize_weight_update")
+async def finalize_weight_update(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
+    await engine_client(raw_request).finalize_weight_update()
+    return JSONResponse(content={"message": "Weight update finalized"})
 
 @router.post(
     "/scale_elastic_ep",

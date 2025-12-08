@@ -53,6 +53,7 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.distributed.weight_transfer import init_transfer_engine
 
 logger = init_logger(__name__)
 
@@ -88,7 +89,8 @@ class Worker(WorkerBase):
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
 
         # Weight transfer engine (initialized on-demand)
-        self.weight_transfer_engine = None
+        # check if class is in the map
+        self.weight_transfer_engine = init_transfer_engine(self.vllm_config.weight_transfer_config, self.vllm_config.parallel_config)
 
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
@@ -881,9 +883,6 @@ class Worker(WorkerBase):
         from vllm.distributed.parallel_state import get_world_group
         from vllm.distributed.weight_transfer import NCCLWeightTransferEngine
 
-        # Initialize NCCL weight transfer engine
-        self.weight_transfer_engine = NCCLWeightTransferEngine(config=self.vllm_config.weight_transfer_config, parallel_config=self.vllm_config.parallel_config)
-
         self.weight_transfer_engine.init_transfer(
             master_address=master_address,
             master_port=master_port,
@@ -892,7 +891,7 @@ class Worker(WorkerBase):
         )
 
     def update_weights(
-        self, names: list[str], dtype_names: list[str], shapes: list[tuple]
+        self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any
     ) -> None:
         """
         Batched weight update from the trainer.
@@ -901,6 +900,7 @@ class Worker(WorkerBase):
             names: List of weight parameter names
             dtype_names: List of dtype names (e.g., ['float32', 'float16'])
             shapes: List of weight shapes
+            **kwargs: Backend-specific arguments
         """
         if self.weight_transfer_engine is None:
             raise RuntimeError(
@@ -909,7 +909,7 @@ class Worker(WorkerBase):
 
         # Receive weights through the transfer engine
         weights = self.weight_transfer_engine.receive_weights(
-            names=names, dtype_names=dtype_names, shapes=shapes
+            names=names, dtype_names=dtype_names, shapes=shapes, **kwargs
         )
 
         # Load all weights at once

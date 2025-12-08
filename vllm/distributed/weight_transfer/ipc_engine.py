@@ -62,17 +62,22 @@ class IPCWeightTransferEngine(WeightTransferEngine):
         """
         weights = []
         for name, dtype_name, shape, ipc_handle in zip(names, dtype_names, shapes, ipc_handles):
-            device = torch.cuda.current_device()
+            device_index = torch.cuda.current_device()
             props = torch.cuda.get_device_properties()
             physical_gpu_id = str(props.uuid)
 
             handle = ipc_handle[physical_gpu_id]
 
-            device_id = device.index
             func, args = handle
             list_args = list(args)
-            list_args[6] = device_id
+            list_args[6] = device_index
             weight = func(*list_args)
             weights.append((name, weight))
 
         return weights
+    
+    def shutdown(self) -> None:
+        """
+        Shutdown the weight transfer engine.
+        """
+        pass

@@ -795,3 +795,21 @@ class AsyncLLM(EngineClient):
     @property
     def dead_error(self) -> BaseException:
         return EngineDeadError()
+    
+    def init_weight_transfer(self, **kwargs: Any) -> None:
+        """
+        Initialize weight transfer for RL training.
+        """
+        self.collective_rpc("init_weight_transfer", kwargs=kwargs,)
+    
+    def update_weights(self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any) -> None:
+        """
+        Batched weight update for RL training.
+        """
+        self.collective_rpc("update_weights", args=(names, dtype_names, shapes,), kwargs=kwargs)
+    
+    def finalize_weight_update(self) -> None:
+        """
+        Finalize the current weight update during RL training.
+        """
+        self.collective_rpc("finalize_weight_update")

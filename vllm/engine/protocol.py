@@ -168,3 +168,15 @@ class EngineClient(ABC):
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks"""
         raise NotImplementedError
+
+    async def init_weight_transfer(self, **kwargs: Any) -> None:
+        """Initialize weight transfer for RL training."""
+        raise NotImplementedError
+
+    async def update_weights(self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any) -> None:
+        """Batched weight update for RL training."""
+        raise NotImplementedError
+
+    async def finalize_weight_update(self) -> None:
+        """Finalize the current weight update during RL training."""
+        raise NotImplementedError
