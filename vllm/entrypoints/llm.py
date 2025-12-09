@@ -82,6 +82,7 @@ from vllm.utils.counter import Counter
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
+from vllm.distributed.weight_transfer.base import WeightUpdateRequest, WeightTransferInitInfo
 
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
@@ -1766,3 +1767,22 @@ class LLM:
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
         return sorted(outputs, key=lambda x: int(x.request_id))
+    
+    def init_weight_transfer(self, init_info: WeightTransferInitInfo) -> None:
+        """
+        Initialize weight transfer for RL training.
+        """
+        self.llm_engine.collective_rpc("init_weight_transfer", args=(init_info,))
+    
+    def update_weights(self, request: WeightUpdateRequest) -> None:
+        """
+        Update the weights of the model.
+        """
+        self.llm_engine.collective_rpc("update_weights", args=(request,))
+    
+    def finalize_weight_update(self) -> None:
+        """
+        Finalize the weight update by processing weights for quantization/kernel format.
+        This should be called after all weight updates are complete.
+        """
+        self.llm_engine.collective_rpc("finalize_weight_update")

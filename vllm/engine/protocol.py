@@ -18,6 +18,7 @@ from vllm.tasks import SupportedTask
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.processor import Processor
+from vllm.distributed.weight_transfer.base import WeightUpdateRequest, WeightTransferInitInfo
 
 logger = init_logger(__name__)
 
@@ -169,11 +170,11 @@ class EngineClient(ABC):
         """Get supported tasks"""
         raise NotImplementedError
 
-    async def init_weight_transfer(self, **kwargs: Any) -> None:
+    async def init_weight_transfer(self, init_info: WeightTransferInitInfo) -> None:
         """Initialize weight transfer for RL training."""
         raise NotImplementedError
 
-    async def update_weights(self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any) -> None:
+    async def update_weights(self, request: WeightUpdateRequest) -> None:
         """Batched weight update for RL training."""
         raise NotImplementedError
 

@@ -3,14 +3,24 @@
 """Base class for weight transfer engines."""
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Type
 
+from dataclasses import dataclass
 import torch
 
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.parallel import ParallelConfig
 
 
+@dataclass
+class WeightUpdateRequest(ABC):
+    names: list[str]
+    dtype_names: list[str]
+    shapes: list[tuple]
+
+@dataclass
+class WeightTransferInitInfo(ABC):
+    pass
 class WeightTransferEngine(ABC):
     """
     Base class for weight transfer engines that handle transport of model weights
@@ -31,36 +41,41 @@ class WeightTransferEngine(ABC):
         """
         self.config = config
         self.parallel_config = parallel_config
+    
+    @property
+    def init_info_cls(self) -> Type[WeightTransferInitInfo]:
+        """
+        Get the class for the weight transfer init info.
+        """
+        raise NotImplementedError
+    
+    @property
+    def update_request_cls(self) -> Type[WeightUpdateRequest]:
+        """
+        Get the class for the weight update request.
+        """
+        raise NotImplementedError
 
     @abstractmethod
-    def init_transfer(self, **kwargs: Any) -> None:
+    def init_transfer(self, init_info: WeightTransferInitInfo) -> None:
         """
         Initialize the weight transfer mechanism.
         This is called once at the beginning of training.
 
         Args:
-            **kwargs: Backend-specific initialization arguments
-                For NCCL: master_address, master_port, rank_offset, world_size
-                For IPC: (no args needed)
-                For RDMA: rdma_specific_args
+            init_info: WeightTransferInitInfo
         """
         raise NotImplementedError
 
     @abstractmethod
     def receive_weights(
-        self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any
+        self, request: WeightUpdateRequest
     ) -> list[tuple[str, torch.Tensor]]:
         """
         Receive weights from the trainer.
 
         Args:
-            names: List of weight parameter names
-            dtype_names: List of dtype names (e.g., ['float32', 'float16'])
-            shapes: List of weight shapes
-            **kwargs: Backend-specific arguments
-                For NCCL: (no additional args)
-                For IPC: ipc_handles
-                For RDMA: rdma_handles
+            request: WeightUpdateRequest
 
         Returns:
             List of (name, weight_tensor) tuples ready to be loaded into the model

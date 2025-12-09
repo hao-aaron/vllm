@@ -1,13 +1,24 @@
 
 from ast import ListComp
-from typing import Any, List, Dict, Tuple
+from typing import Any, List, Dict, Tuple, Type
 
 import torch
+from dataclasses import dataclass
 
-from vllm.distributed.weight_transfer.base import WeightTransferEngine
+from vllm.distributed.weight_transfer.base import WeightTransferEngine, WeightUpdateRequest, WeightTransferInitInfo
 
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.parallel import ParallelConfig
+
+
+
+@dataclass
+class IPCWeightTransferInitInfo(WeightTransferInitInfo):
+    pass
+
+@dataclass
+class IPCWeightUpdateRequest(WeightUpdateRequest):
+    ipc_handles: list[dict[str, str]]
 
 
 class IPCWeightTransferEngine(WeightTransferEngine):
@@ -27,41 +38,40 @@ class IPCWeightTransferEngine(WeightTransferEngine):
             parallel_config: The configuration for the parallel setup
         """
         super().__init__(config, parallel_config)
+    
+    @property
+    def init_info_cls(self) -> Type[IPCWeightTransferInitInfo]:
+        return IPCWeightTransferInitInfo
 
-    def init_transfer(self, **kwargs: Any) -> None:
+    @property
+    def update_request_cls(self) -> Type[IPCWeightUpdateRequest]:
+        return IPCWeightUpdateRequest
+
+    def init_transfer(self, init_info: IPCWeightTransferInitInfo) -> None:
         """
         Initialize the weight transfer mechanism.
         This is called once at the beginning of training.
 
         Args:
-            **kwargs: Backend-specific initialization arguments
-                For NCCL: master_address, master_port, rank_offset, world_size
-                For IPC: (no args needed)
-                For RDMA: rdma_specific_args
+            init_info: IPCWeightTransferInitInfo
         """
         pass
         
 
     def receive_weights(
-        self, names: List[str], dtype_names: List[str], shapes: List[Tuple], ipc_handles: List[Dict[str, str]]
+        self, request: IPCWeightUpdateRequest
     ) -> List[Tuple[str, torch.Tensor]]:
         """
         Receive weights from the trainer.
 
         Args:
-            names: List of weight parameter names
-            dtype_names: List of dtype names (e.g., ['float32', 'float16'])
-            shapes: List of weight shapes
-            **kwargs: Backend-specific arguments
-                For NCCL: (no additional args)
-                For IPC: ipc_handles
-                For RDMA: rdma_handles
+            request: IPCWeightUpdateRequest
 
         Returns:
             List of (name, weight_tensor) tuples ready to be loaded into the model
         """
-        weights = []
-        for name, dtype_name, shape, ipc_handle in zip(names, dtype_names, shapes, ipc_handles):
+        weights = [] 
+        for name, dtype_name, shape, ipc_handle in zip(request.names, request.dtype_names, request.shapes, request.ipc_handles):
             device_index = torch.cuda.current_device()
             props = torch.cuda.get_device_properties()
             physical_gpu_id = str(props.uuid)

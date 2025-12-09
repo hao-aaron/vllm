@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Weight transfer engines for syncing model weights from trainers to inference workers."""
 
-from vllm.distributed.weight_transfer.base import WeightTransferEngine
-from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine
+from vllm.distributed.weight_transfer.base import WeightTransferEngine, WeightUpdateRequest, WeightTransferInitInfo
+from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine, NCCLWeightTransferInitInfo, NCCLWeightUpdateRequest
+from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine, IPCWeightTransferInitInfo, IPCWeightUpdateRequest
 
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.parallel import ParallelConfig
@@ -35,4 +35,6 @@ __all__ = [
     "register_weight_transfer_engine",
     "WEIGHT_TRANSFER_ENGINE_MAP",
     "IPCWeightTransferEngine",
+    "WeightUpdateRequest", 
+    "WeightTransferInitInfo",
 ]

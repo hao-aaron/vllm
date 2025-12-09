@@ -47,6 +47,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.distributed.weight_transfer.base import WeightUpdateRequest, WeightTransferInitInfo
 
 logger = init_logger(__name__)
 
@@ -796,17 +797,18 @@ class AsyncLLM(EngineClient):
     def dead_error(self) -> BaseException:
         return EngineDeadError()
     
-    def init_weight_transfer(self, **kwargs: Any) -> None:
+    def init_weight_transfer(self, init_info: WeightTransferInitInfo) -> None:
         """
         Initialize weight transfer for RL training.
         """
-        self.collective_rpc("init_weight_transfer", kwargs=kwargs,)
+
+        self.collective_rpc("init_weight_transfer", args=(init_info,))
     
-    def update_weights(self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any) -> None:
+    def update_weights(self, request: WeightUpdateRequest) -> None:
         """
         Batched weight update for RL training.
         """
-        self.collective_rpc("update_weights", args=(names, dtype_names, shapes,), kwargs=kwargs)
+        self.collective_rpc("update_weights", args=(request,))
     
     def finalize_weight_update(self) -> None:
         """

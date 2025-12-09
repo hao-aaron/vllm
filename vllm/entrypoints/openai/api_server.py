@@ -1150,7 +1150,7 @@ async def init_weight_transfer(raw_request: Request):
         body = await raw_request.json()
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
-    await engine_client(raw_request).init_weight_transfer(**body)
+    await engine_client(raw_request).init_weight_transfer(init_info=body.get("init_info"))
     return JSONResponse(content={"message": "Weight transfer initialized"})
 
 @router.post("/update_weights")
@@ -1159,7 +1159,7 @@ async def update_weights(raw_request: Request):
         body = await raw_request.json()
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
-    await engine_client(raw_request).update_weights(**body)
+    await engine_client(raw_request).update_weights(request=body.get("request"))
     return JSONResponse(content={"message": "Weights updated"})
 
 @router.post("/finalize_weight_update")

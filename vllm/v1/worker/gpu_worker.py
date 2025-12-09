@@ -6,7 +6,7 @@ import gc
 import os
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 import torch
 import torch.distributed
@@ -53,7 +53,8 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm.distributed.weight_transfer import init_transfer_engine
+from vllm.distributed.weight_transfer import init_transfer_engine, WeightUpdateRequest, WeightTransferInitInfo
+from dataclasses import is_dataclass
 
 logger = init_logger(__name__)
 
@@ -868,48 +869,44 @@ class Worker(WorkerBase):
         )
 
     def init_weight_transfer(
-        self, master_address: str, master_port: int, rank_offset: int, world_size: int
+        self, init_info: Union[dict, WeightTransferInitInfo]
     ) -> None:
         """
         Initialize weight transfer mechanism.
         For NCCL backend, this creates a process group with the trainer.
 
         Args:
-            master_address: IP address of the trainer (rank 0)
-            master_port: Port for the trainer
-            rank_offset: Rank offset for this worker in the process group
-            world_size: Total world size including trainer and all workers
+            init_info: WeightTransferInitInfo
         """
-        from vllm.distributed.parallel_state import get_world_group
-        from vllm.distributed.weight_transfer import NCCLWeightTransferEngine
-
+        
+        # Convert dict back to dataclass if it was serialized
+        if isinstance(init_info, dict):
+            init_info = self.weight_transfer_engine.init_info_cls(**init_info)
+        
         self.weight_transfer_engine.init_transfer(
-            master_address=master_address,
-            master_port=master_port,
-            rank_offset=rank_offset,
-            world_size=world_size,
+            init_info=init_info
         )
 
     def update_weights(
-        self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any
+        self, request: Union[dict, WeightUpdateRequest]
     ) -> None:
         """
         Batched weight update from the trainer.
 
         Args:
-            names: List of weight parameter names
-            dtype_names: List of dtype names (e.g., ['float32', 'float16'])
-            shapes: List of weight shapes
-            **kwargs: Backend-specific arguments
+            request: WeightUpdateRequest
         """
         if self.weight_transfer_engine is None:
             raise RuntimeError(
                 "Weight transfer not initialized. Call init_weight_transfer() first."
             )
+        
+        if isinstance(request, dict):
+            request = self.weight_transfer_engine.update_request_cls(**request)
 
         # Receive weights through the transfer engine
         weights = self.weight_transfer_engine.receive_weights(
-            names=names, dtype_names=dtype_names, shapes=shapes, **kwargs
+            request=request
         )
 
         # Load all weights at once

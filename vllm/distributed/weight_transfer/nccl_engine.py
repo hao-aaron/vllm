@@ -2,13 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NCCL-based weight transfer engine."""
 
-from typing import Any
+from typing import Any, Type
 
 import torch
 
-from vllm.distributed.weight_transfer.base import WeightTransferEngine
+from dataclasses import dataclass
+
+from vllm.distributed.weight_transfer.base import WeightTransferEngine, WeightUpdateRequest, WeightTransferInitInfo
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.parallel import ParallelConfig
+
+
+
+@dataclass
+class NCCLWeightTransferInitInfo(WeightTransferInitInfo):
+    master_address: str
+    master_port: int
+    rank_offset: int
+    world_size: int
+
+@dataclass
+class NCCLWeightUpdateRequest(WeightUpdateRequest):
+    pass
 
 class NCCLWeightTransferEngine(WeightTransferEngine):
     """
@@ -29,47 +44,44 @@ class NCCLWeightTransferEngine(WeightTransferEngine):
         super().__init__(config, parallel_config)
         self.model_update_group = None
 
-    def init_transfer(self, **kwargs: Any) -> None:
+    @property
+    def init_info_cls(self) -> Type[NCCLWeightTransferInitInfo]:
+        return NCCLWeightTransferInitInfo
+
+    @property
+    def update_request_cls(self) -> Type[NCCLWeightUpdateRequest]:
+        return NCCLWeightUpdateRequest
+
+    def init_transfer(self, init_info: NCCLWeightTransferInitInfo) -> None:
         """
         Initialize NCCL process group with the trainer.
 
-        Required kwargs:
-            master_address (str): IP address of the trainer (rank 0)
-            master_port (int): Port for the trainer
-            rank_offset (int): Rank offset for this worker in the process group
-            world_size (int): Total world size including trainer and all workers
-            worker_rank (int): The rank of this worker in the inference world group
+        Args: 
+            init_info: NCCLWeightTransferInitInfo
         """
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        master_address = kwargs["master_address"]
-        master_port = kwargs["master_port"]
-        rank_offset = kwargs["rank_offset"]
-        world_size = kwargs["world_size"]
-
         # Calculate the global rank in the trainer-worker process group
         worker_rank = self.parallel_config.rank
-        rank = worker_rank + rank_offset
+        rank = worker_rank + init_info.rank_offset
 
         # Create stateless process group
         pg = StatelessProcessGroup.create(
-            host=master_address, port=master_port, rank=rank, world_size=world_size
+            host=init_info.master_address, port=init_info.master_port, rank=rank, world_size=init_info.world_size
         )
 
         # Initialize NCCL communicator
         self.model_update_group = PyNcclCommunicator(pg, device=torch.cuda.current_device())
 
     def receive_weights(
-        self, names: list[str], dtype_names: list[str], shapes: list[tuple], **kwargs: Any
+        self, request: NCCLWeightUpdateRequest
     ) -> list[tuple[str, torch.Tensor]]:
         """
         Receive weights from trainer via NCCL broadcast.
 
         Args:
-            names: List of weight parameter names
-            dtype_names: List of dtype names (e.g., ['float32', 'float16'])
-            shapes: List of weight shapes
+            request: NCCLWeightUpdateRequest
 
         Returns:
             List of (name, weight_tensor) tuples
@@ -80,7 +92,7 @@ class NCCLWeightTransferEngine(WeightTransferEngine):
             )
 
         weights = []
-        for name, dtype_name, shape in zip(names, dtype_names, shapes):
+        for name, dtype_name, shape in zip(request.names, request.dtype_names, request.shapes):
             # Get the torch dtype
             dtype = getattr(torch, dtype_name)
 
