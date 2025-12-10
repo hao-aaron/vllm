@@ -1,32 +1,46 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Weight transfer engines for syncing model weights from trainers to inference workers."""
+"""
+Weight transfer engines for syncing model weights from trainers
+to inference workers.
+"""
 
-from vllm.distributed.weight_transfer.base import WeightTransferEngine, WeightUpdateRequest, WeightTransferInitInfo
-from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine, NCCLWeightTransferInitInfo, NCCLWeightUpdateRequest
-from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine, IPCWeightTransferInitInfo, IPCWeightUpdateRequest
-
-from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferEngine,
+    WeightTransferInitInfo,
+    WeightUpdateRequest,
+)
+from vllm.distributed.weight_transfer.ipc_engine import (
+    IPCWeightTransferEngine,
+)
+from vllm.distributed.weight_transfer.nccl_engine import (
+    NCCLWeightTransferEngine,
+)
 
 WEIGHT_TRANSFER_ENGINE_REGISTRY = {
     "nccl": NCCLWeightTransferEngine,
     "ipc": IPCWeightTransferEngine,
 }
 
-def register_weight_transfer_engine(name: str, engine: type[WeightTransferEngine]) -> None:
+
+def register_weight_transfer_engine(
+    name: str, engine: type[WeightTransferEngine]
+) -> None:
     if name in WEIGHT_TRANSFER_ENGINE_REGISTRY:
         raise ValueError(f"Weight transfer engine {name} already registered")
     WEIGHT_TRANSFER_ENGINE_REGISTRY[name] = engine
 
 
-def init_transfer_engine(config: WeightTransferConfig, parallel_config: ParallelConfig) -> WeightTransferEngine:
-    if config.backend == "nccl":
-        return NCCLWeightTransferEngine(config, parallel_config)
-    elif config.backend == "ipc":
-        return IPCWeightTransferEngine(config, parallel_config)
-    else:
+def init_transfer_engine(
+    config: WeightTransferConfig, parallel_config: ParallelConfig
+) -> WeightTransferEngine:
+    if config.backend not in WEIGHT_TRANSFER_ENGINE_REGISTRY:
         raise ValueError(f"Invalid weight transfer backend: {config.backend}")
+
+    engine_cls = WEIGHT_TRANSFER_ENGINE_REGISTRY[config.backend]
+    return engine_cls(config, parallel_config)
 
 
 __all__ = [
@@ -35,6 +49,6 @@ __all__ = [
     "register_weight_transfer_engine",
     "WEIGHT_TRANSFER_ENGINE_MAP",
     "IPCWeightTransferEngine",
-    "WeightUpdateRequest", 
+    "WeightUpdateRequest",
     "WeightTransferInitInfo",
 ]

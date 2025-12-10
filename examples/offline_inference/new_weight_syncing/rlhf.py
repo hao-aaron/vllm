@@ -38,8 +38,8 @@ from rlhf_utils import stateless_init_process_group
 from transformers import AutoModelForCausalLM
 
 from vllm import LLM, SamplingParams
-from vllm.utils.network_utils import get_ip, get_open_port
 from vllm.config import WeightTransferConfig
+from vllm.utils.network_utils import get_ip, get_open_port
 
 
 class MyLLM(LLM):
@@ -53,7 +53,9 @@ class MyLLM(LLM):
 
 
 # Load the OPT-125M model onto GPU 0 for the training workload.
-train_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
+train_model = AutoModelForCausalLM.from_pretrained(
+    "facebook/opt-125m", dtype=torch.bfloat16
+)
 train_model.to("cuda:0")
 
 # Initialize Ray and set the visible devices. The vLLM engine will
@@ -116,8 +118,8 @@ for output in outputs:
 master_address = get_ip()
 master_port = get_open_port()
 
-handle = llm.collective_rpc.remote(
-    "init_weight_transfer", args=(master_address, master_port, 1, 3)
+handle = llm.init_weight_transfer.remote(
+    master_address=master_address, master_port=master_port, rank_offset=1, world_size=3
 )
 
 model_update_group = stateless_init_process_group(
@@ -141,10 +143,8 @@ for name, p in train_model.named_parameters():
     dtype_names.append(str(p.dtype).split(".")[-1])
     shapes.append(p.shape)
 
-# Issue batched RPC call to workers
-handle = llm.collective_rpc.remote(
-    "update_weights", args=(names, dtype_names, shapes)
-)
+# Issue update_weights call
+handle = llm.update_weights.remote(names=names, dtype_names=dtype_names, shapes=shapes)
 
 # Broadcast all weights from trainer
 for name, p in train_model.named_parameters():
@@ -153,7 +153,7 @@ for name, p in train_model.named_parameters():
 ray.get(handle)
 
 # Finalize the weight update (processes weights for quantization/kernel format)
-ray.get(llm.collective_rpc.remote("finalize_weight_update"))
+ray.get(llm.finalize_weight_update.remote())
 
 # Generate text with the updated model. The output is expected to be nonsense
 # because the weights are zero.

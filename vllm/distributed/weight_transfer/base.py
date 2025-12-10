@@ -3,24 +3,46 @@
 """Base class for weight transfer engines."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Type
-
 from dataclasses import dataclass
+from typing import Any
+
 import torch
 
-from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.weight_transfer import WeightTransferConfig
 
 
 @dataclass
-class WeightUpdateRequest(ABC):
+class WeightUpdateRequest:
     names: list[str]
     dtype_names: list[str]
-    shapes: list[tuple]
+    shapes: list[list[int]]
+    extras: list[dict[str, Any]]
+
+    def __post_init__(self):
+        num_params = len(self.names)
+        if len(self.dtype_names) != num_params:
+            raise ValueError(
+                f"`dtype_names` should be of the same size as `names`"
+                f" got {len(self.dtype_names)} and {len(self.names)}"
+            )
+        if len(self.shapes) != num_params:
+            raise ValueError(
+                f"`shapes` should be of the same size as `names`"
+                f"got {len(self.shapes)} and {len(self.names)}"
+            )
+        if len(self.extras) != num_params:
+            raise ValueError(
+                f"`extras` should be of the same size as `names`"
+                f"got {len(self.extras)} and {len(self.names)}"
+            )
+
 
 @dataclass
-class WeightTransferInitInfo(ABC):
-    pass
+class WeightTransferInitInfo:
+    init_info: dict[str, Any]
+
+
 class WeightTransferEngine(ABC):
     """
     Base class for weight transfer engines that handle transport of model weights
@@ -31,7 +53,9 @@ class WeightTransferEngine(ABC):
     plugged in.
     """
 
-    def __init__(self, config: WeightTransferConfig, parallel_config: ParallelConfig) -> None:
+    def __init__(
+        self, config: WeightTransferConfig, parallel_config: ParallelConfig
+    ) -> None:
         """
         Initialize the weight transfer engine.
 
@@ -41,41 +65,30 @@ class WeightTransferEngine(ABC):
         """
         self.config = config
         self.parallel_config = parallel_config
-    
-    @property
-    def init_info_cls(self) -> Type[WeightTransferInitInfo]:
-        """
-        Get the class for the weight transfer init info.
-        """
-        raise NotImplementedError
-    
-    @property
-    def update_request_cls(self) -> Type[WeightUpdateRequest]:
-        """
-        Get the class for the weight update request.
-        """
-        raise NotImplementedError
 
-    @abstractmethod
-    def init_transfer(self, init_info: WeightTransferInitInfo) -> None:
+    def init_transfer(self) -> None:  # noqa: B027
         """
         Initialize the weight transfer mechanism.
         This is called once at the beginning of training.
-
-        Args:
-            init_info: WeightTransferInitInfo
         """
-        raise NotImplementedError
+        pass
 
     @abstractmethod
     def receive_weights(
-        self, request: WeightUpdateRequest
+        self,
+        names: list[str],
+        dtype_names: list[str],
+        shapes: list[list[int]],
+        **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
         """
         Receive weights from the trainer.
 
         Args:
-            request: WeightUpdateRequest
+            names: List of parameter names
+            dtype_names: List of dtype names (e.g., "float32", "bfloat16")
+            shapes: List of parameter shapes
+            **kwargs: Backend-specific parameters for weight transfer
 
         Returns:
             List of (name, weight_tensor) tuples ready to be loaded into the model

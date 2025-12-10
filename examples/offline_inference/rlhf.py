@@ -34,12 +34,12 @@ import ray
 import torch
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from examples.offline_inference.rlhf_utils import stateless_init_process_group
 from transformers import AutoModelForCausalLM
 
+from examples.offline_inference.rlhf_utils import stateless_init_process_group
 from vllm import LLM, SamplingParams
-from vllm.utils.network_utils import get_ip, get_open_port
 from vllm.config import WeightTransferConfig
+from vllm.utils.network_utils import get_ip, get_open_port
 
 
 class MyLLM(LLM):
@@ -142,9 +142,7 @@ for name, p in train_model.named_parameters():
     shapes.append(p.shape)
 
 # Issue batched RPC call to workers
-handle = llm.collective_rpc.remote(
-    "update_weights", args=(names, dtype_names, shapes)
-)
+handle = llm.collective_rpc.remote("update_weights", args=(names, dtype_names, shapes))
 
 # Broadcast all weights from trainer
 for name, p in train_model.named_parameters():

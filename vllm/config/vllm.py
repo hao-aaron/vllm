@@ -40,8 +40,8 @@ from .parallel import ParallelConfig
 from .scheduler import SchedulerConfig
 from .speculative import SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
-from .weight_transfer import WeightTransferConfig
 from .utils import SupportsHash, config
+from .weight_transfer import WeightTransferConfig
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig

@@ -34,11 +34,9 @@ import ray
 import torch
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from rlhf_utils import stateless_init_process_group
 from transformers import AutoModelForCausalLM
 
 from vllm import LLM, SamplingParams
-from vllm.utils.network_utils import get_ip, get_open_port
 from vllm.config import WeightTransferConfig
 
 
@@ -53,8 +51,9 @@ class MyLLM(LLM):
         os.environ["VLLM_RAY_PER_WORKER_GPUS"] = "0.4"
         os.environ["VLLM_RAY_BUNDLE_INDICES"] = "0"
         # needed for ipc handle serialization
-        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"]  = "1"
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         super().__init__(*args, **kwargs)
+
 
 def get_physical_gpu_id():
     import torch
@@ -63,18 +62,23 @@ def get_physical_gpu_id():
     props = torch.cuda.get_device_properties(device)
     return str(props.uuid)
 
+
 # Load the OPT-125M model onto GPU 0 for the training workload.
+
+# MODEL_NAME = "facebook/opt-125m"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+
 
 @ray.remote
 class TrainModel:
     def __init__(self, llm_handle: ray.ObjectRef):
-        self.train_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
+        self.train_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME, dtype=torch.bfloat16
+        )
         self.train_model.to("cuda:0")
         self.llm_handle = llm_handle
 
     def init_weight_transfer(self):
-        # Set up the communication channel between the training process and the
-        # inference engine.
         pass
 
     def broadcast_weights(self, llm_handle: ray.ObjectRef):
@@ -93,15 +97,19 @@ class TrainModel:
             ipc_handle = {get_physical_gpu_id(): ipc_handle}
             ipc_handles.append(ipc_handle)
 
-        ray.get(self.llm_handle.collective_rpc.remote(
-            "update_weights", args=(names, dtypes, shapes,), kwargs={"ipc_handles": ipc_handles},))
-    
+        ray.get(
+            self.llm_handle.update_weights.remote(
+                names=names, dtype_names=dtypes, shapes=shapes, ipc_handles=ipc_handles
+            )
+        )
+
     def zero_data(self):
         # Simulate a training step by zeroing out all model weights.
         # In a real RLHF training loop the weights would be updated using the gradient
         # from an RL objective such as PPO on a reward model.
         for name, p in self.train_model.named_parameters():
             p.data.zero_()
+
 
 ray.init(runtime_env={"excludes": [".git/objects/pack/"]})
 
@@ -113,25 +121,30 @@ pg_colocate = placement_group([{"GPU": 1, "CPU": 0}])
 ray.get(pg_colocate.ready())
 
 
-
 llm = ray.remote(
     num_cpus=0,
     num_gpus=0,
     scheduling_strategy=PlacementGroupSchedulingStrategy(
-            placement_group=pg_colocate,
-            placement_group_capture_child_tasks=True,
+        placement_group=pg_colocate,
+        placement_group_capture_child_tasks=True,
     ),
 )(MyLLM).remote(
-    model="facebook/opt-125m",
+    model=MODEL_NAME,
     enforce_eager=True,
     tensor_parallel_size=1,
     distributed_executor_backend="ray",
     gpu_memory_utilization=0.7,
     weight_transfer_config=WeightTransferConfig(backend="ipc"),
+    quantization="fp8",
 )
 
-train_model = TrainModel.options(num_gpus=0.1, num_cpus=0, scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg_colocate, placement_group_capture_child_tasks=True)).remote(llm)
-
+train_model = TrainModel.options(
+    num_gpus=0.1,
+    num_cpus=0,
+    scheduling_strategy=PlacementGroupSchedulingStrategy(
+        placement_group=pg_colocate, placement_group_capture_child_tasks=True
+    ),
+).remote(llm)
 
 
 # Generate text from the prompts.
@@ -161,7 +174,7 @@ train_model.zero_data.remote()
 ray.get(train_model.broadcast_weights.remote(llm))
 
 # Finalize the weight update (processes weights for quantization/kernel format)
-ray.get(llm.collective_rpc.remote("finalize_weight_update"))
+ray.get(llm.finalize_weight_update.remote())
 
 # Generate text with the updated model. The output is expected to be nonsense
 # because the weights are zero.

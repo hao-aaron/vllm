@@ -6,7 +6,7 @@ import gc
 import os
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -29,6 +29,9 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_tp_group,
+)
+from vllm.distributed.weight_transfer import (
+    init_transfer_engine,
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -53,8 +56,6 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm.distributed.weight_transfer import init_transfer_engine, WeightUpdateRequest, WeightTransferInitInfo
-from dataclasses import is_dataclass
 
 logger = init_logger(__name__)
 
@@ -91,7 +92,9 @@ class Worker(WorkerBase):
 
         # Weight transfer engine (initialized on-demand)
         # check if class is in the map
-        self.weight_transfer_engine = init_transfer_engine(self.vllm_config.weight_transfer_config, self.vllm_config.parallel_config)
+        self.weight_transfer_engine = init_transfer_engine(
+            self.vllm_config.weight_transfer_config, self.vllm_config.parallel_config
+        )
 
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
@@ -868,9 +871,7 @@ class Worker(WorkerBase):
             tensorizer_config=tensorizer_config,
         )
 
-    def init_weight_transfer(
-        self, init_info: Union[dict, WeightTransferInitInfo]
-    ) -> None:
+    def init_weight_transfer(self, **kwargs) -> None:
         """
         Initialize weight transfer mechanism.
         For NCCL backend, this creates a process group with the trainer.
@@ -878,17 +879,14 @@ class Worker(WorkerBase):
         Args:
             init_info: WeightTransferInitInfo
         """
-        
-        # Convert dict back to dataclass if it was serialized
-        if isinstance(init_info, dict):
-            init_info = self.weight_transfer_engine.init_info_cls(**init_info)
-        
-        self.weight_transfer_engine.init_transfer(
-            init_info=init_info
-        )
+        self.weight_transfer_engine.init_transfer(**kwargs)
 
     def update_weights(
-        self, request: Union[dict, WeightUpdateRequest]
+        self,
+        names: list[str],
+        dtype_names: list[str],
+        shapes: list[list[int]],
+        **kwargs,
     ) -> None:
         """
         Batched weight update from the trainer.
@@ -897,16 +895,11 @@ class Worker(WorkerBase):
             request: WeightUpdateRequest
         """
         if self.weight_transfer_engine is None:
-            raise RuntimeError(
-                "Weight transfer not initialized. Call init_weight_transfer() first."
-            )
-        
-        if isinstance(request, dict):
-            request = self.weight_transfer_engine.update_request_cls(**request)
+            raise RuntimeError("Weight transfer not initialized.")
 
         # Receive weights through the transfer engine
         weights = self.weight_transfer_engine.receive_weights(
-            request=request
+            names, dtype_names, shapes, **kwargs
         )
 
         # Load all weights at once
@@ -929,7 +922,7 @@ class Worker(WorkerBase):
     def shutdown(self) -> None:
         if runner := getattr(self, "model_runner", None):
             runner.ensure_kv_transfer_shutdown()
-        
+
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
 

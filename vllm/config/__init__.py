@@ -27,7 +27,6 @@ from vllm.config.scheduler import SchedulerConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.speech_to_text import SpeechToTextConfig
 from vllm.config.structured_outputs import StructuredOutputsConfig
-from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.config.utils import (
     ConfigType,
     SupportsMetricsInfo,
@@ -43,6 +42,7 @@ from vllm.config.vllm import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
+from vllm.config.weight_transfer import WeightTransferConfig
 
 # __all__ should only contain classes and functions.
 # Types and globals should be imported from their respective modules.

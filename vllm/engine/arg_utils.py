@@ -53,8 +53,8 @@ from vllm.config import (
     SpeculativeConfig,
     StructuredOutputsConfig,
     VllmConfig,
-    get_attr_docs,
     WeightTransferConfig,
+    get_attr_docs,
 )
 from vllm.config.cache import (
     BlockSize,

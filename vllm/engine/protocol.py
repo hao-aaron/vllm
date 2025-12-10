@@ -7,6 +7,10 @@ from collections.abc import AsyncGenerator, Iterable, Mapping
 from typing import Any
 
 from vllm.config import ModelConfig, VllmConfig
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferInitInfo,
+    WeightUpdateRequest,
+)
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -18,7 +22,6 @@ from vllm.tasks import SupportedTask
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.processor import Processor
-from vllm.distributed.weight_transfer.base import WeightUpdateRequest, WeightTransferInitInfo
 
 logger = init_logger(__name__)
 

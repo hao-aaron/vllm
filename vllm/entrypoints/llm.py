@@ -31,6 +31,10 @@ from vllm.config.model import (
     RunnerOption,
     TokenizerMode,
 )
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferInitInfo,
+    WeightUpdateRequest,
+)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -82,7 +86,6 @@ from vllm.utils.counter import Counter
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
-from vllm.distributed.weight_transfer.base import WeightUpdateRequest, WeightTransferInitInfo
 
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
@@ -1767,19 +1770,25 @@ class LLM:
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
         return sorted(outputs, key=lambda x: int(x.request_id))
-    
+
     def init_weight_transfer(self, init_info: WeightTransferInitInfo) -> None:
         """
         Initialize weight transfer for RL training.
         """
-        self.llm_engine.collective_rpc("init_weight_transfer", args=(init_info,))
-    
+        self.llm_engine.collective_rpc(
+            "init_weight_transfer", kwargs=init_info.init_info
+        )
+
     def update_weights(self, request: WeightUpdateRequest) -> None:
         """
         Update the weights of the model.
         """
-        self.llm_engine.collective_rpc("update_weights", args=(request,))
-    
+        self.llm_engine.collective_rpc(
+            "update_weights",
+            args=(request.names, request.dtype_names, request.shapes),
+            kwargs={"extras": request.extras},
+        )
+
     def finalize_weight_update(self) -> None:
         """
         Finalize the weight update by processing weights for quantization/kernel format.
