@@ -39,6 +39,10 @@ from transformers import AutoModelForCausalLM
 
 from vllm import LLM, SamplingParams
 from vllm.config import WeightTransferConfig
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferInitInfo,
+    WeightUpdateRequest,
+)
 from vllm.utils.network_utils import get_ip, get_open_port
 
 
@@ -119,7 +123,14 @@ master_address = get_ip()
 master_port = get_open_port()
 
 handle = llm.init_weight_transfer.remote(
-    master_address=master_address, master_port=master_port, rank_offset=1, world_size=3
+    WeightTransferInitInfo(
+        init_kwargs=dict(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=1,
+            world_size=3,
+        )
+    )
 )
 
 model_update_group = stateless_init_process_group(
@@ -144,7 +155,9 @@ for name, p in train_model.named_parameters():
     shapes.append(p.shape)
 
 # Issue update_weights call
-handle = llm.update_weights.remote(names=names, dtype_names=dtype_names, shapes=shapes)
+handle = llm.update_weights.remote(
+    WeightUpdateRequest(names=names, dtype_names=dtype_names, shapes=shapes)
+)
 
 # Broadcast all weights from trainer
 for name, p in train_model.named_parameters():

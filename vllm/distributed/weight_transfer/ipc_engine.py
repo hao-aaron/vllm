@@ -31,7 +31,7 @@ class IPCWeightTransferEngine(WeightTransferEngine):
         """
         super().__init__(config, parallel_config)
 
-    def init_transfer(self) -> None:
+    def init_transfer(self, **kwargs) -> None:
         """
         Initialize the weight transfer mechanism.
         This is called once at the beginning of training.

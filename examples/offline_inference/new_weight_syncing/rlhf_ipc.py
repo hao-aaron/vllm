@@ -38,6 +38,10 @@ from transformers import AutoModelForCausalLM
 
 from vllm import LLM, SamplingParams
 from vllm.config import WeightTransferConfig
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferInitInfo,
+    WeightUpdateRequest,
+)
 
 
 class MyLLM(LLM):
@@ -79,7 +83,7 @@ class TrainModel:
         self.llm_handle = llm_handle
 
     def init_weight_transfer(self):
-        pass
+        self.llm_handle.init_weight_transfer.remote(WeightTransferInitInfo())
 
     def broadcast_weights(self, llm_handle: ray.ObjectRef):
         self.llm_handle = llm_handle
@@ -99,7 +103,12 @@ class TrainModel:
 
         ray.get(
             self.llm_handle.update_weights.remote(
-                names=names, dtype_names=dtypes, shapes=shapes, ipc_handles=ipc_handles
+                WeightUpdateRequest(
+                    names=names,
+                    dtype_names=dtypes,
+                    shapes=shapes,
+                    extras=dict(ipc_handles=ipc_handles),
+                )
             )
         )
 
@@ -135,7 +144,6 @@ llm = ray.remote(
     distributed_executor_backend="ray",
     gpu_memory_utilization=0.7,
     weight_transfer_config=WeightTransferConfig(backend="ipc"),
-    quantization="fp8",
 )
 
 train_model = TrainModel.options(

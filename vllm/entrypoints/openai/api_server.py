@@ -39,7 +39,7 @@ from typing_extensions import assert_never
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed.weight_transfer import WeightTransferInitInfo, WeightUpdateRequest
+from vllm.distributed.weight_transfer import WeightUpdateRequest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.protocol import (
@@ -1158,9 +1158,7 @@ async def init_weight_transfer(raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Missing 'init_info' in request body",
         )
-    await engine_client(raw_request).init_weight_transfer(
-        init_info=WeightTransferInitInfo(init_info=init_info)
-    )
+    await engine_client(raw_request).init_weight_transfer(init_info)
     return JSONResponse(content={"message": "Weight transfer initialized"})
 
 

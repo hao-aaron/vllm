@@ -3,7 +3,7 @@
 """Base class for weight transfer engines."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -17,7 +17,7 @@ class WeightUpdateRequest:
     names: list[str]
     dtype_names: list[str]
     shapes: list[list[int]]
-    extras: list[dict[str, Any]]
+    extras: dict[str, list[Any]] = field(default_factory=dict)
 
     def __post_init__(self):
         num_params = len(self.names)
@@ -31,16 +31,20 @@ class WeightUpdateRequest:
                 f"`shapes` should be of the same size as `names`"
                 f"got {len(self.shapes)} and {len(self.names)}"
             )
-        if len(self.extras) != num_params:
-            raise ValueError(
-                f"`extras` should be of the same size as `names`"
-                f"got {len(self.extras)} and {len(self.names)}"
-            )
+        if not isinstance(self.extras, dict):
+            raise ValueError("`extras` must be a dictionary")
+
+        for key in self.extras:
+            if len(self.extras[key]) != num_params:
+                raise ValueError(
+                    f"`extras[{key}]` should be of the same size as `names`"
+                    f"got {len(self.extras[key])} and {len(self.names)}"
+                )
 
 
 @dataclass
 class WeightTransferInitInfo:
-    init_info: dict[str, Any]
+    init_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 class WeightTransferEngine(ABC):
@@ -66,12 +70,13 @@ class WeightTransferEngine(ABC):
         self.config = config
         self.parallel_config = parallel_config
 
-    def init_transfer(self) -> None:  # noqa: B027
+    @abstractmethod
+    def init_transfer(self, **kwargs) -> None:  # noqa: B027
         """
         Initialize the weight transfer mechanism.
         This is called once at the beginning of training.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def receive_weights(

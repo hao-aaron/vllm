@@ -1776,7 +1776,7 @@ class LLM:
         Initialize weight transfer for RL training.
         """
         self.llm_engine.collective_rpc(
-            "init_weight_transfer", kwargs=init_info.init_info
+            "init_weight_transfer", kwargs=init_info.init_kwargs
         )
 
     def update_weights(self, request: WeightUpdateRequest) -> None:
@@ -1786,7 +1786,7 @@ class LLM:
         self.llm_engine.collective_rpc(
             "update_weights",
             args=(request.names, request.dtype_names, request.shapes),
-            kwargs={"extras": request.extras},
+            kwargs=request.extras,
         )
 
     def finalize_weight_update(self) -> None:

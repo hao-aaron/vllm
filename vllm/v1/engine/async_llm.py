@@ -805,7 +805,7 @@ class AsyncLLM(EngineClient):
         Initialize weight transfer for RL training.
         """
 
-        await self.collective_rpc("init_weight_transfer", kwargs=init_info.init_info)
+        await self.collective_rpc("init_weight_transfer", kwargs=init_info.init_kwargs)
 
     async def update_weights(self, request: WeightUpdateRequest) -> None:
         """
@@ -814,7 +814,7 @@ class AsyncLLM(EngineClient):
         await self.collective_rpc(
             "update_weights",
             args=(request.names, request.dtype_names, request.shapes),
-            kwargs={"extras": request.extras},
+            kwargs=request.extras,
         )
 
     async def finalize_weight_update(self) -> None:

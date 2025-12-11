@@ -875,9 +875,6 @@ class Worker(WorkerBase):
         """
         Initialize weight transfer mechanism.
         For NCCL backend, this creates a process group with the trainer.
-
-        Args:
-            init_info: WeightTransferInitInfo
         """
         self.weight_transfer_engine.init_transfer(**kwargs)
 
