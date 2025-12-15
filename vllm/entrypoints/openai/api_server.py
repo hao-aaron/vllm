@@ -40,6 +40,7 @@ from typing_extensions import assert_never
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.weight_transfer import WeightUpdateRequest
+from vllm.distributed.weight_transfer.base import WeightTransferInitRequest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.protocol import (
@@ -1158,7 +1159,9 @@ async def init_weight_transfer(raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Missing 'init_info' in request body",
         )
-    await engine_client(raw_request).init_weight_transfer(init_info)
+    await engine_client(raw_request).init_weight_transfer(
+        WeightTransferInitRequest(init_info=init_info)
+    )
     return JSONResponse(content={"message": "Weight transfer initialized"})
 
 
@@ -1168,29 +1171,14 @@ async def update_weights(raw_request: Request):
         body = await raw_request.json()
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
-    names = body.get("names")
-    if names is None:
+    update_info = body.get("update_info")
+    if update_info is None:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Missing 'names' in request body",
+            detail="Missing 'update_info' in request body",
         )
-    shapes = body.get("shapes")
-    if shapes is None:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Missing 'shapes' in request body",
-        )
-    dtype_names = body.get("dtype_names")
-    if dtype_names is None:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="Missing 'dtype_names' in request body",
-        )
-    extras = body.get("extras", {})
     await engine_client(raw_request).update_weights(
-        request=WeightUpdateRequest(
-            names=names, dtype_names=dtype_names, shapes=shapes, extras=extras
-        )
+        request=WeightUpdateRequest(update_info=update_info)
     )
     return JSONResponse(content={"message": "Weights updated"})
 
