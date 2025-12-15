@@ -2,22 +2,63 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NCCL-based weight transfer engine."""
 
+from dataclasses import dataclass
+
 import torch
 
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
+    BackendInitInfo,
+    BackendUpdateInfo,
     WeightTransferEngine,
 )
 
 
-class NCCLWeightTransferEngine(WeightTransferEngine):
+@dataclass
+class NCCLInitInfo(BackendInitInfo):
+    """Initialization info for NCCL weight transfer backend."""
+
+    master_address: str
+    master_port: int
+    rank_offset: int
+    world_size: int
+
+
+@dataclass
+class NCCLUpdateInfo(BackendUpdateInfo):
+    """Update info for NCCL weight transfer backend."""
+
+    names: list[str]
+    dtype_names: list[str]
+    shapes: list[list[int]]
+
+    def __post_init__(self):
+        """Validate that all lists have the same length."""
+        num_params = len(self.names)
+        if len(self.dtype_names) != num_params:
+            raise ValueError(
+                f"`dtype_names` should be of the same size as `names`: "
+                f"got {len(self.dtype_names)} and {len(self.names)}"
+            )
+        if len(self.shapes) != num_params:
+            raise ValueError(
+                f"`shapes` should be of the same size as `names`: "
+                f"got {len(self.shapes)} and {len(self.names)}"
+            )
+
+
+class NCCLWeightTransferEngine(WeightTransferEngine[NCCLInitInfo, NCCLUpdateInfo]):
     """
     Weight transfer engine using NCCL for communication between trainer and workers.
 
     This implementation uses NCCL broadcast operations to transfer weights from
     the trainer (rank 0) to all inference workers in a process group.
     """
+
+    # Define backend-specific dataclass types
+    init_info_cls = NCCLInitInfo
+    update_info_cls = NCCLUpdateInfo
 
     def __init__(
         self, config: WeightTransferConfig, parallel_config: ParallelConfig
@@ -32,37 +73,27 @@ class NCCLWeightTransferEngine(WeightTransferEngine):
         super().__init__(config, parallel_config)
         self.model_update_group = None
 
-    def init_transfer(  # type: ignore[override]
-        self,
-        master_address: str,
-        master_port: int,
-        rank_offset: int,
-        world_size: int,
-        **kwargs,
-    ) -> None:
+    def init_transfer(self, init_info: NCCLInitInfo) -> None:
         """
         Initialize NCCL process group with the trainer.
 
         Args:
-            master_address: Address of the master process
-            master_port: Port of the master process
-            rank_offset: Offset to add to worker rank to get global rank
-            world_size: Total number of processes in the process group
-            **kwargs: Additional unused parameters
+            init_info: NCCL initialization info containing master address, port,
+                      rank offset, and world size
         """
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
         # Calculate the global rank in the trainer-worker process group
         worker_rank = self.parallel_config.rank
-        rank = worker_rank + rank_offset
+        rank = worker_rank + init_info.rank_offset
 
         # Create stateless process group
         pg = StatelessProcessGroup.create(
-            host=master_address,
-            port=master_port,
+            host=init_info.master_address,
+            port=init_info.master_port,
             rank=rank,
-            world_size=world_size,
+            world_size=init_info.world_size,
         )
 
         # Initialize NCCL communicator
@@ -71,20 +102,13 @@ class NCCLWeightTransferEngine(WeightTransferEngine):
         )
 
     def receive_weights(
-        self,
-        names: list[str],
-        dtype_names: list[str],
-        shapes: list[list[int]],
-        **kwargs,
+        self, update_info: NCCLUpdateInfo
     ) -> list[tuple[str, torch.Tensor]]:
         """
         Receive weights from trainer via NCCL broadcast.
 
         Args:
-            names: List of parameter names
-            dtype_names: List of dtype names (e.g., "float32", "bfloat16")
-            shapes: List of parameter shapes
-            **kwargs: Additional parameters
+            update_info: NCCL update info containing parameter names, dtypes, and shapes
 
         Returns:
             List of (name, weight_tensor) tuples
@@ -95,7 +119,9 @@ class NCCLWeightTransferEngine(WeightTransferEngine):
             )
 
         weights = []
-        for name, dtype_name, shape in zip(names, dtype_names, shapes):
+        for name, dtype_name, shape in zip(
+            update_info.names, update_info.dtype_names, update_info.shapes
+        ):
             # Get the torch dtype
             dtype = getattr(torch, dtype_name)
 

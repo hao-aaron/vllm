@@ -1,34 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Demonstrates reinforcement learning from human feedback (RLHF) using vLLM and Ray.
+Demonstrates reinforcement learning from human feedback (RLHF) using vLLM and Ray,
+with new weight syncing APIs
 
-The script separates training and inference workloads onto distinct GPUs
-so that Ray can manage process placement and inter-process communication.
-A Hugging Face Transformer model occupies GPU 0 for training, whereas a
-tensor-parallel vLLM inference engine occupies GPU 1–2.
+The script colocates the training and inference workloads onto the same GPU using Ray.
 
 The example performs the following steps:
 
-* Load the training model on GPU 0.
-* Split the inference model across GPUs 1–2 using vLLM's tensor parallelism
-  and Ray placement groups.
+* Request a placement group of 1 GPU.
+* Place the inference model on the above GPU using the placement group.
+* Place and load the training model on the same GPU using the placement group.
 * Generate text from a list of prompts using the inference engine.
 * Update the weights of the training model and broadcast the updated weights
   to the inference engine by using a Ray collective RPC group. Note that
   for demonstration purposes we simply zero out the weights.
 
-For a production-ready implementation that supports multiple training and
-inference replicas, see the OpenRLHF framework:
-https://github.com/OpenRLHF/OpenRLHF
-
-This example assumes a single-node cluster with three GPUs, but Ray
-supports multi-node clusters. vLLM expects the GPUs are only used for vLLM
-workloads. Residual GPU activity interferes with vLLM memory profiling and
-causes unexpected behavior.
+This example assumes a single-node cluster with a single GPUs,
+but can be extended to multiple GPUs.
 """
 
 import os
+from dataclasses import asdict
 
 import ray
 import torch
@@ -39,9 +32,10 @@ from transformers import AutoModelForCausalLM
 from vllm import LLM, SamplingParams
 from vllm.config import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
-    WeightTransferInitInfo,
+    WeightTransferInitRequest,
     WeightUpdateRequest,
 )
+from vllm.distributed.weight_transfer.ipc_engine import IPCUpdateInfo
 
 
 class MyLLM(LLM):
@@ -60,8 +54,6 @@ class MyLLM(LLM):
 
 
 def get_physical_gpu_id():
-    import torch
-
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
     return str(props.uuid)
@@ -77,13 +69,13 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 class TrainModel:
     def __init__(self, llm_handle: ray.ObjectRef):
         self.train_model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, dtype=torch.bfloat16
+            MODEL_NAME,
         )
         self.train_model.to("cuda:0")
         self.llm_handle = llm_handle
 
     def init_weight_transfer(self):
-        self.llm_handle.init_weight_transfer.remote(WeightTransferInitInfo())
+        self.llm_handle.init_weight_transfer.remote(WeightTransferInitRequest())
 
     def broadcast_weights(self, llm_handle: ray.ObjectRef):
         self.llm_handle = llm_handle
@@ -104,10 +96,14 @@ class TrainModel:
         ray.get(
             self.llm_handle.update_weights.remote(
                 WeightUpdateRequest(
-                    names=names,
-                    dtype_names=dtypes,
-                    shapes=shapes,
-                    extras=dict(ipc_handles=ipc_handles),
+                    update_info=asdict(
+                        IPCUpdateInfo(
+                            names=names,
+                            dtype_names=dtypes,
+                            shapes=shapes,
+                            ipc_handles=ipc_handles,
+                        )
+                    )
                 )
             )
         )

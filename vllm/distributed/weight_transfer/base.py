@@ -4,50 +4,48 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 import torch
 
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 
+TInitInfo = TypeVar("TInitInfo", bound="BackendInitInfo")
+TUpdateInfo = TypeVar("TUpdateInfo", bound="BackendUpdateInfo")
+
+
+# Base protocols for backend-specific dataclasses
+@dataclass
+class BackendInitInfo(ABC):  # noqa: B024
+    """Base class for backend-specific initialization info."""
+
+    pass
+
+
+@dataclass
+class BackendUpdateInfo(ABC):  # noqa: B024
+    """Base class for backend-specific weight update info."""
+
+    pass
+
+
+# API-level request classes (accept dicts for backend-agnostic serialization)
+@dataclass
+class WeightTransferInitRequest:
+    """API-level weight transfer initialization request."""
+
+    init_info: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class WeightUpdateRequest:
-    names: list[str]
-    dtype_names: list[str]
-    shapes: list[list[int]]
-    extras: dict[str, list[Any]] = field(default_factory=dict)
+    """API-level weight update request."""
 
-    def __post_init__(self):
-        num_params = len(self.names)
-        if len(self.dtype_names) != num_params:
-            raise ValueError(
-                f"`dtype_names` should be of the same size as `names`"
-                f" got {len(self.dtype_names)} and {len(self.names)}"
-            )
-        if len(self.shapes) != num_params:
-            raise ValueError(
-                f"`shapes` should be of the same size as `names`"
-                f"got {len(self.shapes)} and {len(self.names)}"
-            )
-        if not isinstance(self.extras, dict):
-            raise ValueError("`extras` must be a dictionary")
-
-        for key in self.extras:
-            if len(self.extras[key]) != num_params:
-                raise ValueError(
-                    f"`extras[{key}]` should be of the same size as `names`"
-                    f"got {len(self.extras[key])} and {len(self.names)}"
-                )
+    update_info: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class WeightTransferInitInfo:
-    init_kwargs: dict[str, Any] = field(default_factory=dict)
-
-
-class WeightTransferEngine(ABC):
+class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     """
     Base class for weight transfer engines that handle transport of model weights
     from a trainer to inference workers.
@@ -55,7 +53,15 @@ class WeightTransferEngine(ABC):
     This abstraction separates weight transfer transport logic from the worker
     implementation, allowing different backends (NCCL, CUDA IPC, RDMA) to be
     plugged in.
+
+    Subclasses should define:
+        init_info_cls: Type of backend-specific initialization info
+        update_info_cls: Type of backend-specific update info
     """
+
+    # Subclasses should override these class attributes
+    init_info_cls: type[TInitInfo]
+    update_info_cls: type[TUpdateInfo]
 
     def __init__(
         self, config: WeightTransferConfig, parallel_config: ParallelConfig
@@ -70,30 +76,67 @@ class WeightTransferEngine(ABC):
         self.config = config
         self.parallel_config = parallel_config
 
+    def parse_init_info(self, init_dict: dict[str, Any]) -> TInitInfo:
+        """
+        Construct typed init info from dict with validation.
+
+        Args:
+            init_dict: Dictionary containing backend-specific initialization parameters
+
+        Returns:
+            Typed backend-specific init info dataclass
+
+        Raises:
+            ValueError: If init_dict is invalid for this backend
+        """
+        try:
+            return self.init_info_cls(**init_dict)
+        except TypeError as e:
+            raise ValueError(
+                f"Invalid init_info for {self.__class__.__name__}: {e}"
+            ) from e
+
+    def parse_update_info(self, update_dict: dict[str, Any]) -> TUpdateInfo:
+        """
+        Construct typed update info from dict with validation.
+
+        Args:
+            update_dict: Dictionary containing backend-specific update parameters
+
+        Returns:
+            Typed backend-specific update info dataclass
+
+        Raises:
+            ValueError: If update_dict is invalid for this backend
+        """
+        try:
+            return self.update_info_cls(**update_dict)
+        except TypeError as e:
+            raise ValueError(
+                f"Invalid update_info for {self.__class__.__name__}: {e}"
+            ) from e
+
     @abstractmethod
-    def init_transfer(self, **kwargs) -> None:  # noqa: B027
+    def init_transfer(self, init_info: TInitInfo) -> None:
         """
         Initialize the weight transfer mechanism.
         This is called once at the beginning of training.
+
+        Args:
+            init_info: Backend-specific initialization info
         """
         raise NotImplementedError
 
     @abstractmethod
     def receive_weights(
-        self,
-        names: list[str],
-        dtype_names: list[str],
-        shapes: list[list[int]],
-        **kwargs,
+        self, update_info: TUpdateInfo
     ) -> list[tuple[str, torch.Tensor]]:
         """
         Receive weights from the trainer.
 
         Args:
-            names: List of parameter names
-            dtype_names: List of dtype names (e.g., "float32", "bfloat16")
-            shapes: List of parameter shapes
-            **kwargs: Backend-specific parameters for weight transfer
+            update_info: Backend-specific update info containing parameter metadata
+                        and any backend-specific data (e.g., IPC handles)
 
         Returns:
             List of (name, weight_tensor) tuples ready to be loaded into the model

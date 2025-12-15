@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Demonstrates reinforcement learning from human feedback (RLHF) using vLLM and Ray.
+Demonstrates reinforcement learning from human feedback (RLHF) using vLLM and Ray,
+with new weight syncing APIs.
 
 The script separates training and inference workloads onto distinct GPUs
 so that Ray can manage process placement and inter-process communication.
@@ -18,10 +19,6 @@ The example performs the following steps:
   to the inference engine by using a Ray collective RPC group. Note that
   for demonstration purposes we simply zero out the weights.
 
-For a production-ready implementation that supports multiple training and
-inference replicas, see the OpenRLHF framework:
-https://github.com/OpenRLHF/OpenRLHF
-
 This example assumes a single-node cluster with three GPUs, but Ray
 supports multi-node clusters. vLLM expects the GPUs are only used for vLLM
 workloads. Residual GPU activity interferes with vLLM memory profiling and
@@ -29,6 +26,7 @@ causes unexpected behavior.
 """
 
 import os
+from dataclasses import asdict
 
 import ray
 import torch
@@ -40,9 +38,10 @@ from transformers import AutoModelForCausalLM
 from vllm import LLM, SamplingParams
 from vllm.config import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
-    WeightTransferInitInfo,
+    WeightTransferInitRequest,
     WeightUpdateRequest,
 )
+from vllm.distributed.weight_transfer.nccl_engine import NCCLInitInfo, NCCLUpdateInfo
 from vllm.utils.network_utils import get_ip, get_open_port
 
 
@@ -123,12 +122,14 @@ master_address = get_ip()
 master_port = get_open_port()
 
 handle = llm.init_weight_transfer.remote(
-    WeightTransferInitInfo(
-        init_kwargs=dict(
-            master_address=master_address,
-            master_port=master_port,
-            rank_offset=1,
-            world_size=3,
+    WeightTransferInitRequest(
+        init_info=asdict(
+            NCCLInitInfo(
+                master_address=master_address,
+                master_port=master_port,
+                rank_offset=1,
+                world_size=3,
+            )
         )
     )
 )
@@ -154,9 +155,17 @@ for name, p in train_model.named_parameters():
     dtype_names.append(str(p.dtype).split(".")[-1])
     shapes.append(p.shape)
 
-# Issue update_weights call
+# Issue update_weights call with NCCL-specific update info
 handle = llm.update_weights.remote(
-    WeightUpdateRequest(names=names, dtype_names=dtype_names, shapes=shapes)
+    WeightUpdateRequest(
+        update_info=asdict(
+            NCCLUpdateInfo(
+                names=names,
+                dtype_names=dtype_names,
+                shapes=shapes,
+            )
+        )
+    )
 )
 
 # Broadcast all weights from trainer

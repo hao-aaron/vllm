@@ -8,7 +8,7 @@ from typing import Any
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.distributed.weight_transfer.base import (
-    WeightTransferInitInfo,
+    WeightTransferInitRequest,
     WeightUpdateRequest,
 )
 from vllm.inputs.data import PromptType
@@ -173,7 +173,9 @@ class EngineClient(ABC):
         """Get supported tasks"""
         raise NotImplementedError
 
-    async def init_weight_transfer(self, init_info: WeightTransferInitInfo) -> None:
+    async def init_weight_transfer(
+        self, init_request: WeightTransferInitRequest
+    ) -> None:
         """Initialize weight transfer for RL training."""
         raise NotImplementedError
 

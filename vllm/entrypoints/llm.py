@@ -32,7 +32,7 @@ from vllm.config.model import (
     TokenizerMode,
 )
 from vllm.distributed.weight_transfer.base import (
-    WeightTransferInitInfo,
+    WeightTransferInitRequest,
     WeightUpdateRequest,
 )
 from vllm.engine.arg_utils import EngineArgs
@@ -1771,22 +1771,38 @@ class LLM:
         # its previous requests.
         return sorted(outputs, key=lambda x: int(x.request_id))
 
-    def init_weight_transfer(self, init_info: WeightTransferInitInfo) -> None:
+    def init_weight_transfer(self, request: WeightTransferInitRequest) -> None:
         """
         Initialize weight transfer for RL training.
+
+        Args:
+            request: Weight transfer initialization request with backend-specific info
         """
+
+        if isinstance(request, WeightTransferInitRequest):
+            init_info_dict = request.init_info
+        else:
+            raise TypeError(f"Expected WeightTransferInitRequest, got {type(request)}")
+
         self.llm_engine.collective_rpc(
-            "init_weight_transfer", kwargs=init_info.init_kwargs
+            "init_weight_transfer", kwargs={"init_info": init_info_dict}
         )
 
     def update_weights(self, request: WeightUpdateRequest) -> None:
         """
         Update the weights of the model.
+
+        Args:
+            request: Weight update request with backend-specific update info
         """
+
+        if hasattr(request, "update_info"):
+            update_info_dict = request.update_info
+        else:
+            raise TypeError(f"Invalid `WeightUpdateRequest` format: {type(request)}")
+
         self.llm_engine.collective_rpc(
-            "update_weights",
-            args=(request.names, request.dtype_names, request.shapes),
-            kwargs=request.extras,
+            "update_weights", kwargs={"update_info": update_info_dict}
         )
 
     def finalize_weight_update(self) -> None:

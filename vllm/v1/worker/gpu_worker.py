@@ -871,33 +871,33 @@ class Worker(WorkerBase):
             tensorizer_config=tensorizer_config,
         )
 
-    def init_weight_transfer(self, **kwargs) -> None:
+    def init_weight_transfer(self, init_info: dict) -> None:
         """
         Initialize weight transfer mechanism.
         For NCCL backend, this creates a process group with the trainer.
-        """
-        self.weight_transfer_engine.init_transfer(**kwargs)
 
-    def update_weights(
-        self,
-        names: list[str],
-        dtype_names: list[str],
-        shapes: list[list[int]],
-        **kwargs,
-    ) -> None:
+        Args:
+            init_info: Dictionary containing backend-specific initialization info
+        """
+        # Parse dict into backend-specific typed dataclass
+        typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
+        self.weight_transfer_engine.init_transfer(typed_init_info)
+
+    def update_weights(self, update_info: dict) -> None:
         """
         Batched weight update from the trainer.
 
         Args:
-            request: WeightUpdateRequest
+            update_info: Dictionary containing backend-specific update info
         """
         if self.weight_transfer_engine is None:
             raise RuntimeError("Weight transfer not initialized.")
 
+        # Parse dict into backend-specific typed dataclass
+        typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
+
         # Receive weights through the transfer engine
-        weights = self.weight_transfer_engine.receive_weights(
-            names, dtype_names, shapes, **kwargs
-        )
+        weights = self.weight_transfer_engine.receive_weights(typed_update_info)
 
         # Load all weights at once
         self.model_runner.model.load_weights(weights=weights)

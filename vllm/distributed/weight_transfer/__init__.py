@@ -9,7 +9,6 @@ from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
     WeightTransferEngine,
-    WeightTransferInitInfo,
     WeightUpdateRequest,
 )
 from vllm.distributed.weight_transfer.ipc_engine import (
@@ -33,9 +32,7 @@ def register_weight_transfer_engine(
     WEIGHT_TRANSFER_ENGINE_REGISTRY[name] = engine
 
 
-def init_transfer_engine(
-    config: WeightTransferConfig, parallel_config: ParallelConfig
-) -> WeightTransferEngine:
+def init_transfer_engine(config: WeightTransferConfig, parallel_config: ParallelConfig):
     if config.backend not in WEIGHT_TRANSFER_ENGINE_REGISTRY:
         raise ValueError(f"Invalid weight transfer backend: {config.backend}")
 
@@ -50,5 +47,4 @@ __all__ = [
     "WEIGHT_TRANSFER_ENGINE_MAP",
     "IPCWeightTransferEngine",
     "WeightUpdateRequest",
-    "WeightTransferInitInfo",
 ]
