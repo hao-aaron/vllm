@@ -34,11 +34,10 @@ import ray
 import torch
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from rlhf_utils import stateless_init_process_group
 from transformers import AutoModelForCausalLM
 
-from examples.offline_inference.rlhf_utils import stateless_init_process_group
 from vllm import LLM, SamplingParams
-from vllm.config import WeightTransferConfig
 from vllm.utils.network_utils import get_ip, get_open_port
 
 
@@ -59,15 +58,11 @@ train_model.to("cuda:0")
 # Initialize Ray and set the visible devices. The vLLM engine will
 # be placed on GPUs 1 and 2.
 os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
-ray.init(runtime_env={"excludes": [".git/objects/pack/"]})
-# ray.init()
+ray.init()
 
 # Create a placement group that reserves GPU 1–2 for the vLLM inference engine.
 # Learn more about Ray placement groups:
-# https://docs.ray.io/en/latest/ray-core/scheduling/placement-group.html
-pg_training = placement_group([{"GPU": 1, "CPU": 0}])
-ray.get(pg_training.ready())
-
+# https://docs.ray.io/en/latest/placement-groups.html
 pg_inference = placement_group([{"GPU": 1, "CPU": 0}] * 2)
 ray.get(pg_inference.ready())
 scheduling_inference = PlacementGroupSchedulingStrategy(
@@ -78,8 +73,6 @@ scheduling_inference = PlacementGroupSchedulingStrategy(
 
 # Launch the vLLM inference engine. The `enforce_eager` flag reduces
 # start-up latency.
-# Note: Weight transfer APIs (init_weight_transfer, update_weights,
-# finalize_weight_update) are now native to vLLM workers.
 llm = ray.remote(
     num_cpus=0,
     num_gpus=0,
@@ -87,9 +80,9 @@ llm = ray.remote(
 )(MyLLM).remote(
     model="facebook/opt-125m",
     enforce_eager=True,
+    worker_extension_cls="rlhf_utils.WorkerExtension",
     tensor_parallel_size=2,
     distributed_executor_backend="ray",
-    weight_transfer_config=WeightTransferConfig(backend="nccl"),
 )
 
 # Generate text from the prompts.
@@ -117,7 +110,7 @@ master_address = get_ip()
 master_port = get_open_port()
 
 handle = llm.collective_rpc.remote(
-    "init_weight_transfer", args=(master_address, master_port, 1, 3)
+    "init_weight_update_group", args=(master_address, master_port, 1, 3)
 )
 
 model_update_group = stateless_init_process_group(
@@ -131,27 +124,17 @@ ray.get(handle)
 for name, p in train_model.named_parameters():
     p.data.zero_()
 
-# Synchronize the updated weights to the inference engine using batched API.
-# Collect all weight metadata
-names = []
-dtype_names = []
-shapes = []
+# Synchronize the updated weights to the inference engine.
 for name, p in train_model.named_parameters():
-    names.append(name)
-    dtype_names.append(str(p.dtype).split(".")[-1])
-    shapes.append(p.shape)
-
-# Issue batched RPC call to workers
-handle = llm.collective_rpc.remote("update_weights", args=(names, dtype_names, shapes))
-
-# Broadcast all weights from trainer
-for name, p in train_model.named_parameters():
+    dtype_name = str(p.dtype).split(".")[-1]
+    handle = llm.collective_rpc.remote(
+        "update_weight", args=(name, dtype_name, p.shape)
+    )
     model_update_group.broadcast(p, src=0, stream=torch.cuda.current_stream())
+    ray.get(handle)
 
-ray.get(handle)
-
-# Finalize the weight update (processes weights for quantization/kernel format)
-ray.get(llm.collective_rpc.remote("finalize_weight_update"))
+# Verify that the inference weights have been updated.
+assert all(ray.get(llm.collective_rpc.remote("check_weights_changed")))
 
 # Generate text with the updated model. The output is expected to be nonsense
 # because the weights are zero.
