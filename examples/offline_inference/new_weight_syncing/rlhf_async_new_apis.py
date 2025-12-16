@@ -47,15 +47,9 @@ from vllm.distributed.weight_transfer.base import (
 )
 from vllm.utils.network_utils import get_ip, get_open_port
 
-# simple expectations for async
-# generation_futures = llm.generate.remote(request) for request in requests
-# llm.abort_generation.remote()
-# llm.resume_generation.remote()
-# ray.get(generation_futures)
-
 
 class MyLLM:
-    """Configure the vLLM worker for Ray placement group execution."""
+    """Simple wrapper over AsyncLLM for supporting async RL."""
 
     def __init__(self, **kwargs):
         self.engine = vllm.AsyncLLMEngine.from_engine_args(
