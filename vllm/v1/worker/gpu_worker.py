@@ -896,14 +896,11 @@ class Worker(WorkerBase):
         # Parse dict into backend-specific typed dataclass
         typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
 
-        # Receive weights through the transfer engine
-        weights = self.weight_transfer_engine.receive_weights(typed_update_info)
-
-        # Load all weights at once
-        self.model_runner.model.load_weights(weights=weights)
-
-        # Clean up
-        del weights
+        # Receive and load weights incrementally to avoid OOM
+        self.weight_transfer_engine.receive_weights(
+            typed_update_info,
+            load_weights=self.model_runner.model.load_weights,
+        )
 
     def finalize_weight_update(self) -> None:
         """

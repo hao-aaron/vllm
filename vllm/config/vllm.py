@@ -118,7 +118,9 @@ class VllmConfig:
     instance_id: str = ""
     """The ID of the vLLM instance."""
 
-    weight_transfer_config: WeightTransferConfig | None = None
+    weight_transfer_config: WeightTransferConfig = Field(
+        default_factory=WeightTransferConfig
+    )
     """The configurations for weight transfer during RL training."""
 
     def compute_hash(self) -> str:

@@ -3,6 +3,7 @@
 """Base class for weight transfer engines."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
@@ -129,17 +130,18 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     @abstractmethod
     def receive_weights(
-        self, update_info: TUpdateInfo
-    ) -> list[tuple[str, torch.Tensor]]:
+        self,
+        update_info: TUpdateInfo,
+        load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
+    ) -> None:
         """
-        Receive weights from the trainer.
+        Receive weights from the trainer and load them incrementally.
 
         Args:
             update_info: Backend-specific update info containing parameter metadata
                         and any backend-specific data (e.g., IPC handles)
-
-        Returns:
-            List of (name, weight_tensor) tuples ready to be loaded into the model
+            load_weights: Callable that loads weights into the model. Called
+                         incrementally for each weight to avoid OOM.
         """
         raise NotImplementedError
 

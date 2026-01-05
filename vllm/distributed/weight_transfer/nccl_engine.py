@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NCCL-based weight transfer engine."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -85,9 +86,14 @@ class NCCLWeightTransferEngine(WeightTransferEngine[NCCLInitInfo, NCCLUpdateInfo
         from vllm.distributed.utils import StatelessProcessGroup
 
         # Calculate the global rank in the trainer-worker process group
-        worker_rank = self.parallel_config.rank
-        rank = worker_rank + init_info.rank_offset
+        # Must account for data parallel to get unique ranks across all workers
+        dp_rank = self.parallel_config.data_parallel_rank
+        world_size_per_dp = self.parallel_config.world_size  # TP * PP
+        tp_rank = self.parallel_config.rank
 
+        # Unique rank across all DP groups
+        worker_rank = dp_rank * world_size_per_dp + tp_rank
+        rank = worker_rank + init_info.rank_offset
         # Create stateless process group
         pg = StatelessProcessGroup.create(
             host=init_info.master_address,
@@ -102,23 +108,23 @@ class NCCLWeightTransferEngine(WeightTransferEngine[NCCLInitInfo, NCCLUpdateInfo
         )
 
     def receive_weights(
-        self, update_info: NCCLUpdateInfo
-    ) -> list[tuple[str, torch.Tensor]]:
+        self,
+        update_info: NCCLUpdateInfo,
+        load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
+    ) -> None:
         """
-        Receive weights from trainer via NCCL broadcast.
+        Receive weights from trainer via NCCL broadcast and load them incrementally.
 
         Args:
             update_info: NCCL update info containing parameter names, dtypes, and shapes
-
-        Returns:
-            List of (name, weight_tensor) tuples
+            load_weights: Callable that loads weights into the model. Called
+                         incrementally for each weight to avoid OOM.
         """
         if self.model_update_group is None:
             raise RuntimeError(
                 "NCCL weight transfer not initialized. Call init_transfer() first."
             )
 
-        weights = []
         for name, dtype_name, shape in zip(
             update_info.names, update_info.dtype_names, update_info.shapes
         ):
@@ -133,9 +139,11 @@ class NCCLWeightTransferEngine(WeightTransferEngine[NCCLInitInfo, NCCLUpdateInfo
                 weight, src=0, stream=torch.cuda.current_stream()
             )
 
-            weights.append((name, weight))
+            # Load weight immediately to avoid accumulating all weights in memory
+            load_weights([(name, weight)])
 
-        return weights
+            # Clean up the weight tensor
+            del weight
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:

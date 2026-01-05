@@ -44,6 +44,8 @@ from vllm.distributed.weight_transfer.base import (
 from vllm.distributed.weight_transfer.nccl_engine import NCCLInitInfo, NCCLUpdateInfo
 from vllm.utils.network_utils import get_ip, get_open_port
 
+MODEL_NAME = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+
 
 class MyLLM(LLM):
     """Configure the vLLM worker for Ray placement group execution."""
@@ -56,9 +58,7 @@ class MyLLM(LLM):
 
 
 # Load the OPT-125M model onto GPU 0 for the training workload.
-train_model = AutoModelForCausalLM.from_pretrained(
-    "facebook/opt-125m", dtype=torch.bfloat16
-)
+train_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16)
 train_model.to("cuda:0")
 
 # Initialize Ray and set the visible devices. The vLLM engine will
@@ -90,11 +90,14 @@ llm = ray.remote(
     num_gpus=0,
     scheduling_strategy=scheduling_inference,
 )(MyLLM).remote(
-    model="facebook/opt-125m",
+    model=MODEL_NAME,
     enforce_eager=True,
-    tensor_parallel_size=2,
+    tensor_parallel_size=1,
+    data_parallel_size=2,
     distributed_executor_backend="ray",
     weight_transfer_config=WeightTransferConfig(backend="nccl"),
+    enable_expert_parallel=True,
+    all2all_backend="pplx",
 )
 
 # Generate text from the prompts.
