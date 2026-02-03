@@ -1327,6 +1327,58 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dp_rank = dp_rank
         self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
 
+    def pause_scheduler(self) -> int:
+        """Pause the scheduler, keeping requests frozen in queue.
+
+        For DP case, returns the current step counter so that all engines
+        can be synchronized to the same step before pausing.
+
+        Returns:
+            The current step counter for this engine.
+        """
+        self._scheduler_paused = True
+        return self.step_counter
+
+    def _sync_to_step(self, target_step: int) -> None:
+        """Sync this engine to the target step for coordinator-driven pause.
+
+        This is called when the coordinator broadcasts SYNC_TO_STEP to ensure
+        all engines reach the same step before pausing. Uses only dummy batches
+        and all-reduce to participate in DP synchronization without executing
+        real model work.
+
+        Args:
+            target_step: The step number to sync to.
+        """
+        if self.step_counter >= target_step:
+            # Already at or past target step, nothing to do
+            logger.debug(
+                "DP rank %d already at step %d (target %d)",
+                self.dp_rank,
+                self.step_counter,
+                target_step,
+            )
+            return
+
+        logger.debug(
+            "DP rank %d syncing from step %d to step %d",
+            self.dp_rank,
+            self.step_counter,
+            target_step,
+        )
+
+        # Run dummy batches with all-reduce to sync with other engines
+        while self.step_counter < target_step:
+            self.execute_dummy_batch()
+            # Participate in all-reduce to stay synchronized with other DP ranks
+            local_unfinished = self.scheduler.has_unfinished_requests()
+            self._has_global_unfinished_reqs(local_unfinished)
+            self.step_counter += 1
+
+        logger.debug(
+            "DP rank %d synced to step %d", self.dp_rank, self.step_counter
+        )
+
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
@@ -1357,6 +1409,46 @@ class DPEngineCoreProc(EngineCoreProc):
                 if not self.engines_running:
                     logger.debug("EngineCore starting idle loop for wave %d.", new_wave)
                     self.engines_running = True
+
+        elif request_type == EngineCoreRequestType.PAUSE_DP:
+            # Coordinator requested pause - set flag and return step counter
+            logger.debug(
+                "DP rank %d received PAUSE_DP at step %d",
+                self.dp_rank,
+                self.step_counter,
+            )
+            self._scheduler_paused = True
+            # Send step counter back to coordinator
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(
+                    engine_index=self.dp_rank,
+                    pause_step=self.step_counter,
+                ))
+            )
+
+        elif request_type == EngineCoreRequestType.SYNC_TO_STEP:
+            # Coordinator requested sync to target step
+            target_step = request
+            logger.debug(
+                "DP rank %d syncing from step %d to step %d",
+                self.dp_rank,
+                self.step_counter,
+                target_step,
+            )
+            self._sync_to_step(target_step)
+            # Send confirmation back to coordinator
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(
+                    engine_index=self.dp_rank,
+                    sync_complete=True,
+                ))
+            )
+
+        elif request_type == EngineCoreRequestType.RESUME_DP:
+            # Coordinator requested resume
+            logger.debug("DP rank %d received RESUME_DP", self.dp_rank)
+            self._scheduler_paused = False
+
         else:
             super()._handle_client_request(request_type, request)
 

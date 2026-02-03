@@ -110,6 +110,8 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         self.request_counts = [0, 0]  # [waiting, running]
+        self.pause_step: int | None = None  # Step counter when paused
+        self.sync_complete: bool = False  # Whether engine synced to target step
 
 
 class DPCoordinatorProc:
@@ -276,6 +278,29 @@ class DPCoordinatorProc:
                             )
                         continue  # Skip normal engine notification processing
 
+                    # Handle pause/resume requests from front-end
+                    if decoded[0] == "PAUSE_DP_ENGINES":
+                        logger.info("Coordinator received PAUSE_DP_ENGINES request")
+                        paused_step = self._handle_pause_request(
+                            publish_back, output_back, decoder
+                        )
+                        # Send confirmation back to client
+                        response = ("PAUSE_COMPLETE", paused_step)
+                        publish_front.send(msgspec.msgpack.encode(response))
+                        logger.info(
+                            "All engines paused and synced at step %d", paused_step
+                        )
+                        continue
+
+                    if decoded[0] == "RESUME_DP_ENGINES":
+                        logger.info("Coordinator received RESUME_DP_ENGINES request")
+                        self._handle_resume_request(publish_back)
+                        # Send confirmation back to client
+                        response = ("RESUME_COMPLETE", True)
+                        publish_front.send(msgspec.msgpack.encode(response))
+                        logger.info("All engines resumed")
+                        continue
+
                     # Wave coordination: handle new-request messages from front-end.
                     # Only process these when wave coordination is enabled
                     if self.enable_wave_coordination:
@@ -388,6 +413,166 @@ class DPCoordinatorProc:
         """
         wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
+
+    # All-reduce happens every 32 steps in _has_global_unfinished_reqs
+    ALL_REDUCE_INTERVAL = 32
+
+    def _handle_pause_request(
+        self,
+        publish_back: zmq.Socket,
+        output_back: zmq.Socket,
+        decoder: MsgpackDecoder,
+    ) -> int:
+        """Orchestrate pausing all DP engines with deadlock recovery.
+
+        1. Broadcast PAUSE_DP to all engines
+        2. Collect step counters with timeout
+        3. Compute target step:
+           - If all responded: target = max of steps
+           - If deadlock (not all responded): target = next multiple of 32
+        4. Broadcast SYNC_TO_STEP to sync all engines
+        5. Wait for all engines to confirm sync
+        6. Return the synchronized step number
+
+        Returns:
+            The step number at which all engines are paused.
+        """
+        num_engines = len(self.engines)
+
+        # Reset state for this pause operation
+        for engine in self.engines:
+            engine.pause_step = None
+            engine.sync_complete = False
+
+        # Phase 1: Broadcast PAUSE_DP to all engines
+        logger.debug("Broadcasting PAUSE_DP to %d engines", num_engines)
+        pause_msg = msgspec.msgpack.encode(None)
+        publish_back.send_multipart(
+            (EngineCoreRequestType.PAUSE_DP.value, pause_msg)
+        )
+
+        # Phase 2: Collect step counters with timeout
+        engines_responded: set[int] = set()
+        timeout_ms = 2000  # 2 second timeout
+
+        while len(engines_responded) < num_engines:
+            if output_back.poll(timeout=timeout_ms):
+                buffer = output_back.recv()
+                outputs: EngineCoreOutputs = decoder.decode(buffer)
+
+                if outputs.pause_step is not None:
+                    eng_index = outputs.engine_index
+                    self.engines[eng_index].pause_step = outputs.pause_step
+                    engines_responded.add(eng_index)
+                    logger.debug(
+                        "Engine %d paused at step %d (%d/%d)",
+                        eng_index,
+                        outputs.pause_step,
+                        len(engines_responded),
+                        num_engines,
+                    )
+            else:
+                # Timeout - some engines may be stuck in all-reduce
+                break
+
+        # Phase 3: Compute target step
+        known_steps = [
+            e.pause_step for e in self.engines if e.pause_step is not None
+        ]
+
+        if len(engines_responded) == 0:
+            raise RuntimeError("No engines responded to PAUSE_DP")
+
+        if len(engines_responded) < num_engines:
+            # Deadlock detected: use next multiple of 32 to unstick
+            max_known_step = max(known_steps)
+            target_step = (
+                (max_known_step // self.ALL_REDUCE_INTERVAL + 1)
+                * self.ALL_REDUCE_INTERVAL
+            )
+            logger.warning(
+                "Deadlock detected: %d/%d engines responded. "
+                "Syncing to step %d to unstick all-reduce.",
+                len(engines_responded),
+                num_engines,
+                target_step,
+            )
+        else:
+            # All responded: use max step
+            target_step = max(known_steps)
+            logger.debug(
+                "All engines paused. Steps: %s, syncing to step %d",
+                known_steps,
+                target_step,
+            )
+
+        # Phase 4: Broadcast SYNC_TO_STEP
+        sync_msg = msgspec.msgpack.encode(target_step)
+        publish_back.send_multipart(
+            (EngineCoreRequestType.SYNC_TO_STEP.value, sync_msg)
+        )
+
+        # Phase 5: Wait for all engines to confirm sync
+        # Also collect any remaining pause responses from engines that were
+        # stuck in all-reduce (they will respond after SYNC_TO_STEP unsticks them)
+        engines_synced: set[int] = set()
+        sync_timeout_ms = 10000
+        sync_retries = 0
+        max_sync_retries = 5
+
+        while len(engines_synced) < num_engines:
+            if output_back.poll(timeout=sync_timeout_ms):
+                buffer = output_back.recv()
+                outputs: EngineCoreOutputs = decoder.decode(buffer)
+
+                if outputs.pause_step is not None:
+                    # Late pause response from engine that was stuck in all-reduce
+                    eng_index = outputs.engine_index
+                    if eng_index not in engines_responded:
+                        self.engines[eng_index].pause_step = outputs.pause_step
+                        engines_responded.add(eng_index)
+                        logger.debug(
+                            "Engine %d paused at step %d (after unstick)",
+                            eng_index,
+                            outputs.pause_step,
+                        )
+
+                if outputs.sync_complete:
+                    eng_index = outputs.engine_index
+                    if eng_index not in engines_synced:
+                        self.engines[eng_index].sync_complete = True
+                        engines_synced.add(eng_index)
+                        logger.debug(
+                            "Engine %d sync complete (%d/%d)",
+                            eng_index,
+                            len(engines_synced),
+                            num_engines,
+                        )
+            else:
+                sync_retries += 1
+                logger.warning(
+                    "Timeout waiting for sync confirmation (%d/%d), "
+                    "%d/%d engines synced",
+                    sync_retries,
+                    max_sync_retries,
+                    len(engines_synced),
+                    num_engines,
+                )
+                if sync_retries >= max_sync_retries:
+                    missing = set(range(num_engines)) - engines_synced
+                    raise RuntimeError(
+                        f"Failed to sync all engines. Missing: {missing}"
+                    )
+
+        return target_step
+
+    def _handle_resume_request(self, publish_back: zmq.Socket) -> None:
+        """Broadcast resume to all DP engines."""
+        logger.debug("Broadcasting RESUME_DP to all engines")
+        resume_msg = msgspec.msgpack.encode(None)
+        publish_back.send_multipart(
+            (EngineCoreRequestType.RESUME_DP.value, resume_msg)
+        )
 
     def _get_engine_counts(self, do_copy=False) -> list[list[int]]:
         """Return list of [waiting, running] count lists for each engine."""

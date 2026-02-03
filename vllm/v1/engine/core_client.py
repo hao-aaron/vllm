@@ -1149,8 +1149,24 @@ class DPAsyncMPClient(AsyncMPClient):
                     if buf is None:
                         continue
 
-                    # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
+                    decoded = msgspec.msgpack.decode(buf)
+
+                    # Handle pause/resume confirmations from coordinator
+                    if isinstance(decoded, (list, tuple)) and len(decoded) == 2:
+                        if decoded[0] == "PAUSE_COMPLETE":
+                            paused_step = decoded[1]
+                            if hasattr(self, "_pause_complete_future"):
+                                if not self._pause_complete_future.done():
+                                    self._pause_complete_future.set_result(paused_step)
+                            continue
+                        if decoded[0] == "RESUME_COMPLETE":
+                            if hasattr(self, "_resume_complete_future"):
+                                if not self._resume_complete_future.done():
+                                    self._resume_complete_future.set_result(True)
+                            continue
+
+                    # Update local load-balancing state (regular stats update).
+                    counts, wave, running = decoded
                     self.current_wave = wave
                     self.engines_running = running
                     if counts is not None:
@@ -1185,16 +1201,61 @@ class DPAsyncMPClient(AsyncMPClient):
         return self.core_engine
 
     async def pause_scheduler_async(self) -> None:
-        """Pause the scheduler, keeping requests frozen in queue."""
-        raise NotImplementedError(
-            "pause_scheduler_async is not yet supported for data parallel"
+        """Pause the scheduler for all DP engines via the coordinator.
+
+        The coordinator handles orchestrating the pause across all engines:
+        1. Broadcasts PAUSE_DP to all engines
+        2. Collects step counters from all engines
+        3. Computes max step and broadcasts SYNC_TO_STEP
+        4. Waits for all engines to sync
+        5. Returns confirmation to client
+
+        This ensures all engines are at the same step when paused, which is
+        critical for DP MoE models that require synchronized execution.
+        """
+        self._ensure_stats_update_task()
+
+        # Create a future to wait for the pause confirmation
+        self._pause_complete_future: asyncio.Future[int] = (
+            asyncio.get_running_loop().create_future()
         )
 
+        # Send pause request to coordinator
+        pause_msg = msgspec.msgpack.encode(("PAUSE_DP_ENGINES", None))
+        await self.first_req_send_socket.send(pause_msg)
+
+        # Wait for confirmation from coordinator (received in stats_update_task)
+        try:
+            paused_step = await asyncio.wait_for(
+                self._pause_complete_future, timeout=30.0
+            )
+            logger.info(
+                "All DP engines paused and synchronized at step %d", paused_step
+            )
+        except asyncio.TimeoutError:
+            logger.error("Timeout waiting for pause confirmation from coordinator")
+            raise RuntimeError("DP pause timed out")
+
     async def resume_scheduler_async(self) -> None:
-        """Resume the scheduler after a pause."""
-        raise NotImplementedError(
-            "resume_scheduler_async is not yet supported for data parallel"
+        """Resume the scheduler for all DP engines via the coordinator."""
+        self._ensure_stats_update_task()
+
+        # Create a future to wait for the resume confirmation
+        self._resume_complete_future: asyncio.Future[bool] = (
+            asyncio.get_running_loop().create_future()
         )
+
+        # Send resume request to coordinator
+        resume_msg = msgspec.msgpack.encode(("RESUME_DP_ENGINES", None))
+        await self.first_req_send_socket.send(resume_msg)
+
+        # Wait for confirmation from coordinator
+        try:
+            await asyncio.wait_for(self._resume_complete_future, timeout=10.0)
+            logger.info("All DP engines resumed")
+        except asyncio.TimeoutError:
+            logger.error("Timeout waiting for resume confirmation from coordinator")
+            raise RuntimeError("DP resume timed out")
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):

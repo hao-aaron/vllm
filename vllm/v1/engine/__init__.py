@@ -194,6 +194,12 @@ class EngineCoreOutputs(
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
 
+    # DP pause coordination responses (engine -> coordinator)
+    # Step counter when engine paused (response to PAUSE_DP)
+    pause_step: int | None = None
+    # Confirmation that engine synced to target step (response to SYNC_TO_STEP)
+    sync_complete: bool | None = None
+
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()
@@ -211,6 +217,10 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY = b"\x03"
     # Sentinel used within EngineCoreProc.
     EXECUTOR_FAILED = b"\x04"
+    # DP pause coordination (coordinator -> engines)
+    PAUSE_DP = b"\x05"
+    SYNC_TO_STEP = b"\x06"
+    RESUME_DP = b"\x07"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):
