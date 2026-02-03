@@ -14,6 +14,7 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -1291,6 +1292,14 @@ class DPEngineCoreProc(EngineCoreProc):
         self.current_wave = 0
         self.last_counts = (0, 0)
 
+        # DP-coordinated pause/resume state.
+        # _pause_requested: set by utility call, triggers all-reduce at next sync
+        # _dp_paused: all ranks enter this state together after all-reduce
+        # _resume_requested: set by utility call, triggers all-reduce to resume
+        self._pause_requested = False
+        self._dp_paused = False
+        self._resume_requested = False
+
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         super().__init__(
@@ -1360,6 +1369,16 @@ class DPEngineCoreProc(EngineCoreProc):
         else:
             super()._handle_client_request(request_type, request)
 
+    def request_pause(self) -> None:
+        """Request a coordinated pause across all DP ranks."""
+        self._pause_requested = True
+        logger.debug("DP rank %d received pause request", self.dp_rank)
+
+    def request_resume(self) -> None:
+        """Request a coordinated resume across all DP ranks."""
+        self._resume_requested = True
+        logger.debug("DP rank %d received resume request", self.dp_rank)
+
     def _maybe_publish_request_counts(self):
         if not self.publish_dp_lb_stats:
             return
@@ -1426,7 +1445,64 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter % 32 != 0:
             return True
 
+        # Check if any rank has requested a pause via all-reduce.
+        # This uses the same sync point to coordinate pause across all DP ranks.
+        if self._check_dp_pause_requested():
+            # All ranks enter paused state together
+            self._dp_pause()
+
         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+
+    def _check_dp_pause_requested(self) -> bool:
+        """All-reduce to check if any DP rank has requested a pause."""
+        tensor = torch.tensor(
+            [self._pause_requested], dtype=torch.int32, device="cpu"
+        )
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+        )
+        return bool(tensor.item())
+
+    def _dp_pause(self) -> None:
+        """Enter coordinated pause state across all DP ranks."""
+        self._dp_paused = True
+        self._pause_requested = False  # Clear the request flag
+
+        logger.debug("DP rank %d entering pause state at step %d",
+                     self.dp_rank, self.step_counter)
+
+        # Send ack to client that we are paused
+        self.output_queue.put_nowait(
+            (-1, EngineCoreOutputs(dp_paused=True))
+        )
+
+        # Run pause loop - do all-reduce to check for resume
+        self._run_dp_pause_loop()
+
+    def _run_dp_pause_loop(self) -> None:
+        """Busy loop while paused, checking for resume via all-reduce."""
+        while self._dp_paused:
+            # Process input queue to receive resume request
+            self._process_input_queue()
+
+            # All-reduce to check if any rank has requested resume
+            tensor = torch.tensor(
+                [self._resume_requested], dtype=torch.int32, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+            )
+
+            if tensor.item():
+                # Resume requested by some rank
+                self._dp_paused = False
+                self._resume_requested = False
+                logger.debug("DP rank %d resuming from pause", self.dp_rank)
+
+                # Send ack to client that we resumed
+                self.output_queue.put_nowait(
+                    (-1, EngineCoreOutputs(dp_resumed=True))
+                )
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
