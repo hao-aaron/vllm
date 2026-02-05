@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     K_SCALE_CONSTANT: int = 200
     V_SCALE_CONSTANT: int = 100
     VLLM_SERVER_DEV_MODE: bool = False
+    VLLM_ENABLE_RL_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1010,6 +1011,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    # If set, enables RLHF-specific endpoints for weight updates and
+    # generation pause/resume (e.g. `/pause`, `/resume`, `/update_weights`)
+    "VLLM_ENABLE_RL_MODE": lambda: bool(int(os.getenv("VLLM_ENABLE_RL_MODE", "0"))),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high
@@ -1625,6 +1629,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_RANDOMIZE_DP_DUMMY_INPUTS",
+        "VLLM_ENABLE_RL_MODE",
         "VLLM_CI_USE_S3",
         "VLLM_MODEL_REDIRECT_PATH",
         "VLLM_HOST_IP",

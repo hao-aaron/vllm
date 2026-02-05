@@ -271,13 +271,13 @@ steps:
   # when we have multiple distributed example tests
   # OLD rlhf examples
   - pushd ../examples/offline_inference
-  - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 rlhf.py
-  - VLLM_ALLOW_INSECURE_SERIALIZATION=1 RAY_DEDUP_LOGS=0 python3 rlhf_colocate.py
+  - python3 rlhf.py
+  - RAY_DEDUP_LOGS=0 python3 rlhf_colocate.py
   - popd
   # NEW rlhf examples
   - pushd ../examples/offline_inference/new_weight_syncing
-  - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 rlhf.py
-  - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 rlhf_async_new_apis.py
+  - python3 rlhf.py
+  - python3 rlhf_async_new_apis.py
   - popd
 
 - label: Distributed Tests (8 GPUs) # 4min

@@ -160,6 +160,6 @@ async def get_world_size(
 
 
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
+    if not envs.VLLM_ENABLE_RL_MODE:
         return
     app.include_router(router)

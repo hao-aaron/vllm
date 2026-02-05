@@ -106,12 +106,19 @@ class NCCLWeightTransferEngine(
 
         # Calculate the global rank in the trainer-worker process group
         # Must account for data parallel to get unique ranks across all workers
-        dp_rank = self.parallel_config.data_parallel_rank
-        world_size_per_dp = self.parallel_config.world_size  # TP * PP
-        rank_within_dp = self.parallel_config.rank
+        if self.parallel_config.distributed_executor_backend == "external_launcher":
+            # For external_launcher, world_size already includes DP and
+            # rank is the global rank, so no adjustment needed
+            worker_rank = self.parallel_config.rank
+        else:
+            # For other backends, calculate global rank from DP rank and local rank
+            dp_rank = self.parallel_config.data_parallel_rank
+            # world_size is TP * PP * PCP (per DP group)
+            world_size_per_dp = self.parallel_config.world_size
+            rank_within_dp = self.parallel_config.rank
+            # Unique rank across all DP groups
+            worker_rank = dp_rank * world_size_per_dp + rank_within_dp
 
-        # Unique rank across all DP groups
-        worker_rank = dp_rank * world_size_per_dp + rank_within_dp
         rank = worker_rank + init_info.rank_offset
         # Create stateless process group
         self.model_update_group = (
