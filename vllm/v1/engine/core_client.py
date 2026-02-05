@@ -1067,6 +1067,10 @@ class DPAsyncMPClient(AsyncMPClient):
         # Used only by DPLBAsyncMPClient subclass.
         self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
 
+        # Events for DP pause/resume coordination
+        self._pause_ack = asyncio.Event()
+        self._resume_ack = asyncio.Event()
+
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
             make_zmq_socket(self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=True)
@@ -1201,16 +1205,12 @@ class DPAsyncMPClient(AsyncMPClient):
         At the next all-reduce sync point, all DP ranks will enter paused state
         together. This method blocks until all engines confirm they are paused.
         """
-        # Create event to wait for pause confirmation
-        if not hasattr(self, "_dp_pause_event"):
-            self._dp_pause_event = asyncio.Event()
-        self._dp_pause_event.clear()
+        self._pause_ack.clear()
 
-        # Send request_pause utility call to first engine - it will propagate via all-reduce
-        await self._call_utility_async("request_pause", {})
+        await self.call_utility_async("request_pause")
 
         # Wait for dp_paused confirmation
-        await asyncio.wait_for(self._dp_pause_event.wait(), timeout=60.0)
+        await asyncio.wait_for(self._pause_ack.wait(), timeout=60.0)
         logger.info("All DP engines paused")
 
     async def resume_scheduler_async(self) -> None:
@@ -1220,29 +1220,21 @@ class DPAsyncMPClient(AsyncMPClient):
         At the next all-reduce check in the pause loop, all DP ranks will resume
         together. This method blocks until all engines confirm they have resumed.
         """
-        # Create event to wait for resume confirmation
-        if not hasattr(self, "_dp_resume_event"):
-            self._dp_resume_event = asyncio.Event()
-        self._dp_resume_event.clear()
+        self._resume_ack.clear()
 
-        # Send request_resume utility call to first engine - it will propagate via all-reduce
-        await self._call_utility_async("request_resume", {})
+        await self.call_utility_async("request_resume")
 
         # Wait for dp_resumed confirmation
-        await asyncio.wait_for(self._dp_resume_event.wait(), timeout=60.0)
+        await asyncio.wait_for(self._resume_ack.wait(), timeout=60.0)
         logger.info("All DP engines resumed")
 
     @staticmethod
-    async def process_engine_outputs(
-        self: "DPAsyncMPClient", outputs: EngineCoreOutputs
-    ):
+    async def process_engine_outputs(self, outputs: EngineCoreOutputs):
         """Handle DP pause/resume signals from engine outputs."""
         if outputs.dp_paused:
-            if hasattr(self, "_dp_pause_event"):
-                self._dp_pause_event.set()
+            self._pause_ack.set()
         if outputs.dp_resumed:
-            if hasattr(self, "_dp_resume_event"):
-                self._dp_resume_event.set()
+            self._resume_ack.set()
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):
@@ -1316,11 +1308,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         )[0]
 
     @staticmethod
-    async def process_engine_outputs(
-        self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
-    ):
+    async def process_engine_outputs(self, outputs: EngineCoreOutputs):
         # Call parent's handler for DP pause/resume signals
-        await DPAsyncMPClient.process_engine_outputs(self, outputs)
+        await super().process_engine_outputs(self, outputs)
 
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:

@@ -1324,10 +1324,8 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # DP-coordinated pause/resume state.
         # _pause_requested: set by utility call, triggers all-reduce at next sync
-        # _dp_paused: all ranks enter this state together after all-reduce
         # _resume_requested: set by utility call, triggers all-reduce to resume
         self._pause_requested = False
-        self._dp_paused = False
         self._resume_requested = False
 
         # Initialize the engine.
@@ -1474,9 +1472,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def _check_dp_pause_requested(self) -> bool:
         """All-reduce to check if any DP rank has requested a pause."""
-        tensor = torch.tensor(
-            [self._pause_requested], dtype=torch.int32, device="cpu"
-        )
+        tensor = torch.tensor([self._pause_requested], dtype=torch.int32, device="cpu")
         torch.distributed.all_reduce(
             tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
         )
@@ -1484,23 +1480,19 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def _dp_pause(self) -> None:
         """Enter coordinated pause state across all DP ranks."""
-        self._dp_paused = True
         self._pause_requested = False  # Clear the request flag
 
-        logger.debug("DP rank %d entering pause state at step %d",
-                     self.dp_rank, self.step_counter)
-
-        # Send ack to client that we are paused
-        self.output_queue.put_nowait(
-            (-1, EngineCoreOutputs(dp_paused=True))
+        logger.debug(
+            "DP rank %d entering pause state at step %d",
+            self.dp_rank,
+            self.step_counter,
         )
 
-        # Run pause loop - do all-reduce to check for resume
-        self._run_dp_pause_loop()
+        # Send ack to client that we are paused
+        self.output_queue.put_nowait((0, EngineCoreOutputs(dp_paused=True)))
 
-    def _run_dp_pause_loop(self) -> None:
-        """Busy loop while paused, checking for resume via all-reduce."""
-        while self._dp_paused:
+        # Busy loop while paused, checking for resume via all-reduce
+        while True:
             # Process input queue to receive resume request
             self._process_input_queue()
 
@@ -1514,14 +1506,12 @@ class DPEngineCoreProc(EngineCoreProc):
 
             if tensor.item():
                 # Resume requested by some rank
-                self._dp_paused = False
                 self._resume_requested = False
                 logger.debug("DP rank %d resuming from pause", self.dp_rank)
 
                 # Send ack to client that we resumed
-                self.output_queue.put_nowait(
-                    (-1, EngineCoreOutputs(dp_resumed=True))
-                )
+                self.output_queue.put_nowait((0, EngineCoreOutputs(dp_resumed=True)))
+                return
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
