@@ -1635,6 +1635,10 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
 
+    def get_all_request_ids(self) -> list[str]:
+        """Return all request IDs currently in the scheduler (running or waiting)."""
+        return list(self.requests.keys())
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -1659,11 +1663,15 @@ class Scheduler(SchedulerInterface):
 
     def finish_requests(
         self, request_ids: str | Iterable[str], finished_status: RequestStatus
-    ) -> None:
+    ) -> list[str]:
         """Handles the finish signal from outside the scheduler.
 
         For example, the API server can abort a request when the client
         disconnects.
+
+        Returns:
+            List of request IDs that were actually finished (were in the
+            scheduler and not already finished).
         """
         assert RequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
@@ -1708,6 +1716,8 @@ class Scheduler(SchedulerInterface):
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
+
+        return [r.request_id for r in valid_requests]
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
