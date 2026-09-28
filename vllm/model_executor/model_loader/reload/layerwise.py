@@ -608,8 +608,35 @@ def _finalize_attention_layer(
     else:
         _place_kernel_tensors(layer, info)
     reloading = info.kernel_tensors is not None
-    with reload_mode() if reloading else nullcontext():
+    if not reloading:
         layer.process_weights_after_loading(model_config.dtype)
+        return
+    # Attention PWAL runs on the live module (MLA derives W_UK_T / W_UV from
+    # the landed kv_b_proj). Land anything it re-registers back into the
+    # original tensors, so captured graphs keep reading valid storage.
+    params, buffers = get_layer_params_buffers(layer)
+    before = {**params, **buffers}
+    with reload_mode():
+        layer.process_weights_after_loading(model_config.dtype)
+    for name, old in before.items():
+        new = getattr(layer, name, None)
+        if new is None or new is old:
+            continue
+        if _direct.same_view(new, old):
+            continue
+        if check_exact_landing(old, new) is None:
+            old.data.copy_(new)
+            if name in layer._parameters:
+                layer._parameters[name] = old
+            else:
+                layer._buffers[name] = old
+        else:
+            logger.warning_once(
+                "%s.%s: attention post-load processing re-allocated it with a "
+                "different layout on reload; CUDA graphs may read stale data",
+                type(layer).__name__,
+                name,
+            )
 
 
 def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:

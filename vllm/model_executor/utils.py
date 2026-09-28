@@ -148,7 +148,6 @@ def replace_parameter(
 
     if (
         prefer_copy
-        and not is_reloading()
         and old_param is not None
         and old_param.shape == new_tensor.shape
         and old_param.dtype == new_tensor.dtype

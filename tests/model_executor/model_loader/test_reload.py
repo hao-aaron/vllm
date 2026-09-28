@@ -1594,14 +1594,14 @@ def test_reload_mode_only_during_reload():
     finalize_layerwise_reload(model, model_config=None)
     assert layer.quant_method.modes == [True]
     assert not is_reloading()
-    # replace_parameter(prefer_copy=True) only rebinds in reload mode
+    # replace_parameter(prefer_copy=True) still copies in place in reload
+    # mode: MLA keeps W_UK_T / W_UV addresses this way during attention PWAL
     holder = torch.nn.Module()
     holder.p = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
     old = holder.p
     with reload_mode():
         replace_parameter(holder, "p", torch.ones(2), prefer_copy=True)
-    assert holder.p is not old and torch.equal(old, torch.zeros(2))
-    replace_parameter(holder, "p", torch.full((2,), 3.0), prefer_copy=True)
+    assert holder.p is old and torch.equal(old, torch.ones(2))
 
 
 class _HookModel(torch.nn.Sequential):
