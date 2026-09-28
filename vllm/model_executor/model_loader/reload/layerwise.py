@@ -3,6 +3,7 @@
 import inspect
 import os
 import threading
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -62,6 +63,7 @@ __all__ = [
     "get_reload_session",
     "is_model_dirty",
     "check_can_serve",
+    "mark_dirty",
 ]
 
 
@@ -281,6 +283,16 @@ def is_model_dirty(model: torch.nn.Module) -> bool:
     return session is not None and session.dirty
 
 
+def mark_dirty(model: torch.nn.Module) -> None:
+    """Mark the model's weights unusable until a full update succeeds (e.g. an
+    update that succeeded here but failed on another rank)."""
+    session = get_reload_session(model)
+    if session is None:
+        session = ReloadSession(active=False)
+        model._reload_session = session
+    session.dirty = True
+
+
 def check_can_serve(model: torch.nn.Module) -> None:
     """Refuse to run the model mid-update or after a failed update."""
     session = getattr(model, "_reload_session", None)
@@ -303,9 +315,111 @@ def _mark_dirty(info: LayerReloadingInfo) -> None:
         info.session.dirty = True
 
 
+def _record_expert_unit(
+    layer: torch.nn.Module,
+    info: LayerReloadingInfo,
+    param_name: str,
+    original_loader,
+    bound_args: inspect.BoundArguments,
+) -> None:
+    """Required keys for routed experts: one fused param holds every local
+    expert, so a missing expert is invisible to name-based checks and a
+    duplicate can make the numel count reach its total with another expert
+    missing. Record each arrival per (param, shard, local expert)."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    session = info.session
+    if session is None or not session.active:
+        return
+    if getattr(original_loader, "__func__", None) is not RoutedExperts.weight_loader:
+        return
+    args = bound_args.arguments
+    shard_id, expert_id = args.get("shard_id"), args.get("expert_id")
+    loaded = args.get("loaded_weight")
+    if not isinstance(expert_id, int) or not isinstance(loaded, torch.Tensor):
+        return
+    stacked = loaded.dim() == 3 or (
+        layer.quant_config is not None
+        and layer.quant_config.get_name() == "gpt_oss_mxfp4"
+    )
+    if stacked:
+        unit: int | str = "*"
+    else:
+        unit = layer._map_global_expert_id_to_local_expert_id(expert_id)
+        if unit == -1:
+            return  # not local to this rank
+    units = session.expert_units.setdefault(id(layer), Counter())
+    units[(param_name, shard_id, unit)] += 1
+
+
+def _expert_shards(layer: torch.nn.Module, param_name: str) -> tuple[str, ...]:
+    if param_name.startswith("w2_"):
+        return ("w2",)
+    if param_name.startswith("w13_"):
+        return ("w1", "w3") if layer.moe_config.is_act_and_mul else ("w1",)
+    return ()
+
+
+def check_expert_units(layer: torch.nn.Module, units: Counter) -> tuple[list, list]:
+    """(missing, duplicated) (param, shard, local expert) units of one routed
+    experts module, for every param this update touched. Input scales are
+    exempt (per-tensor, reduced over experts; may be global)."""
+    local = {
+        layer._map_global_expert_id_to_local_expert_id(g)
+        for g in range(layer.global_num_experts)
+    } - {-1}
+    touched = {param for param, _, _ in units if "input_scale" not in param}
+    missing = []
+    for param in sorted(touched):
+        for shard in _expert_shards(layer, param):
+            if units[(param, shard, "*")]:
+                continue
+            missing += [
+                (param, shard, e) for e in sorted(local) if not units[(param, shard, e)]
+            ]
+    duplicated = sorted(k for k, n in units.items() if n > 1 and k[2] != "*")
+    return missing, duplicated
+
+
+def _check_expert_units(model: torch.nn.Module, session: ReloadSession) -> list[str]:
+    problems = []
+    for name, layer in model.named_modules():
+        units = session.expert_units.get(id(layer))
+        if not units:
+            continue
+        missing, duplicated = check_expert_units(layer, units)
+        if missing:
+            problems.append(
+                f"{name}: {len(missing)} expert shard(s) never loaded, "
+                f"e.g. {missing[:4]}"
+            )
+        if duplicated:
+            msg = (
+                f"{name}: {len(duplicated)} expert shard(s) loaded more than "
+                f"once, e.g. {duplicated[:4]}"
+            )
+            if REQUIRE_COMPLETE:
+                problems.append(msg)
+            else:
+                logger.warning(msg)
+    session.expert_units.clear()
+    return problems
+
+
 def _check_complete(model: torch.nn.Module) -> None:
     incomplete: list[str] = []
     must_raise = False
+    session = get_reload_session(model)
+    if session is not None:
+        # A missing expert holds zeros (or old bytes, with direct loading) in
+        # every mode, and may sit in a module that already completed.
+        expert_problems = _check_expert_units(model, session)
+        if expert_problems:
+            session.incomplete = expert_problems
+            raise ReloadIncompleteError(
+                "Routed experts incomplete in this update: "
+                + "; ".join(expert_problems[:8])
+            )
     for name, layer in model.named_modules():
         info = LAYERWISE_INFO.get(layer)
         if info is None or not info.can_load() or info.kernel_tensors is None:
@@ -461,6 +575,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         finally:
             _CURRENT_LOAD.reset(token)
         info.load_numel += num_loaded
+        _record_expert_unit(layer, info, param_name, original_loader, bound_args)
 
         logger.debug(
             "%s: %d / %d",

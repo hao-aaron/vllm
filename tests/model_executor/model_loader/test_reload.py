@@ -2441,3 +2441,116 @@ def test_flashinfer_bmm_scales_refresh_in_place():
     # output-quant fusion folds the o-scale into bmm2: host floats (flagged)
     assert impl._trtllm_decode_bmm_scales(torch.ones(1)) == (None, impl.bmm2_scale)
     assert impl.float_scales_in_decode
+
+
+def _routed_experts_model(num_experts=3, local_of=lambda g: g, processed=None):
+    """One small unquantized RoutedExperts module (gated, no bias)."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    hidden, intermediate = 4, 2
+    local = [g for g in range(num_experts) if local_of(g) != -1]
+    config = SimpleNamespace(
+        hidden_dim_unpadded=hidden,
+        intermediate_size_per_partition_unpadded=intermediate,
+        is_act_and_mul=True,
+        has_bias=False,
+        tp_rank=0,
+        tp_shard_with_padding=False,
+        moe_parallel_config=SimpleNamespace(tp_size=1),
+    )
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    torch.nn.Module.__init__(method)
+    method.moe = config
+    method.process_weights_after_loading = (
+        processed.append if processed is not None else (lambda layer: None)
+    )
+    layer = object.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = config
+    layer.quant_config = None
+    layer.quant_method = method
+    layer.global_num_experts = num_experts
+    layer.expert_map_manager = SimpleNamespace(map_global_to_local=local_of)
+    layer._loaded_expert_biases = set()
+    method.create_weights(
+        layer,
+        len(local),
+        hidden,
+        intermediate,
+        torch.float32,
+        weight_loader=layer.weight_loader,
+    )
+    model = torch.nn.ModuleList([layer])
+    record_metadata_for_reloading(model)
+    return model, layer, (hidden, intermediate)
+
+
+def _send_expert(layer, dims, expert, shard):
+    hidden, intermediate = dims
+    name = "w2_weight" if shard == "w2" else "w13_weight"
+    shape = (hidden, intermediate) if shard == "w2" else (intermediate, hidden)
+    param = getattr(layer, name)
+    param.weight_loader(param, torch.ones(shape), name, shard, expert)
+
+
+_ALL_UNITS = [(e, s) for e in range(3) for s in ("w1", "w3", "w2")]
+
+
+@pytest.mark.parametrize(
+    "sends,error,completes_early",
+    [
+        # every (expert, shard): fine
+        (_ALL_UNITS, None, True),
+        # expert 1's w1 never arrives: its slice would serve zeros
+        ([u for u in _ALL_UNITS if u != (1, "w1")], "never loaded", False),
+        # expert 0's w3 twice and expert 2's w3 never: the numel count reaches
+        # its total, so the module completes early with expert 2 missing
+        (
+            [u for u in _ALL_UNITS if u != (2, "w3")] + [(0, "w3")],
+            "never loaded",
+            True,
+        ),
+    ],
+)
+def test_routed_experts_required_units(sends, error, completes_early):
+    processed: list = []
+    model, layer, dims = _routed_experts_model(processed=processed)
+    initialize_layerwise_reload(model)
+    for expert, shard in sends:
+        _send_expert(layer, dims, expert, shard)
+    assert bool(processed) == completes_early
+    if error is None:
+        finalize_layerwise_reload(model, model_config=None)
+        return
+    with pytest.raises(reload_layerwise.ReloadIncompleteError, match=error):
+        finalize_layerwise_reload(model, model_config=None)
+    reload_layerwise.abort_reload(model)
+
+
+def test_routed_experts_required_units_ep_and_duplicates():
+    # EP: global experts 0 and 2 are local (local ids 0, 1); 1 and 3 are not
+    local_of = {0: 0, 1: -1, 2: 1, 3: -1}.get
+    model, layer, dims = _routed_experts_model(num_experts=4, local_of=local_of)
+    initialize_layerwise_reload(model)
+    # a broadcast sends every expert; non-local ones are declined
+    for expert in range(4):
+        for shard in ("w1", "w3", "w2"):
+            _send_expert(layer, dims, expert, shard)
+    finalize_layerwise_reload(model, model_config=None)
+
+    # a duplicate alone (nothing missing) is reported, not fatal
+    model, layer, dims = _routed_experts_model()
+    initialize_layerwise_reload(model)
+    for expert, shard in _ALL_UNITS:
+        _send_expert(layer, dims, expert, shard)
+    _send_expert(layer, dims, 0, "w1")  # after completion: excess, ignored
+    session = reload_layerwise.get_reload_session(model)
+    assert session is not None
+    units = session.expert_units[id(layer)]
+    units[("w13_weight", "w1", 0)] += 1  # as if the duplicate came in time
+    missing, duplicated = reload_layerwise.check_expert_units(layer, units)
+    assert missing == [] and duplicated == [("w13_weight", "w1", 0)]
+    finalize_layerwise_reload(model, model_config=None)

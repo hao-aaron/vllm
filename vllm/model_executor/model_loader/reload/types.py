@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import Counter
 from dataclasses import dataclass, field
 from inspect import BoundArguments
 from typing import Any
@@ -25,6 +26,9 @@ class ReloadSession:
     incomplete: list[str] = field(default_factory=list)
     # between start and finish/abort: params are on meta / hold checkpoint bytes
     active: bool = True
+    # routed experts: id(module) -> arrivals per (param, shard, local expert);
+    # expert "*" is a stacked [E, ...] load covering every local expert
+    expert_units: dict[int, Counter] = field(default_factory=dict)
 
 
 @dataclass

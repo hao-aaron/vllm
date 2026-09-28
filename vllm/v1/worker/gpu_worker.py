@@ -216,6 +216,9 @@ class Worker(WorkerBase):
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         self._weight_update_is_draft = False
+        # an update/finish failed on this rank since the last start; finish
+        # still joins the all-ranks agreement so peers don't wait for it
+        self._weight_update_failed = False
 
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -1472,6 +1475,7 @@ class Worker(WorkerBase):
             self.weight_transfer_engine.reset_weight_update_target()
             raise
         self._weight_update_active = True
+        self._weight_update_failed = False
         self._weight_update_is_draft = is_draft
 
     def update_weights(self, update_info: dict | list[dict]) -> None:
@@ -1523,28 +1527,70 @@ class Worker(WorkerBase):
                 abort_reload(model)
         finally:
             self._weight_update_active = False
+            self._weight_update_failed = True
             self.weight_transfer_engine.reset_weight_update_target()
+
+    def _weight_update_ok_on_all_ranks(self, ok: bool) -> bool:
+        """All ranks of this engine (TP x PP) agree on the outcome before any
+        of them serves: a forward runs on all of them together, so one rank's
+        failure (e.g. an expert missing on its EP shard) makes every rank's
+        weights unusable. DP replicas are separate engines and not included."""
+        from vllm.distributed import parallel_state
+
+        if parallel_state._WORLD is None or parallel_state._WORLD.world_size == 1:
+            return ok
+        group = parallel_state.get_world_group()
+        flag = torch.tensor([int(ok)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        return bool(flag.item())
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
 
-        if not self._weight_update_active:
+        failed_earlier = self._weight_update_failed
+        if not self._weight_update_active and not failed_earlier:
             raise RuntimeError(
                 "finish_weight_update called without a matching start_weight_update."
             )
 
         with set_current_vllm_config(self.vllm_config):
-            try:
-                self.weight_transfer_engine.finish_weight_update()
-            except BaseException:
-                # A failed finish used to leave `_weight_update_active` set, so
-                # the next start raised "already active".
-                self._abort_weight_update()
-                raise
+            error: BaseException | None = None
+            if self._weight_update_active:
+                try:
+                    self.weight_transfer_engine.finish_weight_update()
+                except BaseException as e:
+                    # A failed finish used to leave `_weight_update_active` set,
+                    # so the next start raised "already active".
+                    error = e
+                    self._abort_weight_update()
+            ok = error is None and not failed_earlier
+            all_ok = self._weight_update_ok_on_all_ranks(ok)
+            self._weight_update_failed = False
+            if error is not None:
+                raise error
+            if failed_earlier:
+                raise RuntimeError(
+                    "finish_weight_update: this weight update already failed on "
+                    "this rank (see the earlier error); the model stays dirty "
+                    "until a full update succeeds."
+                )
             self.weight_transfer_engine.reset_weight_update_target()
             self._weight_update_active = False
+            if not all_ok:
+                from vllm.model_executor.model_loader.reload import mark_dirty
+
+                model = getattr(self.weight_transfer_engine, "model", None)
+                if isinstance(model, torch.nn.Module):
+                    mark_dirty(model)
+                raise RuntimeError(
+                    "finish_weight_update: the weight update failed on another "
+                    "rank; this rank's weights are marked dirty and the engine "
+                    "refuses to serve until a full update succeeds."
+                )
 
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
