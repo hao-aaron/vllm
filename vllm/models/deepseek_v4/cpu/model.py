@@ -914,6 +914,9 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
+    # Modulewise reload: the model hook does nothing (yet).
+    reload_safe = True
+
     def process_weights_after_loading(self) -> None:
         # No CPU AMX weight-packing hook yet.
         pass

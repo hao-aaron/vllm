@@ -1196,6 +1196,19 @@ class DeepseekV4MoE(nn.Module):
             self.experts.finalize_weights(self.shared_experts)
 
 
+def mega_moe_reload_safe(model: nn.Module) -> bool:
+    """Whether every MegaMoE experts module of `model` redoes its transform
+    per module on reload. MegaMoE shared-expert fusion (reads another
+    module's checkpoint tensors) and the FlashInfer MoE-EP experts (weights
+    held in a FlashInfer object) fail closed."""
+    for module in model.modules():
+        if isinstance(module, DeepseekV4MegaMoEExperts) and (
+            module.has_fused_shared_experts or not module.reload_outputs
+        ):
+            return False
+    return True
+
+
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """Pick the CUDA sparse-MLA attention class for the configured backend.
 
@@ -2097,16 +2110,9 @@ class DeepseekV4ForCausalLM(
     @property
     def reload_safe(self) -> bool:
         """Modulewise reload: the model hook's work is redone per module
-        (MegaMoE reload_outputs) and by `refresh()` (mHC broadcast), except
-        for MegaMoE shared-expert fusion (reads another module's checkpoint
-        tensors) and the FlashInfer MoE-EP experts (weights held in a
-        FlashInfer object), which fail closed."""
-        for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts) and (
-                module.has_fused_shared_experts or not module.reload_outputs
-            ):
-                return False
-        return True
+        (MegaMoE reload_outputs) and by `refresh()` (mHC broadcast); see
+        `mega_moe_reload_safe` for what fails closed."""
+        return mega_moe_reload_safe(self)
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()

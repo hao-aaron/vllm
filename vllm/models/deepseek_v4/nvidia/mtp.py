@@ -533,6 +533,14 @@ class DeepSeekV4MTP(nn.Module):
         for layer in self.model.layers.values():
             layer.mtp_block.ffn.finalize_mega_moe_weights()
 
+    @property
+    def reload_safe(self) -> bool:
+        # Modulewise reload: the hook's only work (the MegaMoE transform) is
+        # redone per module on reload.
+        from vllm.models.deepseek_v4.nvidia.model import mega_moe_reload_safe
+
+        return mega_moe_reload_safe(self)
+
     def process_weights_after_loading(self) -> None:
         self.finalize_mega_moe_weights()
 

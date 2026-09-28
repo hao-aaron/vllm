@@ -342,6 +342,11 @@ class DeepseekV41ForCausalLM(
         self._weights_finalized = True
         return loaded_params
 
+    @property
+    def reload_safe(self) -> bool:
+        # Modulewise reload: the hook only runs the language model's hook.
+        return bool(getattr(self.language_model, "reload_safe", False))
+
     def process_weights_after_loading(self) -> None:
         # Model-level post-load hook (called by the loader after any load
         # format). Under DummyModelLoader the child's load_weights — and

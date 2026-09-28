@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import importlib
 import importlib.machinery
 import inspect
 import sys
@@ -2700,3 +2701,28 @@ def test_dots3_vision_moe_fused_fp8_refresh(monkeypatch, keep):
         now = getattr(mlp, name)
         assert now is t and now.data_ptr() == ptr
         assert torch.equal(now, exp)
+
+
+@pytest.mark.parametrize(
+    "module,cls_name",
+    [
+        ("vllm.models.kimi_k3.nvidia.model", "KimiK3ForConditionalGeneration"),
+        (
+            "vllm.models.deepseek_v4.common.vl_model",
+            "DeepseekV4ForConditionalGeneration",
+        ),
+        ("vllm.models.deepseek_v41.nvidia.vl_model", "DeepseekV41ForCausalLM"),
+    ],
+)
+@pytest.mark.parametrize("inner_safe", [True, False, None])
+def test_wrapper_models_delegate_reload_safe(module, cls_name, inner_safe):
+    """Wrapper models whose hook only runs the language model's hook are as
+    reload-safe as that language model (undeclared: not safe)."""
+    cls = getattr(importlib.import_module(module), cls_name)
+    model = object.__new__(cls)
+    torch.nn.Module.__init__(model)
+    inner = torch.nn.Module()
+    if inner_safe is not None:
+        inner.reload_safe = inner_safe
+    model.language_model = inner
+    assert model.reload_safe is bool(inner_safe)
