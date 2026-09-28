@@ -2659,3 +2659,44 @@ def test_deepseek_v4_reload_safe_fails_closed_for_unsupported_experts():
         experts_of(DeepseekV4MegaMoEExperts, fused_shared=True)
     ).reload_safe
     assert not model_with(experts_of(DeepseekV4MegaMoEExpertsFI)).reload_safe
+
+
+@requires_cuda
+@pytest.mark.parametrize("keep", [True, False])
+def test_dots3_vision_moe_fused_fp8_refresh(monkeypatch, keep):
+    """dots3 vision MoE (kind C by default: fused FP8 buffers built from the
+    experts, which are then deleted). With weight updates configured the
+    experts are kept, so the fused buffers are derived state that refresh()
+    recomputes in place; otherwise the block is not reload-safe."""
+    import vllm.models.dots3_note.nvidia.vision as vision
+
+    monkeypatch.setattr(vision, "_keep_experts_for_reload", lambda: keep)
+    config = SimpleNamespace(
+        embed_dim=128,
+        pyramid_num_routed=[2],
+        capacity_factor=1,
+        router_scoring_func="sigmoid",
+        router_scale=1.0,
+        moe_intermediate_size=128,
+        use_bias=False,
+    )
+    with torch.device("cuda"):
+        mlp = vision.MoESwiGLUFFNFP8(config, layer_number=0)
+    mlp.process_weights_after_loading()
+    assert mlp.reload_safe is keep
+    if not keep:
+        assert not hasattr(mlp, "experts")
+        return
+    live = {
+        n: (getattr(mlp, n), getattr(mlp, n).data_ptr())
+        for n in vision._FUSED_FP8_BUFFERS
+    }
+    with torch.no_grad():
+        for p in mlp.experts.parameters():
+            p.mul_(2.0)  # a reload lands new expert weights
+    expected = mlp._fused_fp8()
+    mlp.refresh()
+    for (name, (t, ptr)), exp in zip(live.items(), expected):
+        now = getattr(mlp, name)
+        assert now is t and now.data_ptr() == ptr
+        assert torch.equal(now, exp)

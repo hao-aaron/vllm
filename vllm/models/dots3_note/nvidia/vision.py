@@ -225,14 +225,28 @@ def _per_block_cast_to_fp8_padded(
     )
 
 
+_FUSED_FP8_BUFFERS = (
+    "_fused_w13_fp8",
+    "_fused_w13_scale",
+    "_fused_w2_fp8",
+    "_fused_w2_scale",
+)
+
+
+def _keep_experts_for_reload() -> bool:
+    """Weight updates (a weight transfer backend is configured) need the
+    source experts to rebuild the fused FP8 buffers from."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    return config is not None and config.weight_transfer_config is not None
+
+
 class MoESwiGLUFFNFP8(MoESwiGLUFFN):
     """NOTE vision MoE using the checkpoint's local block-FP8 semantics."""
 
     @torch.no_grad()
-    def process_weights_after_loading(self) -> None:
-        if hasattr(self, "_fused_w13_fp8"):
-            return
-
+    def _fused_fp8(self) -> tuple[torch.Tensor, ...]:
         w13_weights = []
         w13_scales = []
         w2_weights = []
@@ -245,28 +259,35 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
             w13_scales.append(torch.cat((s1, s3), dim=0))
             w2_weights.append(w2)
             w2_scales.append(s2)
+        return tuple(
+            torch.stack(t).contiguous()
+            for t in (w13_weights, w13_scales, w2_weights, w2_scales)
+        )
 
-        self.register_buffer(
-            "_fused_w13_fp8",
-            torch.stack(w13_weights).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w13_scale",
-            torch.stack(w13_scales).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w2_fp8",
-            torch.stack(w2_weights).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w2_scale",
-            torch.stack(w2_scales).contiguous(),
-            persistent=False,
-        )
-        del self.experts
+    @torch.no_grad()
+    def process_weights_after_loading(self) -> None:
+        if hasattr(self, "_fused_w13_fp8"):
+            return
+        for name, tensor in zip(_FUSED_FP8_BUFFERS, self._fused_fp8()):
+            self.register_buffer(name, tensor, persistent=False)
+        # The fused buffers are all the forward reads. Keep the source experts
+        # only when weights can be updated in place (see `refresh`).
+        if not _keep_experts_for_reload():
+            del self.experts
+
+    @property
+    def reload_safe(self) -> bool:
+        return hasattr(self, "experts")
+
+    @torch.no_grad()
+    def refresh(self) -> None:
+        """Modulewise reload, kind A: with the source experts kept, the fused
+        FP8 buffers are derived from live params; recompute them in place
+        after the experts' new weights landed."""
+        if not hasattr(self, "_fused_w13_fp8") or not self.reload_safe:
+            return
+        for name, tensor in zip(_FUSED_FP8_BUFFERS, self._fused_fp8()):
+            getattr(self, name).copy_(tensor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not hasattr(self, "_fused_w13_fp8"):
