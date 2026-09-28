@@ -312,11 +312,27 @@ def _check_complete(model: torch.nn.Module) -> None:
         if is_deferred_attention_layer(layer):
             continue
         if 0 < info.load_numel < info.load_numel_total:  # type: ignore[operator]
+            # Required keys, by name: every loadable tensor must have received
+            # a loader call. Counts alone can't tell a missing shard from
+            # padding a loader never writes.
+            restore_params, restore_buffers = info.restore_metadata
+            never_loaded = sorted(
+                t
+                for t in (*restore_params, *restore_buffers)
+                if t not in SKIP_LOAD_TENSORS
+                and t not in info.kernel_non_persistent_buffers
+                and t not in info.loaded_names
+            )
             incomplete.append(
                 f"{name or type(layer).__name__} "
-                f"({info.load_numel}/{info.load_numel_total})"
+                f"({info.load_numel}/{info.load_numel_total}"
+                + (f", never loaded: {never_loaded}" if never_loaded else "")
+                + ")"
             )
-            must_raise = must_raise or bool(getattr(info, "hosted", None))
+            # With direct loading a never-loaded hosted tensor holds zeros
+            must_raise = must_raise or bool(
+                set(never_loaded) & set(getattr(info, "hosted", {}))
+            )
     session = get_reload_session(model)
     if session is not None:
         session.incomplete = incomplete
