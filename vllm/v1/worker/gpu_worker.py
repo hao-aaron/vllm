@@ -1223,6 +1223,14 @@ class Worker(WorkerBase):
                 handle.wait()
             self._pp_send_work = []
 
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            # weight-update integrity: not mid-update, not after a failed one
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                check_can_serve,
+            )
+
+            check_can_serve(self.model_runner.get_model())
+
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
