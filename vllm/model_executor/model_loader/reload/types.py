@@ -29,6 +29,12 @@ class ReloadSession:
     # routed experts: id(module) -> arrivals per (param, shard, local expert);
     # expert "*" is a stacked [E, ...] load covering every local expert
     expert_units: dict[int, Counter] = field(default_factory=dict)
+    # True: a partial update (modules may receive nothing). False: a full
+    # update (every module with checkpoint tensors must receive weights).
+    # None: unspecified (modules that received nothing are reported)
+    partial: bool | None = None
+    # id(module) -> name, for modules a full update must touch
+    required_modules: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass

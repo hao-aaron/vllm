@@ -358,3 +358,28 @@ class ReloadHarnessExtension:
             out["error"] = (out["error"] or "") + f" | finish: {e}"[:400]
         out["dirty"] = is_model_dirty(model)
         return out
+
+    def mw_load_only(
+        self, path: str, skip_regex: str | None = None, batch_size: int = 16
+    ) -> None:
+        """Stream ``path`` into the weight transfer engine's model, between a
+        caller's ``start_weight_update`` and ``finish_weight_update`` RPCs
+        (stands in for ``update_weights`` without a trainer)."""
+        from safetensors import safe_open
+
+        from vllm.config import set_current_vllm_config
+
+        files = _checkpoint_files(path)
+        names = order_names(_read_names(files), "natural")
+        if skip_regex:
+            names = [n for n in names if not re.search(skip_regex, n[0])]
+        handles = {fn: safe_open(fn, "pt", device="cpu") for fn in files}
+        device = torch.device("cuda", torch.cuda.current_device())
+        model = self.weight_transfer_engine.model
+        with set_current_vllm_config(self.vllm_config):
+            for i in range(0, len(names), batch_size):
+                batch = [
+                    (n, handles[fn].get_tensor(n).to(device))
+                    for n, fn in names[i : i + batch_size]
+                ]
+                model.load_weights(iter(batch))

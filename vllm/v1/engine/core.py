@@ -135,6 +135,13 @@ class EngineCore:
         self.log_stats = log_stats
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
+        # Weight-update integrity. A failed update/finish leaves some weights
+        # written (dirty): the engine keeps scheduling paused, rejects new
+        # requests and refuses to resume until a full update succeeds, but
+        # keeps accepting weight-update RPCs. `_paused_for_weight_update`: the
+        # engine paused a running scheduler itself at start (resumed on success).
+        self._weights_dirty = False
+        self._paused_for_weight_update = False
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -494,6 +501,7 @@ class EngineCore:
             raise TypeError(
                 f"request_id must be a string, got {type(request.request_id)}"
             )
+        self._check_weights_not_dirty("accept requests")
 
         if pooling_params := request.pooling_params:
             supported_pooling_tasks = [
@@ -910,7 +918,17 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        self._check_weights_not_dirty("resume generation")
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
+
+    def _check_weights_not_dirty(self, action: str) -> None:
+        if self._weights_dirty:
+            raise RuntimeError(
+                f"Cannot {action}: a weight update failed after writing model "
+                "weights, and the engine serves nothing until a full weight "
+                "update succeeds (start_weight_update / update_weights / "
+                "finish_weight_update)."
+            )
 
     def is_scheduler_paused(self) -> bool:
         """Return whether the scheduler is in any pause state."""
@@ -1027,6 +1045,9 @@ class EngineCore:
             path=path, pattern=pattern, max_size=max_size
         )
 
+    _WEIGHT_UPDATE_START_RPCS = ("start_weight_update", "start_draft_weight_update")
+    _WEIGHT_UPDATE_RPCS = (*_WEIGHT_UPDATE_START_RPCS, "update_weights")
+
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -1034,7 +1055,43 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        if method not in (*self._WEIGHT_UPDATE_RPCS, "finish_weight_update"):
+            return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        return self._weight_update_rpc(method, timeout, args, kwargs)
+
+    def _weight_update_rpc(self, method, timeout, args, kwargs):
+        """Weight-update RPCs. Nothing may run a forward between start and
+        finish (params are on meta or hold checkpoint bytes): a running,
+        non-DP scheduler is paused at start and resumed after a successful
+        finish. A failed update or finish marks the engine dirty."""
+        is_start = method in self._WEIGHT_UPDATE_START_RPCS
+        if (
+            is_start
+            and self.scheduler.pause_state == PauseState.UNPAUSED
+            and self.vllm_config.parallel_config.data_parallel_size == 1
+        ):
+            self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+            self._paused_for_weight_update = True
+        try:
+            result = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        except BaseException:
+            if not is_start:  # a failed start wrote nothing
+                self._weights_dirty = True
+            if not self._weights_dirty:
+                self._release_weight_update_pause()
+            elif self._paused_for_weight_update:
+                # stay paused; resume only after a full update succeeds
+                self.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+            raise
+        if method == "finish_weight_update":
+            self._weights_dirty = False
+            self._release_weight_update_pause()
+        return result
+
+    def _release_weight_update_pause(self) -> None:
+        if self._paused_for_weight_update:
+            self._paused_for_weight_update = False
+            self.scheduler.set_pause_state(PauseState.UNPAUSED)
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
@@ -1604,6 +1661,14 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
                 return
+            if self._weights_dirty:
+                logger.warning(
+                    "Rejecting request %s: a weight update failed; the engine "
+                    "serves nothing until a full weight update succeeds.",
+                    req.request_id,
+                )
+                self._send_error_outputs_to_client([req.request_id], req.client_index)
+                return
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
@@ -2171,6 +2236,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 )
 
     def resume_scheduler(self):
+        self._check_weights_not_dirty("resume generation")
         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
             raise RuntimeError(
                 "resume_scheduler called while pause is still in "

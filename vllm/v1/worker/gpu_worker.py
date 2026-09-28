@@ -1434,15 +1434,21 @@ class Worker(WorkerBase):
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
 
-    def start_weight_update(self) -> None:
+    def start_weight_update(self, partial: bool | None = None) -> None:
         """Start a new weight update session.
 
         Delegates engine-specific preparation (e.g. layerwise reload setup) to
         the configured weight transfer engine. The worker only tracks that a
         session is active.
+
+        Args:
+            partial: True if this update sends only part of the model; False
+                if it must send every module's weights (finish raises
+                otherwise); None to only report modules that received none.
+
         """
         with set_current_vllm_config(self.vllm_config):
-            self._start_weight_update()
+            self._start_weight_update(partial=partial)
 
     def start_draft_weight_update(self) -> None:
         """Like start_weight_update, but retargets the engine at the speculative
@@ -1451,7 +1457,9 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self._start_weight_update(is_draft=True)
 
-    def _start_weight_update(self, is_draft: bool = False) -> None:
+    def _start_weight_update(
+        self, is_draft: bool = False, partial: bool | None = None
+    ) -> None:
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
 
@@ -1477,6 +1485,17 @@ class Worker(WorkerBase):
         self._weight_update_active = True
         self._weight_update_failed = False
         self._weight_update_is_draft = is_draft
+        if partial is not None:
+            from vllm.model_executor.model_loader.reload import get_reload_session
+
+            model = getattr(self.weight_transfer_engine, "model", None)
+            session = (
+                get_reload_session(model)
+                if isinstance(model, torch.nn.Module)
+                else None
+            )
+            if session is not None:
+                session.partial = partial
 
     def update_weights(self, update_info: dict | list[dict]) -> None:
         """Receive one weight update chunk from the trainer.

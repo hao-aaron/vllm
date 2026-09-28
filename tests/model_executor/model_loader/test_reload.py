@@ -526,6 +526,7 @@ def test_padded_moe_reload_releases_each_layer(
         layer.moe_config = config
         layer.quant_config = None
         layer.quant_method = method
+        layer.global_num_experts = experts
         layer.expert_map_manager = SimpleNamespace(map_global_to_local=lambda i: i)
         layer._loaded_expert_biases = set()
         method.create_weights(
@@ -2246,6 +2247,7 @@ def _routed_experts(method, local=(0, 1), num_global=4, hidden=4, inter=3):
     layer.quant_config = None
     layer.quant_method = method
     local_map = {g: i for i, g in enumerate(local)}
+    layer.global_num_experts = num_global
     layer.expert_map_manager = SimpleNamespace(
         map_global_to_local=lambda g: local_map.get(g, -1)
     )
@@ -2308,7 +2310,7 @@ def test_per_expert_backstop_and_fallbacks(monkeypatch):
     import vllm.model_executor.model_loader.reload.per_expert as per_expert
 
     monkeypatch.setattr(per_expert, "PER_EXPERT", True)
-    # expert 1 never sent: the module completes at finalize via flush (zeros)
+    # expert 1 never sent: a missing expert fails the update (required keys)
     method = _PerExpertMethod()
     layer = _routed_experts(method)
     model = torch.nn.Sequential(layer)
@@ -2318,6 +2320,25 @@ def test_per_expert_backstop_and_fallbacks(monkeypatch):
     _send(layer, "w13_weight", "w1", 0, 1.0)
     _send(layer, "w13_weight", "w3", 0, 1.0)
     _send(layer, "w2_weight", "w2", 0, 1.0)
+    with pytest.raises(reload_layerwise.ReloadIncompleteError, match="never loaded"):
+        finalize_layerwise_reload(model, model_config=None)
+    reload_layerwise.abort_reload(model)
+
+    # backstop: units whose pieces arrived but never reached their count
+    # (e.g. padding miscounts) are quantized by flush at completion (zeros
+    # here, as nothing was sent for expert 1 and its units are not tracked)
+    method = _PerExpertMethod()
+    layer = _routed_experts(method)
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    _send(layer, "w13_weight", "w1", 0, 1.0)
+    _send(layer, "w13_weight", "w3", 0, 1.0)
+    _send(layer, "w2_weight", "w2", 0, 1.0)
+    session = reload_layerwise.get_reload_session(model)
+    assert session is not None
+    session.expert_units.clear()
     finalize_layerwise_reload(model, model_config=None)
     assert {(n, e) for n, e, _ in method.quantized} == {
         (n, e) for n in ("w13_weight", "w2_weight") for e in (0, 1)
@@ -2554,3 +2575,52 @@ def test_routed_experts_required_units_ep_and_duplicates():
     missing, duplicated = reload_layerwise.check_expert_units(layer, units)
     assert missing == [] and duplicated == [("w13_weight", "w1", 0)]
     finalize_layerwise_reload(model, model_config=None)
+
+
+class _WeightOnly(torch.nn.Module):
+    def __init__(self, weight: torch.nn.Parameter | None = None):
+        super().__init__()
+        self.weight = (
+            weight if weight is not None else torch.nn.Parameter(torch.zeros(2, 2))
+        )
+        self.weight.weight_loader = default_weight_loader
+
+
+def _full_partial_model():
+    """Embed / lm_head (tied) / proj / a rotary-like module with only a
+    non-persistent buffer."""
+    model = torch.nn.Module()
+    model.embed = _WeightOnly()
+    model.lm_head = _WeightOnly(model.embed.weight)  # tied
+    model.proj = _WeightOnly()
+    model.rotary = torch.nn.Module()
+    model.rotary.register_buffer("cos_sin_cache", torch.ones(2), persistent=False)
+    record_metadata_for_reloading(model)
+    return model
+
+
+@pytest.mark.parametrize("partial", [None, False, True])
+@pytest.mark.parametrize("send_proj", [True, False])
+def test_full_vs_partial_update(partial, send_proj):
+    """A full update (partial=False) must send every module that owns a
+    checkpoint tensor; a tied lm_head and a module with only non-persistent
+    buffers never need their own weights. Unspecified reports, partial
+    accepts."""
+    model = _full_partial_model()
+    initialize_layerwise_reload(model, partial=partial)
+    session = reload_layerwise.get_reload_session(model)
+    assert session is not None
+    assert set(session.required_modules.values()) == {"embed", "proj"}
+    sends = [model.embed] + ([model.proj] if send_proj else [])
+    for module in sends:
+        module.weight.weight_loader(module.weight, torch.full((2, 2), 3.0))
+    if not send_proj and partial is False:
+        with pytest.raises(reload_layerwise.ReloadIncompleteError, match="proj"):
+            finalize_layerwise_reload(model, model_config=None)
+        reload_layerwise.abort_reload(model)
+        return
+    finalize_layerwise_reload(model, model_config=None)
+    assert torch.equal(model.embed.weight, torch.full((2, 2), 3.0))
+    assert model.lm_head.weight is model.embed.weight
+    expected = 3.0 if send_proj else 0.0  # untouched modules keep old weights
+    assert torch.equal(model.proj.weight, torch.full((2, 2), expected))

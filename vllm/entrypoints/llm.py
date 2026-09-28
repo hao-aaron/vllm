@@ -884,9 +884,17 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             "init_weight_transfer_engine", kwargs={"init_info": init_info_dict}
         )
 
-    def start_weight_update(self) -> None:
-        """Start a new weight update."""
-        self.llm_engine.collective_rpc("start_weight_update")
+    def start_weight_update(self, partial: bool | None = None) -> None:
+        """Start a new weight update.
+
+        Args:
+            partial: True if the update sends only part of the model; False
+                to require every module's weights (finish raises otherwise);
+                None (default) to only report modules that received none.
+
+        """
+        kwargs = {} if partial is None else {"partial": partial}
+        self.llm_engine.collective_rpc("start_weight_update", kwargs=kwargs)
 
     def start_draft_weight_update(self) -> None:
         """Start a new weight update targeting the speculative draft model."""
