@@ -33,6 +33,13 @@ class LayerReloadingInfo:
     # persistence survives `_non_persistent_buffers_set` being mutated during reload
     kernel_non_persistent_buffers: set[str] = field(default_factory=set)
 
+    # names of tensors materialized (first touch) this round, and their bytes
+    materialized: set[str] = field(default_factory=set)
+    scratch_bytes: int = 0
+
+    # names of tensors that received at least one loader call this round
+    loaded_names: set[str] = field(default_factory=set)
+
     def reset(self):
         self.__init__(  # type: ignore[misc]
             restore_metadata=self.restore_metadata, restore_device=self.restore_device

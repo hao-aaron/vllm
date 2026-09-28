@@ -634,7 +634,7 @@ def test_layerwise_loading_warning_only_checks_new_layers(monkeypatch):
         layer.weight.weight_loader = partial_weight_loader
         reload_layerwise.initialize_online_processing(layer)
 
-    monkeypatch.setattr(reload_layerwise, "has_device_tensors", lambda _: True)
+    monkeypatch.setattr(reload_layerwise, "_has_device_incoming", lambda _: True)
     get_info_size = Mock(return_value=0)
     warning_once = Mock()
     monkeypatch.setattr(reload_layerwise, "get_info_size", get_info_size)
@@ -1213,3 +1213,157 @@ def test_online_quantize_reload(
         mul_perp = llm.generate_prompt_perplexity(["3 4 = 12"], mask=["3 4 ="])[0]
         add_perp = llm.generate_prompt_perplexity(["3 4 = 7"], mask=["3 4 ="])[0]
         assert add_perp < mul_perp
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload, PR 1: first-touch materialization (device incoming)
+# ---------------------------------------------------------------------------
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="first-touch path needs device incoming"
+)
+
+
+class _ProcessRecorder(QuantizeMethodBase):
+    """Records a clone of every tensor of the layer when processing runs."""
+
+    def __init__(self):
+        self.calls: list[dict[str, torch.Tensor]] = []
+
+    def create_weights(self, layer, *weight_args, **extra_weight_attrs):
+        pass
+
+    def apply(self, layer, *args, **kwargs):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        self.calls.append(
+            {n: t.detach().clone() for n, t in get_layer_tensors(layer).items()}
+        )
+
+
+class _ExpertLayer(torch.nn.Module):
+    """Two local experts out of `num_global`; non-local calls copy nothing and
+    return False, like `RoutedExperts.weight_loader`."""
+
+    def __init__(self, num_global=8, local=(2, 5), device="cuda"):
+        super().__init__()
+        self.local = {g: i for i, g in enumerate(local)}
+        self.quant_method = _ProcessRecorder()
+        w = torch.nn.Parameter(torch.randn(len(local), 4, 6, device=device))
+        w.weight_loader = self.weight_loader
+        self.register_parameter("w", w)
+
+    def weight_loader(self, param, loaded_weight, expert_id):
+        if expert_id not in self.local:
+            return False
+        param.data[self.local[expert_id]].copy_(loaded_weight)
+        return True
+
+
+@requires_cuda
+def test_first_touch_does_not_retain_nonlocal_experts():
+    layer = _ExpertLayer()
+    model = torch.nn.Sequential(layer)
+    live = layer.w
+    live_ptr = live.data_ptr()
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    info = reload_layerwise.get_layerwise_info(layer)
+
+    refs = []
+    for e in range(8):
+        incoming = torch.full((4, 6), float(e), device="cuda")
+        refs.append(ref(incoming))
+        layer.w.weight_loader(layer.w, incoming, expert_id=e)
+        # nothing is buffered on the first-touch path
+        assert info.loaded_weights == [] or not info.can_load()
+        del incoming
+    gc.collect()
+    assert all(r() is None for r in refs), "incoming tensors were retained"
+    # the module completed inside the last local call (expert 5)
+    assert len(layer.quant_method.calls) == 1
+    finalize_layerwise_reload(model, model_config=None)
+    assert layer.w is live and layer.w.data_ptr() == live_ptr
+    assert torch.equal(layer.w[0], torch.full((4, 6), 2.0, device="cuda"))
+    assert torch.equal(layer.w[1], torch.full((4, 6), 5.0, device="cuda"))
+
+
+@requires_cuda
+def test_cpu_incoming_keeps_buffering():
+    layer = _ExpertLayer()
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    info = reload_layerwise.get_layerwise_info(layer)
+    layer.w.weight_loader(layer.w, torch.full((4, 6), 1.0), expert_id=2)
+    assert len(info.loaded_weights) == 1
+    assert layer.w.is_meta  # nothing materialized for CPU incoming
+    layer.w.weight_loader(layer.w, torch.full((4, 6), 3.0), expert_id=5)
+    finalize_layerwise_reload(model, model_config=None)
+    assert torch.equal(layer.w[0].cpu(), torch.full((4, 6), 1.0))
+    assert torch.equal(layer.w[1].cpu(), torch.full((4, 6), 3.0))
+
+
+@requires_cuda
+def test_first_touch_interleaved_modules_complete():
+    layers = [_ExpertLayer(local=(0, 1)) for _ in range(3)]
+    model = torch.nn.Sequential(*layers)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    # interleave: expert 0 of every layer, then expert 1 of every layer
+    for e in (0, 1):
+        for i, layer in enumerate(layers):
+            layer.w.weight_loader(
+                layer.w, torch.full((4, 6), 10.0 * i + e, device="cuda"), expert_id=e
+            )
+            if e == 0:
+                # open modules hold partition scratch, nothing else
+                info = reload_layerwise.get_layerwise_info(layer)
+                assert info.scratch_bytes == layer.w.nbytes
+    assert reload_layerwise.scratch_bytes_in_flight() == 0
+    finalize_layerwise_reload(model, model_config=None)
+    for i, layer in enumerate(layers):
+        assert len(layer.quant_method.calls) == 1
+        assert torch.equal(layer.w[1], torch.full((4, 6), 10.0 * i + 1, device="cuda"))
+
+
+class _PaddedLayer(torch.nn.Module):
+    """Live weight [4, 8]; the loader writes only [:, :6] (padding untouched)."""
+
+    def __init__(self):
+        super().__init__()
+        self.quant_method = _ProcessRecorder()
+        w = torch.nn.Parameter(torch.full((4, 8), 7.0, device="cuda"))
+        w.weight_loader = lambda param, loaded: param.data[:, :6].copy_(loaded)
+        w.weight_loader_numel = 24  # padding is not loadable
+        self.register_parameter("weight", w)
+
+
+@requires_cuda
+def test_first_touch_padding_reads_zero():
+    layer = _PaddedLayer()
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    layer.weight.weight_loader(layer.weight, torch.ones(4, 6, device="cuda"))
+    finalize_layerwise_reload(model, model_config=None)
+    seen = layer.quant_method.calls[0]["weight"]
+    assert torch.equal(seen[:, 6:], torch.zeros(4, 2, device="cuda"))
+    assert torch.equal(layer.weight[:, 6:], torch.zeros(4, 2, device="cuda"))
+
+
+@requires_cuda
+def test_first_touch_late_registered_bias():
+    quant_method = _RecordingQuantMethod()
+    with torch.device("cuda"):
+        layer = _LateBiasLayer(quant_method)
+    loaded_bias = torch.full((4,), 3.0, device="cuda")
+    layer.weight.weight_loader(layer.weight, torch.full((4, 2), 2.0, device="cuda"))
+    assert quant_method.bias_at_process is None
+    layer.bias.weight_loader(layer.bias, loaded_bias)
+    assert torch.equal(quant_method.bias_at_process, loaded_bias)
