@@ -487,6 +487,7 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
             Fp8MoeBackend.FLASHINFER_TRTLLM,
             Fp8MoeBackend.TRITON,
             Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.VLLM_CUTLASS,
         )
 
     # ---- per-expert quantization (one code path for module-level and
