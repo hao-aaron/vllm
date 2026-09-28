@@ -598,6 +598,7 @@ def finalize_layerwise_reload(*args, **kwargs):
 def _finalize_attention_layer(
     layer: torch.nn.Module, info: LayerReloadingInfo, model_config: ModelConfig
 ) -> None:
+    old_floats = _kv_scale_floats(layer)
     if info.kernel_tensors is None:
         if info.load_numel > 0:
             complete_module(layer, info)
@@ -618,6 +619,22 @@ def _finalize_attention_layer(
     before = {**params, **buffers}
     with reload_mode():
         layer.process_weights_after_loading(model_config.dtype)
+    # The layer PWAL refreshed backend state derived from the q/k/v scales
+    # (FlashInfer bmm1/bmm2 scales, device copies filled in place). Decode
+    # paths that consume host floats are baked into FULL CUDA graphs.
+    impl = getattr(layer, "impl", None)
+    if (
+        old_floats != _kv_scale_floats(layer)
+        and getattr(impl, "float_scales_in_decode", False)
+        and _cudagraphs_captured()
+    ):
+        logger.warning_once(
+            "Attention q/k/v scales changed on reload, but this attention "
+            "backend's decode path (%s) reads them as host floats, which "
+            "captured CUDA graphs bake in: decode uses the old scales until "
+            "the graphs are re-captured.",
+            type(impl).__name__,
+        )
     for name, old in before.items():
         new = getattr(layer, name, None)
         if new is None or new is old:
@@ -637,6 +654,23 @@ def _finalize_attention_layer(
                 type(layer).__name__,
                 name,
             )
+
+
+def _kv_scale_floats(layer: torch.nn.Module) -> tuple:
+    return tuple(
+        getattr(layer, name, None)
+        for name in ("_q_scale_float", "_k_scale_float", "_v_scale_float")
+    )
+
+
+def _cudagraphs_captured() -> bool:
+    try:
+        from vllm.config import CUDAGraphMode, get_current_vllm_config
+
+        mode = get_current_vllm_config().compilation_config.cudagraph_mode
+        return mode is not None and mode != CUDAGraphMode.NONE
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:

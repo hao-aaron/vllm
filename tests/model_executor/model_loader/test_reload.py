@@ -2395,3 +2395,49 @@ def test_fused_router_gate_refresh_in_place():
     assert runner._combined_gate_weight.data_ptr() == ptr
     assert torch.equal(fused[:4], torch.full((4, 8), 3.0, device="cuda"))
     assert torch.equal(fused[4:], runner.shared_expert_gate.weight)
+
+
+@requires_cuda
+def test_flashinfer_bmm_scales_refresh_in_place():
+    """FlashInfer's trtllm-gen decode reads bmm1/bmm2 scales from device
+    tensors allocated once and refilled by refresh(), so FULL CUDA graphs see
+    q/k/v scales changed by a reload. Values match the host-float path: the
+    launcher computes float(double(bmm1) * log2(e))."""
+    import math
+
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as fi
+
+    impl = object.__new__(fi.FlashInferImpl)
+    impl.scale = 0.125
+    impl.kv_cache_dtype = "fp8"
+    impl.bmm1_scale = impl.bmm2_scale = impl.o_sf_scale = None
+    impl._bmm_scale_tensors = None
+    impl.float_scales_in_decode = False
+    layer = SimpleNamespace(
+        _q_scale_float=1.0,
+        _k_scale_float=0.3,
+        _v_scale_float=0.7,
+        _o_scale_float=0.5,
+        _k_scale=torch.ones(1, device="cuda"),
+    )
+
+    impl.refresh(layer)
+    assert impl._bmm_scale_tensors is not None
+    bmm1_log2, bmm2 = impl._bmm_scale_tensors
+    ptrs = (bmm1_log2.data_ptr(), bmm2.data_ptr())
+    assert layer._o_scale_float is None  # re-read at the next eager forward
+    assert impl._trtllm_decode_bmm_scales(None) == (bmm1_log2, bmm2)
+    assert not impl.float_scales_in_decode
+
+    layer._k_scale_float, layer._v_scale_float = 0.9, 0.2
+    impl.refresh(layer)
+    assert (bmm1_log2.data_ptr(), bmm2.data_ptr()) == ptrs
+    assert impl.bmm1_scale == 0.125 * 0.9
+    expected_log2 = torch.tensor([0.125 * 0.9 * math.log2(math.e)], dtype=torch.float32)
+    assert torch.equal(bmm1_log2.cpu(), expected_log2)
+    assert torch.equal(bmm2.cpu(), torch.tensor([0.2], dtype=torch.float32))
+
+    # output-quant fusion folds the o-scale into bmm2: host floats (flagged)
+    assert impl._trtllm_decode_bmm_scales(torch.ones(1)) == (None, impl.bmm2_scale)
+    assert impl.float_scales_in_decode

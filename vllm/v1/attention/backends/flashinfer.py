@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import math
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
@@ -102,6 +104,14 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+# Pass the q/k/v-derived bmm scales to the trtllm-gen decode kernel as device
+# tensors (allocated once, refilled in place by `FlashInferImpl.refresh`), so
+# FULL CUDA graphs read the current scales after a weight reload instead of
+# the floats they were captured with. Prefill runs outside FULL graphs and keeps
+# the host floats. The values match the float path bit for bit (the launcher
+# computes float(double(bmm1) * log2(e)) and float(double(bmm2))).
+_TENSOR_BMM_SCALES = os.getenv("VLLM_FLASHINFER_TENSOR_BMM_SCALES", "1") == "1"
 
 trtllm_workspace_buffer = None
 
@@ -1925,6 +1935,11 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+        # device (bmm1_scale * log2e, bmm2_scale) for trtllm-gen decode
+        self._bmm_scale_tensors: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Set once a decode path consumed host-side scale floats; FULL CUDA
+        # graphs bake those, so a reload that changes the scales is not seen.
+        self.float_scales_in_decode = False
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -1976,6 +1991,43 @@ class FlashInferImpl(AttentionImpl):
             self.sinks = source_sinks.to(torch.float32)
         else:
             self.sinks.copy_(source_sinks)
+
+    def _compute_bmm_scales(self, layer: torch.nn.Module) -> tuple[float, float]:
+        bmm1_scale, bmm2_scale = self.scale, 1.0
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+            bmm2_scale *= layer._v_scale_float
+        self.bmm1_scale, self.bmm2_scale = bmm1_scale, bmm2_scale
+        return bmm1_scale, bmm2_scale
+
+    def refresh(self, layer: torch.nn.Module) -> None:
+        """Recompute the scales derived from the layer's q/k/v/o scales (after
+        loading, and after a weight reload). Runs outside graph capture. The
+        device copies are filled in place, so captured graphs see the new
+        values; the o-scale is re-read at the next eager forward."""
+        bmm1_scale, bmm2_scale = self._compute_bmm_scales(layer)
+        self.o_sf_scale = None
+        if getattr(layer, "_o_scale_float", None) is not None:
+            layer._o_scale_float = None
+        if not (_TENSOR_BMM_SCALES and is_quantized_kv_cache(self.kv_cache_dtype)):
+            return
+        if self._bmm_scale_tensors is None:
+            device = layer._k_scale.device
+            self._bmm_scale_tensors = (
+                torch.empty(1, dtype=torch.float32, device=device),
+                torch.empty(1, dtype=torch.float32, device=device),
+            )
+        self._bmm_scale_tensors[0].fill_(bmm1_scale * math.log2(math.e))
+        self._bmm_scale_tensors[1].fill_(bmm2_scale)
+
+    def _trtllm_decode_bmm_scales(self, output_scale: torch.Tensor | None):
+        """(bmm1_scale_log2, bmm2_scale) for trtllm-gen decode: the device
+        copies when they exist and no output-quant fusion folds the o-scale
+        into bmm2; otherwise (None, host float)."""
+        if self._bmm_scale_tensors is not None and output_scale is None:
+            return self._bmm_scale_tensors
+        self.float_scales_in_decode = True
+        return None, self.bmm2_scale
 
     def get_xqa_bmm1_scale(self, layer: torch.nn.Module, q_data_type: torch.dtype):
         bmm1_scale = self.scale
@@ -2045,15 +2097,8 @@ class FlashInferImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
-        if self.bmm1_scale is None:
-            self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-
-        if self.bmm2_scale is None:
-            self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm2_scale *= layer._v_scale_float
+        if self.bmm1_scale is None or self.bmm2_scale is None:
+            self._compute_bmm_scales(layer)
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
         decode_kernel = (
@@ -2427,6 +2472,7 @@ class FlashInferImpl(AttentionImpl):
 
             if not decode_with_flashinfer_trtllm_api:
                 assert isinstance(attn_metadata.decode, FIDecode)
+                self.float_scales_in_decode = True
                 decode_wrapper = attn_metadata.decode.wrapper
                 assert decode_wrapper is not None
                 assert decode_wrapper._window_left == self.window_left
@@ -2532,6 +2578,7 @@ class FlashInferImpl(AttentionImpl):
                     decode_query = canonicalize_singleton_dim_strides(decode_query)
 
                 if decode_with_xqa:
+                    self.float_scales_in_decode = True
                     bmm1_scale = self.get_xqa_bmm1_scale(
                         layer, attn_metadata.q_data_type_decode
                     )
@@ -2601,6 +2648,14 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
+                # DCP speculative decode takes host scales only
+                if use_dcp:
+                    self.float_scales_in_decode = True
+                    bmm1_scale_log2, decode_bmm2 = None, self.bmm2_scale
+                else:
+                    bmm1_scale_log2, decode_bmm2 = self._trtllm_decode_bmm_scales(
+                        output_scale
+                    )
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
                     kv_cache=(
@@ -2611,7 +2666,8 @@ class FlashInferImpl(AttentionImpl):
                     seq_lens=seq_lens_decode,
                     max_seq_len=attn_metadata.decode.max_seq_len,
                     bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
+                    bmm1_scale_log2=bmm1_scale_log2,
+                    bmm2_scale=decode_bmm2,
                     window_left=self.window_left,
                     sinks=self.sinks,
                     o_sf_scale=self.o_sf_scale,
