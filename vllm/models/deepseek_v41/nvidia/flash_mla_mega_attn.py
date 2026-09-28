@@ -183,6 +183,24 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
             )
         self.n_wv_group = self.padded_heads // WV_GROUP_SIZE
         self._fused_layouts_ready = False
+        # Modulewise reload (PR 2c): a reload lands wq_b / wo_a in their
+        # checkpoint (unpermuted) layout and the guard above stops a second
+        # finalize, so apply the same permutes to the child linears' PWAL
+        # results before they land.
+        from vllm.model_executor.model_loader.reload import add_reload_transform
+
+        add_reload_transform(self.wq_b, self._permute_wq_b)
+        add_reload_transform(self.wo_a, self._permute_wo_a)
+
+    def _permute_wq_b(self, wq_b: torch.nn.Module) -> None:
+        permute_wq_b_(wq_b.weight.data, wq_b.weight_scale.data, self.n_local_heads)
+
+    def _permute_wo_a(self, wo_a: torch.nn.Module) -> None:
+        permute_wo_a_(
+            wo_a.weight.data,
+            wo_a.weight_scale.data,
+            self.n_local_heads // self.n_local_groups,
+        )
 
     # ---- interface contract ------------------------------------------------
 
@@ -236,14 +254,8 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
         """
         if self._fused_layouts_ready:
             return
-        permute_wq_b_(
-            self.wq_b.weight.data, self.wq_b.weight_scale.data, self.n_local_heads
-        )
-        permute_wo_a_(
-            self.wo_a.weight.data,
-            self.wo_a.weight_scale.data,
-            self.n_local_heads // self.n_local_groups,
-        )
+        self._permute_wq_b(self.wq_b)
+        self._permute_wo_a(self.wo_a)
         self._fused_layouts_ready = True
 
     # ---- forward -----------------------------------------------------------

@@ -56,6 +56,7 @@ __all__ = [
     "ensure_materialized",
     "LoadTarget",
     "LoadTrace",
+    "add_reload_transform",
 ]
 
 
@@ -580,6 +581,16 @@ def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:
         quant_method.refresh(layer)
 
 
+def add_reload_transform(
+    module: torch.nn.Module, transform: Callable[[torch.nn.Module], None]
+) -> None:
+    """Register an output transform on `module`: on reload it runs on the
+    module's PWAL results, before they land in the live tensors. At cold start
+    the owner runs the same function where it does today."""
+    transforms = module.__dict__.setdefault("_reload_output_transforms", [])
+    transforms.append(transform)
+
+
 def _has_module_pwal(layer: torch.nn.Module) -> bool:
     """A plain module with its own zero-argument transform (not attention,
     whose PWAL takes the activation dtype and is deferred to finalize)."""
@@ -634,6 +645,14 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         # checkpoint-format tensors, writing its declared `reload_outputs`.
         with reload_mode():
             layer.process_weights_after_loading()
+
+    # Output transforms (kind B hooks, e.g. a parent's layout permute of this
+    # module's weights): applied to the PWAL results before landing, so the
+    # live tensors receive the final layout exactly once.
+    if reloading:
+        for transform in getattr(layer, "_reload_output_transforms", ()):
+            with reload_mode(), torch.no_grad():
+                transform(layer)
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)

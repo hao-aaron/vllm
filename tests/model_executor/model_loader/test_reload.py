@@ -1772,3 +1772,90 @@ def test_kimi_k3_mega_moe_reload_updates_transformed_weights(default_vllm_config
     assert experts._transformed_l1_weights[0] is experts._mega_l1_packed
     # raw params are dropped again after reload
     assert experts.w13_weight is None and experts.w2_weight is None
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload, PR 2c: output transforms before landing
+# ---------------------------------------------------------------------------
+
+
+class _WqB(torch.nn.Module):
+    """Stands in for DeepSeek-V4.1's MXFP8 `wq_b` linear (bytes + row scales)."""
+
+    def __init__(self, rows, cols):
+        super().__init__()
+        self.quant_method = _ProcessRecorder()  # PWAL: identity layout
+        for name, shape in (("weight", (rows, cols)), ("weight_scale", (rows, 2))):
+            p = torch.nn.Parameter(
+                torch.zeros(shape, dtype=torch.uint8), requires_grad=False
+            )
+            p.weight_loader = default_weight_loader
+            self.register_parameter(name, p)
+
+
+class _MegaAttnLike(torch.nn.Module):
+    """Parent that permutes its child's rows in place once, behind a guard,
+    exactly like `DeepseekV4MegaAttnAttention.finalize_loaded_weights`."""
+
+    def __init__(self, register_transform):
+        super().__init__()
+        from vllm.model_executor.model_loader.reload import add_reload_transform
+
+        self.heads = 2
+        self.wq_b = _WqB(self.heads * 32, 8)
+        self._fused_layouts_ready = False
+        if register_transform:
+            add_reload_transform(self.wq_b, self._permute)
+
+    def _permute(self, wq_b):
+        from vllm.models.deepseek_v41.common.ops.fused_layout import permute_wq_b_
+
+        permute_wq_b_(wq_b.weight.data, wq_b.weight_scale.data, self.heads)
+
+    def finalize_loaded_weights(self):
+        if self._fused_layouts_ready:
+            return
+        self._permute(self.wq_b)
+        self._fused_layouts_ready = True
+
+
+@pytest.mark.parametrize("register_transform", [False, True])
+def test_reload_output_transform_permutes_before_landing(register_transform):
+    from vllm.models.deepseek_v41.common.ops.fused_layout import q_fused_permutation
+
+    parent = _MegaAttnLike(register_transform)
+    model = torch.nn.Sequential(parent)
+    record_metadata_for_reloading(model)
+    g = torch.Generator().manual_seed(0)
+    A = {
+        n: torch.randint(0, 255, p.shape, generator=g, dtype=torch.uint8)
+        for n, p in parent.wq_b.named_parameters()
+    }
+    B = {
+        n: torch.randint(0, 255, p.shape, generator=g, dtype=torch.uint8)
+        for n, p in parent.wq_b.named_parameters()
+    }
+    for n, v in A.items():
+        getattr(parent.wq_b, n).data.copy_(v)
+    parent.finalize_loaded_weights()  # cold start: model hook
+    ptr = parent.wq_b.weight.data_ptr()
+    perm = q_fused_permutation(parent.heads, 32)
+    assert torch.equal(parent.wq_b.weight, A["weight"][perm])
+
+    initialize_layerwise_reload(model)
+    for n, v in B.items():
+        p = getattr(parent.wq_b, n)
+        p.weight_loader(p, v)
+    finalize_layerwise_reload(model, model_config=None)
+    parent.finalize_loaded_weights()  # even if something re-ran it: guarded
+
+    assert parent.wq_b.weight.data_ptr() == ptr
+    if register_transform:
+        # final (permuted) layout landed exactly once
+        assert torch.equal(parent.wq_b.weight, B["weight"][perm])
+        assert torch.equal(parent.wq_b.weight_scale, B["weight_scale"][perm])
+    else:
+        # today's behavior: the checkpoint layout lands and the guard blocks
+        # the permute, so the kernel would read a mismatched layout
+        assert torch.equal(parent.wq_b.weight, B["weight"])
+        assert not torch.equal(parent.wq_b.weight, B["weight"][perm])
