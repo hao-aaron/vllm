@@ -1674,3 +1674,101 @@ def test_fp8_flashinfer_cutlass_quant_config_refresh():
     assert qc.g1_alphas is layer.g1_alphas or qc.g1_alphas.data_ptr() == (
         layer.g1_alphas.data_ptr()
     )
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload, PR 2b: module-level PWAL for model-local transforms
+# ---------------------------------------------------------------------------
+
+
+def _sm100() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
+
+def _make_k3_mega_experts(vllm_config, prefix):
+    from vllm.models.kimi_k3.nvidia.model import KimiK3MegaMoEExperts
+
+    with torch.device("cuda"):
+        experts = KimiK3MegaMoEExperts(
+            vllm_config,
+            num_experts=4,
+            num_local_experts=4,
+            experts_start_idx=0,
+            top_k=2,
+            hidden_size=512,
+            intermediate_size=256,
+            prefix=prefix,
+            activation="swiglu",
+            activation_beta=None,
+            activation_linear_beta=None,
+        )
+    return experts
+
+
+def _k3_raw(experts, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    out = {}
+    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+        p = getattr(experts, name)
+        if "scale" in name:
+            # valid ue8m0 exponents around 1.0
+            out[name] = torch.randint(
+                120, 130, p.shape, generator=g, device="cuda", dtype=torch.int32
+            ).to(torch.uint8)
+        else:
+            out[name] = torch.randint(
+                0, 256, p.shape, generator=g, device="cuda", dtype=torch.int32
+            ).to(torch.uint8)
+    return out
+
+
+@pytest.mark.skipif(not _sm100(), reason="DeepGEMM MegaMoE requires SM100")
+def test_kimi_k3_mega_moe_reload_updates_transformed_weights(default_vllm_config):
+    """PR 2b premise: layerwise reload of a mega-MoE experts module (no quant
+    method, transform run once from the model hook) must update the
+    transformed `_mega_*` buffers in place."""
+    from vllm.model_executor.model_loader.reload import (
+        complete_module,
+        ensure_materialized,
+        finish_reload,
+        start_reload,
+    )
+
+    experts = _make_k3_mega_experts(default_vllm_config, "k3.experts.a")
+    fresh = _make_k3_mega_experts(default_vllm_config, "k3.experts.b")
+    model = torch.nn.Sequential(experts)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    a, b = _k3_raw(experts, 0), _k3_raw(experts, 1)
+    for name, v in a.items():
+        getattr(experts, name).data.copy_(v)
+    experts.finalize_weights()  # cold start (model hook)
+    live = {
+        n: (t, t.data_ptr())
+        for n, t in experts.named_buffers()
+        if n.startswith("_mega_")
+    }
+    assert len(live) == 4
+
+    # reference: fresh transform of B
+    for name, v in b.items():
+        getattr(fresh, name).data.copy_(v)
+    fresh.finalize_weights()
+    expected = {
+        n: t.clone() for n, t in fresh.named_buffers() if n.startswith("_mega_")
+    }
+
+    start_reload(model)
+    targets = ensure_materialized(experts)
+    for name, v in b.items():
+        targets[name].copy_(v)
+    complete_module(experts)
+    finish_reload(model, model_config=None)
+
+    for n, (t, ptr) in live.items():
+        now = getattr(experts, n)
+        assert now is t and now.data_ptr() == ptr, f"{n} was re-allocated"
+        assert torch.equal(now, expected[n]), f"{n} kept stale (old) weights"
+    assert experts._transformed_l1_weights[0] is experts._mega_l1_packed
+    # raw params are dropped again after reload
+    assert experts.w13_weight is None and experts.w2_weight is None

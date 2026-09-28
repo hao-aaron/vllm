@@ -88,6 +88,7 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.model_executor.utils import is_reloading
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -364,6 +365,26 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
             return
 
         self._check_runtime_supported()
+        self._transformed_l1_weights, self._transformed_l2_weights = (
+            self._mega_transform()
+        )
+        self._register_mega_outputs(
+            self._transformed_l1_weights, self._transformed_l2_weights
+        )
+        self._drop_raw_mega_weights()
+
+    # Modulewise reload (PR 2b): the MegaMoE transform is this module's own
+    # post-load step. On reload it runs per module on the freshly loaded raw
+    # params; its declared outputs are landed into the live `_mega_*` buffers,
+    # which `_transformed_*` keep pointing at.
+    reload_outputs = (
+        "_mega_l1_packed",
+        "_mega_l1_scale",
+        "_mega_l2_packed",
+        "_mega_l2_scale",
+    )
+
+    def _mega_transform(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
@@ -381,19 +402,27 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
             (1, 32),
             self.num_local_experts,
         )
-        self._transformed_l1_weights, self._transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(
-                (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-                activation=self.activation,
-            )
+        return deep_gemm.transform_weights_for_mega_moe(
+            (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
+            (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
+            activation=self.activation,
         )
-        l1_packed, l1_scale = self._transformed_l1_weights
-        l2_packed, l2_scale = self._transformed_l2_weights
-        self.register_buffer("_mega_l1_packed", l1_packed, persistent=False)
-        self.register_buffer("_mega_l1_scale", l1_scale, persistent=False)
-        self.register_buffer("_mega_l2_packed", l2_packed, persistent=False)
-        self.register_buffer("_mega_l2_scale", l2_scale, persistent=False)
+
+    def _register_mega_outputs(self, l1, l2) -> None:
+        self.register_buffer("_mega_l1_packed", l1[0], persistent=False)
+        self.register_buffer("_mega_l1_scale", l1[1], persistent=False)
+        self.register_buffer("_mega_l2_packed", l2[0], persistent=False)
+        self.register_buffer("_mega_l2_scale", l2[1], persistent=False)
+
+    def process_weights_after_loading(self) -> None:
+        """Reload-only transform (cold start keeps finalize_weights from the
+        model hook, after the whole stream)."""
+        assert is_reloading(), "cold start finalizes from the model hook"
+        assert self._transformed_l1_weights is not None
+        l1, l2 = self._mega_transform()
+        # Results become landing targets; the live buffers keep their storage
+        # and `_transformed_*` keep referencing them.
+        self._register_mega_outputs(l1, l2)
         self._drop_raw_mega_weights()
 
     def _drop_raw_mega_weights(self) -> None:

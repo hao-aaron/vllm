@@ -580,6 +580,16 @@ def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:
         quant_method.refresh(layer)
 
 
+def _has_module_pwal(layer: torch.nn.Module) -> bool:
+    """A plain module with its own zero-argument transform (not attention,
+    whose PWAL takes the activation dtype and is deferred to finalize)."""
+    return (
+        not is_deferred_attention_layer(layer)
+        and callable(getattr(layer, "process_weights_after_loading", None))
+        and bool(getattr(layer, "reload_outputs", ()))
+    )
+
+
 def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = None):
     """Finish one module: PWAL on its checkpoint-format tensors, copy the
     results into the live tensors, restore the original tensor objects, reset.
@@ -618,6 +628,13 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         # otherwise break replicated (disable_tp) weights on a subsequent reload.
         if hasattr(layer, "update_param_tp_status"):
             layer.update_param_tp_status()
+    elif reloading and _has_module_pwal(layer):
+        # Module-level PWAL for modules without a quant method (model-local
+        # transforms, e.g. mega-MoE): runs per module, on the fresh
+        # checkpoint-format tensors, writing its declared `reload_outputs`.
+        with reload_mode():
+            layer.process_weights_after_loading()
+
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)
     if reloading:
@@ -727,10 +744,22 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
             logger.debug("%s.%s: not produced by PWAL", type(layer).__name__, name)
             continue
         _land(layer, name, param, result)
+    # Outputs a module-level PWAL declares: landed even though they are
+    # non-persistent buffers that no loader wrote
+    declared = set(getattr(layer, "reload_outputs", ()))
     for name, buffer in buffers.items():
         if name not in layer._buffers or layer._buffers[name] is None:
+            if name in declared:
+                raise RuntimeError(
+                    f"{type(layer).__name__}: declared reload output {name!r} was "
+                    "not produced by its process_weights_after_loading()"
+                )
             continue
-        if name in non_persistent and name not in loaded_tensor_names:
+        if (
+            name in non_persistent
+            and name not in loaded_tensor_names
+            and name not in declared
+        ):
             continue
         _land(layer, name, buffer, getattr(layer, name))
 
