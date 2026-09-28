@@ -216,3 +216,35 @@ def test_missing_engine_raises():
     worker = _make_worker(None)
     with pytest.raises(RuntimeError, match="Weight transfer not configured"):
         Worker.start_weight_update(worker)
+
+
+def test_failed_finish_ends_session_and_aborts_reload():
+    """A failed finish used to leave `_weight_update_active` set, so the next
+    start raised "already active"; it now aborts the reload and ends the
+    session."""
+    from vllm.model_executor.model_loader.reload import (
+        record_metadata_for_reloading,
+    )
+
+    class _FailingFinishEngine(_RecordingEngine):
+        def start_weight_update(self) -> None:
+            super().start_weight_update()
+            from vllm.model_executor.model_loader.reload import start_reload
+
+            start_reload(self.model)
+
+        def finish_weight_update(self) -> None:
+            raise RuntimeError("finish failed")
+
+    engine = _FailingFinishEngine()
+    engine.model = nn.Sequential(nn.Linear(2, 2, bias=False))
+    live = engine.model[0].weight
+    record_metadata_for_reloading(engine.model)
+    worker = _make_worker(engine)
+    Worker.start_weight_update(worker)
+    assert engine.model[0].weight.is_meta
+    with pytest.raises(RuntimeError, match="finish failed"):
+        Worker.finish_weight_update(worker)
+    assert worker._weight_update_active is False
+    assert engine.model[0].weight is live  # abort_reload restored the tensors
+    Worker.start_weight_update(worker)  # no "already active"

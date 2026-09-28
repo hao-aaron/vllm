@@ -2336,3 +2336,62 @@ def test_per_expert_backstop_and_fallbacks(monkeypatch):
     assert info.per_expert is False and info.expert_slots is None
     assert not layer.w13_weight.is_meta  # module-level scratch
     reload_layerwise.abort_reload(model)
+
+
+@requires_cuda
+def test_trtllm_mxfp4_situ_constants_refresh_in_place():
+    """The per-expert gemm1 constants are allocated once and refilled by
+    refresh() (a rebuilt kernel used to allocate fresh ones while a captured
+    graph kept reading the freed ones)."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+        TrtLlmMxfp4ExpertsBase,
+    )
+
+    moe_config = SimpleNamespace(
+        routing_method=None,
+        experts_per_token=2,
+        intermediate_size_per_partition=256,
+        hidden_dim=512,
+        hidden_dim_unpadded=512,
+        num_local_experts=4,
+        moe_parallel_config=SimpleNamespace(ep_rank=0),
+        activation=MoEActivation.SITU,
+        activation_situ_beta=1.5,
+        activation_situ_linear_beta=0.75,
+    )
+    quant_config = SimpleNamespace(
+        gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None
+    )
+    experts = object.__new__(TrtLlmMxfp4ExpertsBase)
+    TrtLlmMxfp4ExpertsBase.__init__(experts, moe_config, quant_config)
+    ptrs = (experts.gemm1_alpha.data_ptr(), experts.gemm1_beta.data_ptr())
+    assert torch.equal(experts.gemm1_alpha, torch.full((4,), 1.5, device="cuda"))
+    assert torch.equal(experts.gemm1_beta, torch.full((4,), 0.75, device="cuda"))
+    assert experts.gemm1_clamp_limit is None
+    experts.gemm1_alpha.zero_()  # e.g. garbage after an old path
+    experts.refresh()
+    assert torch.equal(experts.gemm1_alpha, torch.full((4,), 1.5, device="cuda"))
+    assert ptrs == (experts.gemm1_alpha.data_ptr(), experts.gemm1_beta.data_ptr())
+
+
+@requires_cuda
+def test_fused_router_gate_refresh_in_place():
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    runner = object.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.gate = torch.nn.Linear(8, 4, bias=False, device="cuda")
+    runner.shared_expert_gate = torch.nn.Linear(8, 1, bias=False, device="cuda")
+    runner._combined_gate_weight = None
+    runner.refresh()  # not built yet: nothing to do
+    assert runner._combined_gate_weight is None
+    runner._maybe_fuse_gate_weights()
+    fused = runner._combined_gate_weight
+    ptr = fused.data_ptr()
+    with torch.no_grad():
+        runner.gate.weight.fill_(3.0)  # a reload lands new gate weights
+    runner.refresh()
+    assert runner._combined_gate_weight.data_ptr() == ptr
+    assert torch.equal(fused[:4], torch.full((4, 8), 3.0, device="cuda"))
+    assert torch.equal(fused[4:], runner.shared_expert_gate.weight)
