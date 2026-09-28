@@ -1818,6 +1818,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
+    def refresh(self) -> None:
+        """Modulewise reload, kind A: the mHC broadcast is derived from live
+        `hc_attn_fn`; once built it is recomputed in place after landing."""
+        if get_pp_group().is_first_rank and self.start_layer < self.end_layer:
+            layer = self.layers[self.start_layer]
+            if getattr(layer, "hc_attn_fn_broadcast", None) is not None:
+                self.finalize_mhc_broadcast_weights()
+
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
             return

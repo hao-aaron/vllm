@@ -1720,6 +1720,11 @@ class KimiLinearForCausalLM(
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
+    # Modulewise reload: the model hook's only work (the mega-MoE transform)
+    # runs per module on reload (KimiK3MegaMoEExperts reload_outputs), so the
+    # cold-start-only hook is safe to skip on reload.
+    reload_safe = True
+
     def process_weights_after_loading(self) -> None:
         # A parent AutoWeightsLoader may invoke load_weights repeatedly for
         # non-contiguous streamed prefixes. Finalize only after the full stream.
