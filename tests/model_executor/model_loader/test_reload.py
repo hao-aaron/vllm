@@ -2150,3 +2150,28 @@ def test_direct_load_hosted_padding_reads_zero_and_failure_is_dirty(direct_load)
         assert is_model_dirty(model)
     finally:
         reload_layerwise._has_device_incoming = orig
+
+
+def test_unloaded_scale_keeps_create_time_sentinel():
+    """A shard scale the checkpoint lacks must read as its create-time sentinel
+    after reload (as at cold start), not as zero."""
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        FP8_SCALE_SENTINEL,
+    )
+
+    layer = torch.nn.Module()
+    layer.quant_method = _ProcessRecorder()
+    scale = torch.nn.Parameter(
+        torch.full((3,), FP8_SCALE_SENTINEL), requires_grad=False
+    )
+    scale.weight_loader = lambda param, w, i: param.data[i].copy_(w)
+    layer.register_parameter("weight_scale", scale)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    scale.data.fill_(1.0)  # "loaded" at cold start
+    initialize_layerwise_reload(model)
+    layer.weight_scale.weight_loader(layer.weight_scale, torch.tensor(0.5), 0)
+    finalize_layerwise_reload(model, model_config=None)
+    seen = layer.quant_method.calls[0]["weight_scale"]
+    assert seen[0] == 0.5
+    assert (seen[1:] == FP8_SCALE_SENTINEL).all()

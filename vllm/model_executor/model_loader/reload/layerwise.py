@@ -149,6 +149,35 @@ def record_metadata_for_reloading(model: torch.nn.Module):
         info = get_layerwise_info(layer)
         info.restore_metadata = capture_layer_to_meta(layer)
         info.restore_device = torch.get_default_device()
+        info.init_values = _capture_init_values(layer, info)
+
+
+# Small scale tensors keep their create-time value as the reload initial value:
+# scales are created with deliberate values (ones, or FP8_SCALE_SENTINEL, which
+# process_weights_after_loading uses to detect shards the checkpoint lacks).
+# Everything else is zero-filled (weights are often created with torch.empty).
+INIT_VALUE_MAX_NUMEL = 4096
+
+
+def _capture_init_values(
+    layer: torch.nn.Module, info: LayerReloadingInfo
+) -> dict[str, torch.Tensor]:
+    values = {}
+    params, buffers = info.restore_metadata
+    for name in (*params, *buffers):
+        t = getattr(layer, name, None)
+        if (
+            "scale" in name
+            and isinstance(t, torch.Tensor)
+            and not t.is_meta
+            and 0 < t.numel() <= INIT_VALUE_MAX_NUMEL
+            and not isinstance(t, torch.nn.parameter.UninitializedParameter)
+        ):
+            try:
+                values[name] = t.detach().clone()
+            except (RuntimeError, NotImplementedError):
+                continue
+    return values
 
 
 @torch.no_grad()
@@ -635,8 +664,13 @@ def ensure_param_materialized(
             target = _meta.materialize_meta_tensor(tensor)
         info.scratch_bytes += target.nbytes
     # Zero-filled, hosted or not: loaders don't write padding, and a slice no
-    # loader writes must not read as plausible old kernel-format bytes.
-    target.data.zero_()
+    # loader writes must not read as plausible old kernel-format bytes. Small
+    # tensors start from their create-time value instead (scale sentinels).
+    init = info.init_values.get(name)
+    if init is not None and init.shape == target.shape and init.dtype == target.dtype:
+        target.data.copy_(init)
+    else:
+        target.data.zero_()
     setattr(layer, name, target)
     info.materialized.add(name)
     return target
