@@ -19,6 +19,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import reload_mode
 
+from . import direct as _direct
 from . import meta as _meta
 from .meta import (
     SKIP_LOAD_TENSORS,
@@ -173,6 +174,9 @@ def initialize_layerwise_reload(model: torch.nn.Module, generation: int | None =
         generation=generation, dirty=previous is not None and previous.dirty
     )
     model._reload_session = session
+
+    if _direct.DIRECT_LOAD:
+        _direct.build_storage_users(model)
 
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
@@ -486,6 +490,17 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
         info.reset()
 
+    # Cross-module readers in the attention phase (MLA reads kv_b_proj) must
+    # only see landed modules: every other module is closed by now.
+    still_open = [
+        layer
+        for layer in model.modules()
+        if not is_deferred_attention_layer(layer)
+        and (info := LAYERWISE_INFO.get(layer)) is not None
+        and info.hosted
+    ]
+    assert not still_open, f"modules not landed before attention: {still_open}"
+
     # Process attention layers after all other layers are done
     for layer, info in deferred_attn:
         reloading = reloading or info.kernel_tensors is not None
@@ -591,12 +606,37 @@ def ensure_param_materialized(
     tensor = getattr(layer, name)
     if not tensor.is_meta or name in SKIP_TENSORS:
         return tensor
-    with info.restore_device:
-        target = _meta.materialize_meta_tensor(tensor)
-        target.data.zero_()
+    target = None
+    if (
+        _direct.DIRECT_LOAD
+        and info.kernel_tensors is not None
+        # never host a non-persistent buffer: unless a loader writes it, landing
+        # skips it, so zero-filling its live bytes would destroy its value
+        and name not in info.kernel_non_persistent_buffers
+    ):
+        # Check 1: can the live tensor's own bytes hold the checkpoint tensor?
+        params, buffers = info.kernel_tensors
+        live = params.get(name, buffers.get(name))
+        reason = _direct.plan_input(tensor, live, info.restore_device)
+        plan = _direct.PLAN_OUTCOMES.setdefault(layer, {})
+        if reason is None:
+            assert live is not None
+            target = _direct.checkpoint_view(live, tensor)
+            storage = live.untyped_storage()
+            info.hosted[name] = (storage.data_ptr(), storage.nbytes())
+            plan[name] = "hosted"
+            _mark_dirty(info)  # live bytes now hold checkpoint data
+        else:
+            plan[name] = f"scratch:{reason}"
+    if target is None:
+        with info.restore_device:
+            target = _meta.materialize_meta_tensor(tensor)
+        info.scratch_bytes += target.nbytes
+    # Zero-filled, hosted or not: loaders don't write padding, and a slice no
+    # loader writes must not read as plausible old kernel-format bytes.
+    target.data.zero_()
     setattr(layer, name, target)
     info.materialized.add(name)
-    info.scratch_bytes += target.nbytes
     return target
 
 
@@ -848,40 +888,79 @@ def _get_weight_loader(tensor: torch.Tensor):
     return getattr(tensor, "weight_loader", default_weight_loader)
 
 
+def _skip_landing(
+    layer: torch.nn.Module, info: LayerReloadingInfo, name: str, is_buffer: bool
+) -> bool:
+    """Copy-back rules, shared by every landing: skip buffers that are no
+    longer registered, and non-persistent buffers no loader wrote (#44371),
+    unless a module-level PWAL declares them as outputs."""
+    if not is_buffer:
+        return False
+    declared = name in getattr(layer, "reload_outputs", ())
+    if name not in layer._buffers or layer._buffers[name] is None:
+        if declared:
+            raise RuntimeError(
+                f"{type(layer).__name__}: declared reload output {name!r} was "
+                "not produced by its process_weights_after_loading()"
+            )
+        return True
+    loaded = info.loaded_names | {n for n, _ in info.loaded_weights}
+    return (
+        name in info.kernel_non_persistent_buffers
+        and name not in loaded
+        and not declared
+    )
+
+
 def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
-    """Copy processed values into original kernel tensor storage and restore
-    kernel tensor references on the layer. Preserves cudagraph references."""
+    """Land PWAL results in the original kernel tensors and restore those tensor
+    objects on the layer (preserves cudagraph references).
+
+    Check 2, per tensor: the result already is the live tensor ("in place"),
+    or it is copied with the exact-landing check; a result that shares storage
+    with live storage is cloned first ("overlap"). All sources are resolved
+    before the first copy, so no copy overwrites bytes a later one reads."""
     assert info.kernel_tensors is not None
     _mark_dirty(info)
     parameters, buffers = info.kernel_tensors
-    non_persistent = info.kernel_non_persistent_buffers
-    loaded_tensor_names = info.loaded_names | {name for name, _ in info.loaded_weights}
-    for name, param in parameters.items():
-        result = getattr(layer, name, None)
-        if result is None:
-            # Derived tensors (e.g. g1_alphas) that a build-once PWAL no longer
-            # produces keep their storage and are rewritten by refresh()
-            logger.debug("%s.%s: not produced by PWAL", type(layer).__name__, name)
-            continue
-        _land(layer, name, param, result)
-    # Outputs a module-level PWAL declares: landed even though they are
-    # non-persistent buffers that no loader wrote
-    declared = set(getattr(layer, "reload_outputs", ()))
-    for name, buffer in buffers.items():
-        if name not in layer._buffers or layer._buffers[name] is None:
-            if name in declared:
-                raise RuntimeError(
-                    f"{type(layer).__name__}: declared reload output {name!r} was "
-                    "not produced by its process_weights_after_loading()"
-                )
-            continue
-        if (
-            name in non_persistent
-            and name not in loaded_tensor_names
-            and name not in declared
-        ):
-            continue
-        _land(layer, name, buffer, getattr(layer, name))
+    live_storages = {
+        t.untyped_storage().data_ptr()
+        for t in (*parameters.values(), *buffers.values())
+        if t.numel() > 0
+    }
+    outcomes = _direct.LANDING_OUTCOMES.setdefault(layer, {})
+    pending: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+    for is_buffer, tensors in ((False, parameters), (True, buffers)):
+        for name, live in tensors.items():
+            if _skip_landing(layer, info, name, is_buffer):
+                continue
+            result = getattr(layer, name, None)
+            if result is None:
+                # Derived tensors (e.g. g1_alphas) a build-once PWAL no longer
+                # produces keep their storage and are rewritten by refresh()
+                outcomes[name] = "not_produced"
+                continue
+            if _direct.same_view(result, live):
+                outcomes[name] = "in_place"
+            elif _direct.shares_storage(result, live_storages):
+                pending.append((name, live, result.clone()))
+                outcomes[name] = "overlap"
+            else:
+                pending.append((name, live, result))
+                outcomes[name] = "copied"
+    for name, live, result in pending:
+        _land(layer, name, live, result)
+
+    # Hosting must never have grown or moved a live storage
+    for name, (ptr, nbytes) in info.hosted.items():
+        live = parameters.get(name, buffers.get(name))
+        assert live is not None
+        storage = live.untyped_storage()
+        if storage.data_ptr() != ptr or storage.nbytes() != nbytes:
+            raise RuntimeError(
+                f"{type(layer).__name__}.{name}: hosted live storage moved "
+                f"({ptr:#x}/{nbytes} -> {storage.data_ptr():#x}/{storage.nbytes()})"
+            )
 
     _place_kernel_tensors(layer, info)
 

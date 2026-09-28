@@ -29,6 +29,7 @@ __all__ = [
     "add_reload_transform",
     "get_reload_session",
     "is_model_dirty",
+    "landing_outcomes",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -37,6 +38,7 @@ __all__ = [
     "support_quantized_model_reload_from_hp_weights",
 ]
 
+from .direct import landing_outcomes
 from .layerwise import (
     LoadTarget,
     LoadTrace,
