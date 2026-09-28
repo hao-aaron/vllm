@@ -207,6 +207,7 @@ class ReloadHarnessExtension:
         on_cpu: bool = False,
         perturb: float | None = None,
         use_public_api: bool = True,
+        force_rebuild: bool = False,
     ) -> dict:
         """Stream ``path`` into the live model. Returns memory/retention stats."""
         from safetensors import safe_open
@@ -214,6 +215,12 @@ class ReloadHarnessExtension:
         from vllm.config import set_current_vllm_config
 
         model = self._mw_model()
+        if force_rebuild:
+            # emulate the pre-PR-2 behavior: every MoE kernel is rebuilt
+            for m in model.modules():
+                qm = getattr(m, "quant_method", None)
+                if hasattr(qm, "reload_safe"):
+                    qm.reload_safe = False
         files = _checkpoint_files(path)
         names = order_names(_read_names(files), order, seed)
         if skip_regex:

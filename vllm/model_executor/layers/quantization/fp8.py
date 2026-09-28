@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -74,6 +75,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import (
+    is_reloading,
     is_weights_pre_processed,
     replace_parameter,
     set_weight_attrs,
@@ -521,6 +523,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             activation_key=activation_key,
             allow_vllm_cutlass=False,
         )
+        # Backends whose weight-derived state is declared and refreshable.
+        self.reload_safe = self.fp8_backend in (
+            Fp8MoeBackend.FLASHINFER_CUTLASS,
+            Fp8MoeBackend.FLASHINFER_TRTLLM,
+            Fp8MoeBackend.TRITON,
+            Fp8MoeBackend.DEEPGEMM,
+        )
 
     def create_weights(
         self,
@@ -650,6 +659,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
+            # The checkpoint has one input scale per w1 and w3 shard, both loaded
+            # into the same expert slot: declare it so streaming reload counts
+            # the module complete only after every shard arrived.
+            w13_input_scale.weight_loader_numel = num_experts * self.moe.w13_num_shards
 
             w2_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
@@ -690,6 +703,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, f"w13_{self.weight_scale_name}", w13_scale)
         replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
 
+        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+            # Build once: the kernel (captured by CUDA graphs) keeps referencing
+            # the live tensors; the reload framework lands the new values and
+            # then calls refresh() for derived state (alphas, gscales).
+            return
         self._init_moe_kernel(layer)
 
     def _init_moe_kernel(self, layer: RoutedExperts) -> None:

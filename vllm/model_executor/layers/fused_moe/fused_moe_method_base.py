@@ -26,6 +26,21 @@ logger = init_logger(__name__)
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+    # Modulewise reload: an instance that builds its kernel once (skipping the
+    # rebuild under `reload_mode()`) and keeps all weight-derived state in
+    # declared, refreshable tensors sets this. Undeclared instances rebuild
+    # their kernel on every reload, as before.
+    reload_safe: bool = False
+
+    def refresh(self, layer: torch.nn.Module) -> None:
+        """Recompute weight-derived state in place after reload landing."""
+        moe_kernel = getattr(self, "moe_kernel", None)
+        moe_quant_config = getattr(self, "moe_quant_config", None)
+        if moe_kernel is not None:
+            moe_kernel.refresh()
+        elif moe_quant_config is not None:
+            moe_quant_config.refresh()
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
         self.moe: FusedMoEConfig = moe

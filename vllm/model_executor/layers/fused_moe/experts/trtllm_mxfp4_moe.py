@@ -58,34 +58,16 @@ class TrtLlmMxfp4ExpertsBase:
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
 
-        # MXFP4-specific TRTLLM parameters from quant_config
+        # MXFP4-specific TRTLLM per-expert constants (SwiGLU alpha/beta/clamp,
+        # or the SITU betas). Declared once and filled by refresh(): a kernel
+        # rebuilt on reload would otherwise allocate fresh tensors while a
+        # captured graph keeps reading the old, freed ones.
         device = torch.accelerator.current_device_index()
-        if quant_config.gemm1_alpha is not None:
-            self.gemm1_alpha = torch.tensor(
-                [quant_config.gemm1_alpha] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_alpha = None
-
-        if quant_config.gemm1_beta is not None:
-            self.gemm1_beta = torch.tensor(
-                [quant_config.gemm1_beta] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_beta = None
-
-        if quant_config.gemm1_clamp_limit is not None:
-            self.gemm1_clamp_limit = torch.tensor(
-                [quant_config.gemm1_clamp_limit] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_clamp_limit = None
+        self._gemm1_values: dict[str, float | None] = {
+            "gemm1_alpha": quant_config.gemm1_alpha,
+            "gemm1_beta": quant_config.gemm1_beta,
+            "gemm1_clamp_limit": quant_config.gemm1_clamp_limit,
+        }
 
         # SITU (SituGLU) TRTLLM-Gen kernel computes
         #   left  = alpha * tanh(x0 / alpha) * sigmoid(x0)   # gate (x0)
@@ -103,19 +85,32 @@ class TrtLlmMxfp4ExpertsBase:
                 "TRTLLM SiTuGlu requires activation_situ_linear_beta > 0 "
                 "(the private cubin has no up-passthrough path)"
             )
-            self.gemm1_alpha = torch.full(
-                (self.local_num_experts,),
-                float(situ_beta),
-                dtype=torch.float32,
-                device=device,
-            )
-            self.gemm1_beta = torch.full(
-                (self.local_num_experts,),
-                float(situ_linear_beta),
-                dtype=torch.float32,
-                device=device,
-            )
-            self.gemm1_clamp_limit = None
+            self._gemm1_values = {
+                "gemm1_alpha": float(situ_beta),
+                "gemm1_beta": float(situ_linear_beta),
+                "gemm1_clamp_limit": None,
+            }
+
+        for name, value in self._gemm1_values.items():
+            if value is None:
+                setattr(self, name, None)
+            else:
+                setattr(
+                    self,
+                    name,
+                    torch.empty(
+                        (self.local_num_experts,), dtype=torch.float32, device=device
+                    ),
+                )
+        self.refresh()
+
+    @torch.no_grad()
+    def refresh(self) -> None:
+        """Refill the per-expert constants in place (idempotent)."""
+        for name, value in self._gemm1_values.items():
+            t = getattr(self, name)
+            if t is not None:
+                t.fill_(value)
 
     @staticmethod
     def _supports_current_device() -> bool:

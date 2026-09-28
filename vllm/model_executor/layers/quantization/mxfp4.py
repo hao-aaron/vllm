@@ -37,6 +37,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import (
+    is_reloading,
     is_weights_pre_processed,
     replace_parameter,
     set_weight_attrs,
@@ -44,6 +45,14 @@ from vllm.model_executor.utils import (
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+# Backends whose kernels are built once and whose weight-derived state is
+# declared (modulewise reload).
+_RELOAD_SAFE_MXFP4_BACKENDS = (
+    Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+    Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+)
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -150,6 +159,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.weight_dtype = "gpt_oss_mxfp4"
         self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(moe)
+        self.reload_safe = self.mxfp4_backend in _RELOAD_SAFE_MXFP4_BACKENDS
 
         self.max_capture_size = moe.max_capture_size
 
@@ -369,6 +379,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
+        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+            # Build once; the reload framework lands results then refreshes.
+            return
+
         # Build quant config
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
@@ -485,6 +499,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.weight_dtype = "mxfp4"
         self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
+        self.reload_safe = self.mxfp4_backend in _RELOAD_SAFE_MXFP4_BACKENDS
 
         self.max_capture_size = moe.max_capture_size
 
@@ -764,6 +779,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
+
+        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+            # Build once; the reload framework lands results then refreshes.
+            return
 
         # Build quant config
         self._build_moe_kernel(layer)

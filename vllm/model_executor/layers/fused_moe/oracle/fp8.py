@@ -761,27 +761,48 @@ def make_fp8_moe_quant_config(
         g1_alphas = w1_scale * a1_scale
         g2_alphas = w2_scale * a2_scale
         if layer is not None:
-            layer.register_parameter(
-                "g1_alphas", torch.nn.Parameter(g1_alphas, requires_grad=False)
-            )
-            layer.register_parameter(
-                "g2_alphas", torch.nn.Parameter(g2_alphas, requires_grad=False)
-            )
+            # This builder can run more than once per layer; re-registering
+            # would orphan the tensor an earlier kernel reads.
+            for name, value in (("g1_alphas", g1_alphas), ("g2_alphas", g2_alphas)):
+                existing = getattr(layer, name, None)
+                if (
+                    isinstance(existing, torch.nn.Parameter)
+                    and existing.shape == value.shape
+                    and existing.dtype == value.dtype
+                ):
+                    existing.data.copy_(value)
+                else:
+                    layer.register_parameter(
+                        name, torch.nn.Parameter(value, requires_grad=False)
+                    )
             g1_alphas = layer.g1_alphas
             g2_alphas = layer.g2_alphas
-        return fp8_w8a8_moe_quant_config(
+        a1_gscale = torch.empty_like(a1_scale)
+        a2_gscale = torch.empty_like(a2_scale)
+        quant_config = fp8_w8a8_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
-            a1_gscale=(1.0 / a1_scale),
-            a2_gscale=(1.0 / a2_scale),
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
             g1_alphas=g1_alphas,
             g2_alphas=g2_alphas,
             gemm1_clamp_limit=swiglu_limit,
         )
+
+        # Derived from the (live) scales: refreshed in place after a reload
+        # lands new scales, so captured graphs read current values.
+        def _refresh() -> None:
+            torch.mul(w1_scale, a1_scale, out=g1_alphas.data)
+            torch.mul(w2_scale, a2_scale, out=g2_alphas.data)
+            torch.reciprocal(a1_scale, out=a1_gscale)
+            torch.reciprocal(a2_scale, out=a2_gscale)
+
+        quant_config.add_refresh(_refresh)
+        return quant_config
     # MXFP8 (block [1, 32]) dispatches to the mxfp8 activation quant. Scales are
     # the non-swizzled (num_tokens, hidden_dim // 32) uint8 UE8M0 layout for all
     # backends; the DeepGEMM expert permute repacks them for the grouped GEMM.

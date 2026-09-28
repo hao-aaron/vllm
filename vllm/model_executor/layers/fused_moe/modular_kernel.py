@@ -186,6 +186,10 @@ class FusedMoEPrepareAndFinalize(ABC):
     * FusedMoEPrepareAndFinalizeMonolithic - the operates on router_logits
     """
 
+    def refresh(self) -> None:  # noqa: B027
+        """Recompute weight-derived state in place. No-op by default."""
+        pass
+
     def post_init_setup(self, fused_experts: "FusedMoEExperts"):
         """Initialize FusedMoEPrepareAndFinalizeModular settings that depend on
         FusedMoEExpertsModular experts object.
@@ -496,6 +500,27 @@ class FusedMoEExperts(ABC):
         self.num_dispatchers = num_dispatchers
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
+        pass
+
+    def register_derived(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device | int | None = None,
+    ) -> torch.Tensor:
+        """Allocate a weight-derived tensor once. Its value is written by
+        `refresh()`, which the constructor calls, so cold start and reload run
+        the same code and the address never changes."""
+        if device is None:
+            device = torch.accelerator.current_device_index()
+        t = torch.empty(shape, dtype=dtype, device=device)
+        setattr(self, name, t)
+        return t
+
+    def refresh(self) -> None:  # noqa: B027
+        """Recompute weight-derived state in place (idempotent). Called by the
+        reload framework after new weights land. No-op by default."""
         pass
 
     @staticmethod
@@ -1663,6 +1688,17 @@ class FusedMoEKernel:
 
     def supports_lora(self) -> bool:
         return self.fused_experts.supports_lora()
+
+    @torch.no_grad()
+    def refresh(self) -> None:
+        """Refresh weight-derived state of the whole kernel, in place: the quant
+        config first (experts may read its derived values), then
+        prepare/finalize and experts."""
+        quant_config = getattr(self.fused_experts, "quant_config", None)
+        if quant_config is not None and hasattr(quant_config, "refresh"):
+            quant_config.refresh()
+        self.prepare_finalize.refresh()
+        self.fused_experts.refresh()
 
     def _post_init_setup(self):
         """Resolve any leftover setup dependencies between self.prepare_finalize

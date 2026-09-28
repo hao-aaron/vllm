@@ -3,6 +3,7 @@
 """Utils for model executor."""
 
 import copy
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -68,6 +69,31 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+_RELOADING: ContextVar[bool] = ContextVar("vllm_weight_reloading", default=False)
+
+
+@contextmanager
+def reload_mode() -> Iterator[None]:
+    """Set around process_weights_after_loading during a weight reload.
+
+    In reload mode, PWAL must not rebuild kernel objects that already exist
+    (they are captured by CUDA graphs); the reload framework calls their
+    `refresh()` after the results land in the live tensors. `replace_parameter`
+    only rebinds: nothing is written into existing storage while later PWAL
+    steps may still read it.
+    """
+    token = _RELOADING.set(True)
+    try:
+        yield
+    finally:
+        _RELOADING.reset(token)
+
+
+def is_reloading() -> bool:
+    """True inside `reload_mode()`."""
+    return _RELOADING.get()
+
+
 def replace_parameter(
     layer: torch.nn.Module,
     param_name: str,
@@ -122,6 +148,7 @@ def replace_parameter(
 
     if (
         prefer_copy
+        and not is_reloading()
         and old_param is not None
         and old_param.shape == new_tensor.shape
         and old_param.dtype == new_tensor.dtype

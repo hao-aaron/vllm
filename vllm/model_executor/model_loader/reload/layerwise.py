@@ -4,7 +4,7 @@ import inspect
 import os
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import reload_mode
 
 from . import meta as _meta
 from .meta import (
@@ -160,6 +161,8 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
+    _check_model_hook_reload_safe(model)
+
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
@@ -181,6 +184,33 @@ def initialize_layerwise_reload(model: torch.nn.Module):
 
         # Wrap weight loaders to buffer loading
         initialize_online_processing(layer)
+
+
+# Reload never calls the free-form model hook `model.process_weights_after_loading()`
+# (cold start only). A model that has one must declare `reload_safe = True`
+# (its reload work lives in module-level PWAL / `refresh()`), else reload fails
+# closed. VLLM_RELOAD_ALLOW_UNSAFE_MODEL_HOOK=1 downgrades this to a warning.
+ALLOW_UNSAFE_MODEL_HOOK = os.getenv("VLLM_RELOAD_ALLOW_UNSAFE_MODEL_HOOK", "0") == "1"
+
+
+class ReloadUnsafeModelError(RuntimeError):
+    pass
+
+
+def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
+    hook = getattr(type(model), "process_weights_after_loading", None)
+    if hook is None or getattr(model, "reload_safe", False):
+        return
+    msg = (
+        f"{type(model).__name__} has a model-level process_weights_after_loading() "
+        "hook, which reload does not call, and does not declare reload_safe. Its "
+        "post-load work would not be redone on reload (stale or wrong weights). "
+        "Set VLLM_RELOAD_ALLOW_UNSAFE_MODEL_HOOK=1 to reload anyway."
+    )
+    if ALLOW_UNSAFE_MODEL_HOOK:
+        logger.warning_once(msg)
+        return
+    raise ReloadUnsafeModelError(msg)
 
 
 def initialize_online_processing(layer: torch.nn.Module):
@@ -327,12 +357,14 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         model._do_torchao_reload = model._original_do_torchao_reload
 
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
+    reloading = False
 
     for layer in model.modules():
         info = get_layerwise_info(layer)
         if not info.can_load():
             info.reset()
             continue
+        reloading = reloading or info.kernel_tensors is not None
 
         # Deferred attention-like layers are processed after all other layers
         if is_deferred_attention_layer(layer):
@@ -365,10 +397,25 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
     # Process attention layers after all other layers are done
     for layer, info in deferred_attn:
+        reloading = reloading or info.kernel_tensors is not None
         _finalize_attention_layer(layer, info, model_config)
         info.reset()
 
+    # Model phase: declared refresh() of model-local derived state (kind A),
+    # after every module has landed. The free-form model hook is not called.
+    if reloading:
+        _refresh_model_local(model)
+
     LOADING_LAYERS.clear()
+
+
+def _refresh_model_local(model: torch.nn.Module) -> None:
+    # post-order-ish: children before their parents, the model last
+    for module in reversed(list(model.modules())):
+        refresh = getattr(module, "refresh", None)
+        if callable(refresh) and isinstance(module, torch.nn.Module):
+            with torch.no_grad():
+                refresh()
 
 
 def finalize_layerwise_reload(*args, **kwargs):
@@ -387,7 +434,9 @@ def _finalize_attention_layer(
         _reload_attention_scales(layer, info)
     else:
         _place_kernel_tensors(layer, info)
-    layer.process_weights_after_loading(model_config.dtype)
+    reloading = info.kernel_tensors is not None
+    with reload_mode() if reloading else nullcontext():
+        layer.process_weights_after_loading(model_config.dtype)
 
 
 def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
@@ -509,6 +558,28 @@ def scratch_bytes_in_flight() -> int:
     return sum(LAYERWISE_INFO[layer].scratch_bytes for layer in in_flight)
 
 
+def _warn_if_not_reload_safe(layer: torch.nn.Module, quant_method) -> None:
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+
+    if isinstance(quant_method, FusedMoEMethodBase) and not quant_method.reload_safe:
+        logger.warning_once(
+            "%s (%s) does not declare reload_safe: its MoE kernel is rebuilt on "
+            "reload, so weight-derived state held off-registry may be stale under "
+            "CUDA graphs.",
+            type(quant_method).__name__,
+            getattr(quant_method, "fp8_backend", None)
+            or getattr(quant_method, "mxfp4_backend", None)
+            or "",
+        )
+
+
+def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:
+    if getattr(quant_method, "reload_safe", False) and hasattr(quant_method, "refresh"):
+        quant_method.refresh(layer)
+
+
 def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = None):
     """Finish one module: PWAL on its checkpoint-format tensors, copy the
     results into the live tensors, restore the original tensor objects, reset.
@@ -533,20 +604,27 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     for param in get_layer_tensors(layer).values():
         param.weight_loader = _get_original_loader(param)
 
-    # Process weights (quantization, repacking, etc.)
+    # Process weights (quantization, repacking, etc.). On reload this runs in
+    # reload mode: kernel objects are built once, `replace_parameter` rebinds.
+    reloading = info.kernel_tensors is not None
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
-        quant_method.process_weights_after_loading(layer)
+        if reloading:
+            _warn_if_not_reload_safe(layer, quant_method)
+        with reload_mode() if reloading else nullcontext():
+            quant_method.process_weights_after_loading(layer)
         # Re-reconcile parameter TP state: process_weights_after_loading may
         # have re-created Parameters (stamped with the global rank), which would
         # otherwise break replicated (disable_tp) weights on a subsequent reload.
         if hasattr(layer, "update_param_tp_status"):
             layer.update_param_tp_status()
-
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)
-    if info.kernel_tensors is not None:
+    if reloading:
         _copy_and_restore_kernel_tensors(layer, info)
+        # Refresh weight-derived state now that the live tensors hold the new
+        # values (quant phase; attention and model phases run in finalize)
+        _refresh_quant_method(layer, quant_method)
 
     info.reset()
     with _LOADING_LOCK:
@@ -642,15 +720,62 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     non_persistent = info.kernel_non_persistent_buffers
     loaded_tensor_names = info.loaded_names | {name for name, _ in info.loaded_weights}
     for name, param in parameters.items():
-        param.data.copy_(getattr(layer, name))
+        result = getattr(layer, name, None)
+        if result is None:
+            # Derived tensors (e.g. g1_alphas) that a build-once PWAL no longer
+            # produces keep their storage and are rewritten by refresh()
+            logger.debug("%s.%s: not produced by PWAL", type(layer).__name__, name)
+            continue
+        _land(layer, name, param, result)
     for name, buffer in buffers.items():
-        if name not in layer._buffers:
+        if name not in layer._buffers or layer._buffers[name] is None:
             continue
         if name in non_persistent and name not in loaded_tensor_names:
             continue
-        buffer.data.copy_(getattr(layer, name))
+        _land(layer, name, buffer, getattr(layer, name))
 
     _place_kernel_tensors(layer, info)
+
+
+# Landing: strict by default in log-only mode; VLLM_RELOAD_STRICT_LANDING=1 raises
+STRICT_LANDING_RAISE = os.getenv("VLLM_RELOAD_STRICT_LANDING", "0") == "1"
+
+
+class LandingMismatchError(RuntimeError):
+    pass
+
+
+def check_exact_landing(dst: torch.Tensor, src: torch.Tensor) -> str | None:
+    """Return a description of why `src` does not land exactly in `dst`
+    (shape, stride, dtype or device differ), or None. `copy_` would silently
+    broadcast or convert in those cases."""
+    problems = []
+    if tuple(dst.shape) != tuple(src.shape):
+        problems.append(f"shape {tuple(src.shape)} -> {tuple(dst.shape)}")
+    elif dst.numel() > 1 and _effective_strides(dst) != _effective_strides(src):
+        problems.append(f"stride {src.stride()} -> {dst.stride()}")
+    if dst.dtype != src.dtype:
+        problems.append(f"dtype {src.dtype} -> {dst.dtype}")
+    if dst.device != src.device:
+        problems.append(f"device {src.device} -> {dst.device}")
+    return ", ".join(problems) or None
+
+
+def _effective_strides(t: torch.Tensor) -> tuple[int, ...]:
+    # strides of size-1 dims carry no layout information
+    return tuple(s for s, n in zip(t.stride(), t.shape) if n != 1)
+
+
+def _land(
+    layer: torch.nn.Module, name: str, dst: torch.Tensor, src: torch.Tensor
+) -> None:
+    problem = check_exact_landing(dst, src)
+    if problem is not None:
+        msg = f"reload landing {type(layer).__name__}.{name}: {problem}"
+        if STRICT_LANDING_RAISE:
+            raise LandingMismatchError(msg)
+        logger.warning_once("Inexact %s (copy_ would broadcast/convert)", msg)
+    dst.data.copy_(src)
 
 
 def _place_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):

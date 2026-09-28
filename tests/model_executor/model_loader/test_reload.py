@@ -1533,3 +1533,144 @@ def test_bake_offsets_relative_to_target():
     t.as_strided(sc.shape, sc.stride, t.storage_offset() + sc.offset).fill_(1.0)
     assert torch.equal(layer.weight[1], torch.ones(4, device="cuda"))
     assert base[:8].sum() == 0 and base[12:].sum() == 4 * 0 + 0
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload, PR 2: reload mode, refresh(), strict landing, fail closed
+# ---------------------------------------------------------------------------
+
+
+def test_strict_landing_flags_broadcast(monkeypatch):
+    dst = torch.zeros(3)
+    src = torch.tensor(2.0)  # 0-dim: copy_ would silently broadcast
+    assert reload_layerwise.check_exact_landing(dst, src) is not None
+    assert reload_layerwise.check_exact_landing(dst, torch.ones(3)) is None
+    # size-1 dims carry no layout, [1] vs [1] with different strides is exact
+    assert (
+        reload_layerwise.check_exact_landing(torch.zeros(4, 1), torch.zeros(1, 4).t())
+        is None
+    )
+    assert "stride" in reload_layerwise.check_exact_landing(
+        torch.zeros(4, 3), torch.zeros(3, 4).t()
+    )
+    layer = torch.nn.Module()
+    monkeypatch.setattr(reload_layerwise, "STRICT_LANDING_RAISE", True)
+    with pytest.raises(reload_layerwise.LandingMismatchError):
+        reload_layerwise._land(layer, "w", dst, src)
+    monkeypatch.setattr(reload_layerwise, "STRICT_LANDING_RAISE", False)
+    reload_layerwise._land(layer, "w", dst, src)  # log-only: copies as before
+    assert torch.equal(dst, torch.full((3,), 2.0))
+
+
+class _ModeRecorder(_ProcessRecorder):
+    def __init__(self):
+        super().__init__()
+        self.modes: list[bool] = []
+
+    def process_weights_after_loading(self, layer):
+        from vllm.model_executor.utils import is_reloading
+
+        self.modes.append(is_reloading())
+        super().process_weights_after_loading(layer)
+
+
+def test_reload_mode_only_during_reload():
+    from vllm.model_executor.utils import is_reloading, reload_mode, replace_parameter
+
+    layer = _ExpertLayer(device="cpu")
+    layer.quant_method = _ModeRecorder()
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    for e in (2, 5):
+        layer.w.weight_loader(layer.w, torch.ones(4, 6), expert_id=e)
+    finalize_layerwise_reload(model, model_config=None)
+    assert layer.quant_method.modes == [True]
+    assert not is_reloading()
+    # replace_parameter(prefer_copy=True) only rebinds in reload mode
+    holder = torch.nn.Module()
+    holder.p = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    old = holder.p
+    with reload_mode():
+        replace_parameter(holder, "p", torch.ones(2), prefer_copy=True)
+    assert holder.p is not old and torch.equal(old, torch.zeros(2))
+    replace_parameter(holder, "p", torch.full((2,), 3.0), prefer_copy=True)
+
+
+class _HookModel(torch.nn.Sequential):
+    def __init__(self, *mods, reload_safe=False):
+        super().__init__(*mods)
+        self.reload_safe = reload_safe
+        self.hook_calls = 0
+        self.register_buffer("derived", torch.zeros(4, 6), persistent=False)
+        self.refresh_calls = 0
+
+    def process_weights_after_loading(self):
+        self.hook_calls += 1
+
+    def refresh(self):
+        # kind A: derived from live params, allocated once, written in place
+        self.refresh_calls += 1
+        self.derived.copy_(self[0].w[0] * 2)
+
+
+def test_model_hook_fail_closed_and_model_phase_refresh(monkeypatch):
+    layer = _ExpertLayer(device="cpu")
+    unsafe = _HookModel(layer)
+    record_metadata_for_reloading(unsafe)
+    with pytest.raises(reload_layerwise.ReloadUnsafeModelError):
+        initialize_layerwise_reload(unsafe)
+
+    layer = _ExpertLayer(device="cpu")
+    model = _HookModel(layer, reload_safe=True)
+    record_metadata_for_reloading(model)
+    derived_ptr = model.derived.data_ptr()
+    initialize_layerwise_reload(model)
+    for e in (2, 5):
+        layer.w.weight_loader(layer.w, torch.full((4, 6), float(e)), expert_id=e)
+    finalize_layerwise_reload(model, model_config=None)
+    assert model.hook_calls == 0  # the free-form hook is cold-start only
+    assert model.refresh_calls == 1
+    assert model.derived.data_ptr() == derived_ptr
+    assert torch.equal(model.derived, torch.full((4, 6), 4.0))
+
+
+@requires_cuda
+def test_fp8_flashinfer_cutlass_quant_config_refresh():
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        Fp8MoeBackend,
+        make_fp8_moe_quant_config,
+    )
+
+    layer = torch.nn.Module()
+    E = 4
+    w1s = torch.rand(E, device="cuda") + 0.5
+    w2s = torch.rand(E, device="cuda") + 0.5
+    a1s = torch.tensor(0.25, device="cuda")
+    a2s = torch.tensor(0.5, device="cuda")
+    qc = make_fp8_moe_quant_config(
+        fp8_backend=Fp8MoeBackend.FLASHINFER_CUTLASS,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        a1_scale=a1s,
+        a2_scale=a2s,
+        layer=layer,
+    )
+    ptrs = (qc.g1_alphas.data_ptr(), qc.a1_gscale.data_ptr(), qc.a2_gscale.data_ptr())
+    # a reload lands new values into the same tensors ...
+    w1s.mul_(3.0)
+    a1s.fill_(0.125)
+    a2s.fill_(2.0)
+    qc.refresh()
+    # ... and refresh() updates derived state in place
+    assert torch.allclose(qc.g1_alphas, w1s * a1s)
+    assert torch.allclose(qc.a1_gscale, torch.tensor(8.0, device="cuda"))
+    assert torch.allclose(qc.a2_gscale, torch.tensor(0.5, device="cuda"))
+    assert ptrs == (
+        qc.g1_alphas.data_ptr(),
+        qc.a1_gscale.data_ptr(),
+        qc.a2_gscale.data_ptr(),
+    )
+    assert qc.g1_alphas is layer.g1_alphas or qc.g1_alphas.data_ptr() == (
+        layer.g1_alphas.data_ptr()
+    )
