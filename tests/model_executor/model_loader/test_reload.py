@@ -2175,3 +2175,164 @@ def test_unloaded_scale_keeps_create_time_sentinel():
     seen = layer.quant_method.calls[0]["weight_scale"]
     assert seen[0] == 0.5
     assert (seen[1:] == FP8_SCALE_SENTINEL).all()
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload, PR 4: per-expert completion for online-quantized MoE
+# ---------------------------------------------------------------------------
+
+
+class _PerExpertMethod(QuantizeMethodBase):
+    """Online-quant-like method: quantize_expert records (name, expert, value),
+    finish_experts records the staging it received."""
+
+    def __init__(self, collective=False):
+        self.quantized: list[tuple[str, int, torch.Tensor]] = []
+        self.finished = None
+        self.collective = collective
+
+    def create_weights(self, layer, *a, **k):
+        pass
+
+    def apply(self, layer, *a, **k):
+        raise NotImplementedError
+
+    def per_expert_needs_collective(self):
+        return self.collective
+
+    def expert_staging_spec(self, layer):
+        return {
+            "w13": (tuple(layer.w13_weight.shape), torch.float32),
+            "w2": (tuple(layer.w2_weight.shape), torch.float32),
+        }
+
+    def quantize_expert(self, layer, name, expert, src, staging, amax=None):
+        self.quantized.append((name, expert, src.clone()))
+        staging["w13" if name == "w13_weight" else "w2"][expert] = src * 2
+
+    def finish_experts(self, layer, staging):
+        from vllm.model_executor.utils import replace_parameter
+
+        self.finished = {k: v.clone() for k, v in staging.items()}
+        replace_parameter(layer, "w13_weight", staging["w13"])
+        replace_parameter(layer, "w2_weight", staging["w2"])
+
+    def process_weights_after_loading(self, layer):
+        staging = {
+            "w13": torch.empty_like(layer.w13_weight),
+            "w2": torch.empty_like(layer.w2_weight),
+        }
+        for e in range(layer.w13_weight.shape[0]):
+            self.quantize_expert(layer, "w13_weight", e, layer.w13_weight[e], staging)
+            self.quantize_expert(layer, "w2_weight", e, layer.w2_weight[e], staging)
+        self.finish_experts(layer, staging)
+
+
+def _routed_experts(method, local=(0, 1), num_global=4, hidden=4, inter=3):
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    config = SimpleNamespace(
+        hidden_dim_unpadded=hidden,
+        intermediate_size_per_partition_unpadded=inter,
+        is_act_and_mul=True,
+        has_bias=False,
+        tp_rank=0,
+        tp_shard_with_padding=False,
+        moe_parallel_config=SimpleNamespace(tp_size=1),
+    )
+    layer = object.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = config
+    layer.quant_config = None
+    layer.quant_method = method
+    local_map = {g: i for i, g in enumerate(local)}
+    layer.expert_map_manager = SimpleNamespace(
+        map_global_to_local=lambda g: local_map.get(g, -1)
+    )
+    layer._loaded_expert_biases = set()
+    for name, shape in (
+        ("w13_weight", (len(local), 2 * inter, hidden)),
+        ("w2_weight", (len(local), hidden, inter)),
+    ):
+        p = torch.nn.Parameter(torch.zeros(shape, device="cuda"), requires_grad=False)
+        p.weight_loader = layer.weight_loader
+        layer.register_parameter(name, p)
+    return layer
+
+
+def _send(layer, name, shard, expert, value, hidden=4, inter=3):
+    shape = (inter, hidden) if shard in ("w1", "w3") else (hidden, inter)
+    p = getattr(layer, name)
+    return p.weight_loader(
+        p, torch.full(shape, float(value), device="cuda"), name, shard, expert, True
+    )
+
+
+@requires_cuda
+def test_per_expert_completion_counts_units_and_skips_nonlocal(monkeypatch):
+    import vllm.model_executor.model_loader.reload.per_expert as per_expert
+
+    monkeypatch.setattr(per_expert, "PER_EXPERT", True)
+    method = _PerExpertMethod()
+    layer = _routed_experts(method)
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    info = reload_layerwise.get_layerwise_info(layer)
+
+    assert _send(layer, "w13_weight", "w1", 0, 1.0)
+    slots = info.expert_slots
+    assert slots is not None and layer.w13_weight.is_meta  # fused never built
+    assert method.quantized == []  # w13 unit needs both w1 and w3
+    assert not _send(layer, "w13_weight", "w1", 3, 9.0)  # non-local: no slot
+    assert len(slots.slots) == 1
+    _send(layer, "w13_weight", "w3", 0, 2.0)
+    assert [(n, e) for n, e, _ in method.quantized] == [("w13_weight", 0)]
+    assert len(slots.slots) == 0  # slot freed right after quantization
+    q = method.quantized[0][2]
+    assert torch.equal(q[:3], torch.full((3, 4), 1.0, device="cuda"))
+    assert torch.equal(q[3:], torch.full((3, 4), 2.0, device="cuda"))
+    _send(layer, "w2_weight", "w2", 0, 3.0)
+    _send(layer, "w13_weight", "w1", 1, 4.0)
+    _send(layer, "w13_weight", "w3", 1, 5.0)
+    _send(layer, "w2_weight", "w2", 1, 6.0)  # completes the module
+    assert not info.can_load()
+    assert slots.max_in_flight == 1
+    assert torch.equal(layer.w2_weight[1], torch.full((4, 3), 12.0, device="cuda"))
+    finalize_layerwise_reload(model, model_config=None)
+
+
+@requires_cuda
+def test_per_expert_backstop_and_fallbacks(monkeypatch):
+    import vllm.model_executor.model_loader.reload.per_expert as per_expert
+
+    monkeypatch.setattr(per_expert, "PER_EXPERT", True)
+    # expert 1 never sent: the module completes at finalize via flush (zeros)
+    method = _PerExpertMethod()
+    layer = _routed_experts(method)
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    _send(layer, "w13_weight", "w1", 0, 1.0)
+    _send(layer, "w13_weight", "w3", 0, 1.0)
+    _send(layer, "w2_weight", "w2", 0, 1.0)
+    finalize_layerwise_reload(model, model_config=None)
+    assert {(n, e) for n, e, _ in method.quantized} == {
+        (n, e) for n in ("w13_weight", "w2_weight") for e in (0, 1)
+    }
+    assert torch.equal(layer.w2_weight[1], torch.zeros(4, 3, device="cuda"))
+
+    # a method whose per-expert step needs a collective uses module level
+    method = _PerExpertMethod(collective=True)
+    layer = _routed_experts(method)
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    _send(layer, "w13_weight", "w1", 0, 1.0)
+    info = reload_layerwise.get_layerwise_info(layer)
+    assert info.per_expert is False and info.expert_slots is None
+    assert not layer.w13_weight.is_meta  # module-level scratch
+    reload_layerwise.abort_reload(model)

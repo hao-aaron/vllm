@@ -94,6 +94,21 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        # Round-up padding is never loaded: declare the checkpoint numel so
+        # streamed modules (and per-expert units) complete on arrival.
+        hidden = self.moe.hidden_dim_unpadded or hidden_size
+        inter = (
+            self.moe.intermediate_size_per_partition_unpadded
+            or intermediate_size_per_partition
+        )
+        shards = self.moe.w13_num_shards
+        for param, numel in (
+            (w13_weight, num_experts * shards * inter * hidden),
+            (w2_weight, num_experts * hidden * inter),
+        ):
+            if numel < param.numel():
+                param.weight_loader_numel = numel
+
         initialize_online_processing(layer)
 
     def _zero_padding(self, layer: torch.nn.Module) -> None:

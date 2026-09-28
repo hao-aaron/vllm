@@ -294,6 +294,13 @@ class ReloadHarnessExtension:
             "num_retained": len(retained),
             "seconds": dt,
         }
+        try:
+            from vllm.model_executor.model_loader.reload import per_expert
+
+            stats["slots_in_flight"] = dict(per_expert.SLOTS_IN_FLIGHT)
+            per_expert.SLOTS_IN_FLIGHT.clear()
+        except ImportError:
+            pass
         get_outcomes = getattr(reload_api, "landing_outcomes", None)
         if get_outcomes is not None:
             stats["landing"] = get_outcomes(model)

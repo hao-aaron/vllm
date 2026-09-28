@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
 from inspect import BoundArguments
+from typing import Any
 
 import torch
 
@@ -64,6 +65,11 @@ class LayerReloadingInfo:
 
     # direct loading: tensors hosted in live storage -> (storage ptr, nbytes)
     hosted: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+    # per-expert completion (online-quantized MoE): decided at the first expert
+    # weight call; `expert_slots` is a `per_expert.ExpertSlots`
+    per_expert: bool | None = None
+    expert_slots: Any = None
 
     def reset(self):
         self.__init__(  # type: ignore[misc]
