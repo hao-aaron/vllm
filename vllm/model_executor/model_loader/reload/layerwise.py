@@ -525,8 +525,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 def _refresh_model_local(model: torch.nn.Module) -> None:
     # post-order-ish: children before their parents, the model last
     for module in reversed(list(model.modules())):
+        if isinstance(module, QuantizeMethodBase):
+            continue  # refreshed in the quant phase, with their layer
         refresh = getattr(module, "refresh", None)
-        if callable(refresh) and isinstance(module, torch.nn.Module):
+        if callable(refresh):
             with torch.no_grad():
                 refresh()
 
