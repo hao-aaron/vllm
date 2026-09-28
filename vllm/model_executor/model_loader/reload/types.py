@@ -5,10 +5,25 @@ from inspect import BoundArguments
 
 import torch
 
-__all__ = ["LayerTensors", "LayerReloadingInfo"]
+__all__ = ["LayerTensors", "LayerReloadingInfo", "ReloadSession"]
 
 # encodes both parameters and buffers separately
 LayerTensors = tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]
+
+
+@dataclass
+class ReloadSession:
+    """Model-wide state of one weight update (holds no module references)."""
+
+    # caller-supplied id of this update, recorded on success
+    generation: int | None = None
+    # a live tensor was written and the update has not finished successfully;
+    # the engine must not serve until a full update succeeds
+    dirty: bool = False
+    # names of modules left incomplete at finish (integrity report)
+    incomplete: list[str] = field(default_factory=list)
+    # between start and finish/abort: params are on meta / hold checkpoint bytes
+    active: bool = True
 
 
 @dataclass
@@ -39,6 +54,9 @@ class LayerReloadingInfo:
 
     # names of tensors that received at least one loader call this round
     loaded_names: set[str] = field(default_factory=set)
+
+    # the update this module belongs to, set by `initialize_layerwise_reload`
+    session: ReloadSession | None = None
 
     def reset(self):
         self.__init__(  # type: ignore[misc]

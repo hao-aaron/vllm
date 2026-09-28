@@ -29,7 +29,7 @@ from .meta import (
     restore_layer_on_meta,
     to_meta_tensor,
 )
-from .types import LayerReloadingInfo
+from .types import LayerReloadingInfo, ReloadSession
 from .utils import (
     get_info_size,
     get_layer_params_buffers,
@@ -57,6 +57,9 @@ __all__ = [
     "LoadTarget",
     "LoadTrace",
     "add_reload_transform",
+    "get_reload_session",
+    "is_model_dirty",
+    "check_can_serve",
 ]
 
 
@@ -148,7 +151,7 @@ def record_metadata_for_reloading(model: torch.nn.Module):
 
 
 @torch.no_grad()
-def initialize_layerwise_reload(model: torch.nn.Module):
+def initialize_layerwise_reload(model: torch.nn.Module, generation: int | None = None):
     """Set up layerwise weight loading with deferred processing.
 
     Must be called after `record_metadata_for_reloading`. This function:
@@ -164,6 +167,13 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     """
     _check_model_hook_reload_safe(model)
 
+    # A failed update leaves the model dirty until a full update succeeds
+    previous = get_reload_session(model)
+    session = ReloadSession(
+        generation=generation, dirty=previous is not None and previous.dirty
+    )
+    model._reload_session = session
+
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
@@ -174,6 +184,8 @@ def initialize_layerwise_reload(model: torch.nn.Module):
         # Skip if the layer has already been initialized
         if info.can_load():
             continue
+
+        info.session = session
 
         # Save current tensors for later copying
         info.kernel_tensors = get_layer_params_buffers(layer)
@@ -212,6 +224,78 @@ def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
         logger.warning_once(msg)
         return
     raise ReloadUnsafeModelError(msg)
+
+
+# Integrity. A module left partially loaded at finish would keep zeros (or,
+# with direct loading, bytes of its old kernel format) where data is missing.
+# VLLM_RELOAD_REQUIRE_COMPLETE=1 raises; otherwise it is reported and logged.
+# Direct loading always requires it for modules it hosted.
+REQUIRE_COMPLETE = os.getenv("VLLM_RELOAD_REQUIRE_COMPLETE", "0") == "1"
+
+
+class ReloadIncompleteError(RuntimeError):
+    pass
+
+
+def get_reload_session(model: torch.nn.Module) -> ReloadSession | None:
+    return getattr(model, "_reload_session", None)
+
+
+def is_model_dirty(model: torch.nn.Module) -> bool:
+    """True after a failed update wrote live weights (until one succeeds)."""
+    session = get_reload_session(model)
+    return session is not None and session.dirty
+
+
+def check_can_serve(model: torch.nn.Module) -> None:
+    """Refuse to run the model mid-update or after a failed update."""
+    session = getattr(model, "_reload_session", None)
+    if session is None:
+        return
+    if session.active:
+        raise RuntimeError(
+            "Model is mid weight update (start_weight_update without "
+            "finish_weight_update); pause generation during updates."
+        )
+    if session.dirty:
+        raise RuntimeError(
+            "A weight update failed after writing live weights; the engine "
+            "refuses to serve until a full update succeeds."
+        )
+
+
+def _mark_dirty(info: LayerReloadingInfo) -> None:
+    if info.session is not None:
+        info.session.dirty = True
+
+
+def _check_complete(model: torch.nn.Module) -> None:
+    incomplete: list[str] = []
+    must_raise = False
+    for name, layer in model.named_modules():
+        info = LAYERWISE_INFO.get(layer)
+        if info is None or not info.can_load() or info.kernel_tensors is None:
+            continue
+        if is_deferred_attention_layer(layer):
+            continue
+        if 0 < info.load_numel < info.load_numel_total:  # type: ignore[operator]
+            incomplete.append(
+                f"{name or type(layer).__name__} "
+                f"({info.load_numel}/{info.load_numel_total})"
+            )
+            must_raise = must_raise or bool(getattr(info, "hosted", None))
+    session = get_reload_session(model)
+    if session is not None:
+        session.incomplete = incomplete
+    if not incomplete:
+        return
+    msg = (
+        f"{len(incomplete)} module(s) were only partially loaded by this update "
+        f"(missing or miscounted names): {incomplete[:8]}"
+    )
+    if REQUIRE_COMPLETE or must_raise:
+        raise ReloadIncompleteError(msg)
+    logger.warning(msg)
 
 
 def initialize_online_processing(layer: torch.nn.Module):
@@ -304,6 +388,10 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                 # incoming tensor (including non-local experts, which the loader
                 # declines) is not retained.
                 target = ensure_param_materialized(layer, info, param_name)
+                if info.kernel_tensors is not None and param_name not in (
+                    info.materialized
+                ):
+                    _mark_dirty(info)  # writes live storage (e.g. `bias`)
                 if info.loaded_weights:
                     _replay_buffered(layer, info)
                 bound_args.arguments["param"] = target
@@ -357,6 +445,8 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
+    _check_complete(model)
+
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
     reloading = False
 
@@ -408,6 +498,13 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         _refresh_model_local(model)
 
     LOADING_LAYERS.clear()
+
+    # The update finished: the model may serve again
+    session = get_reload_session(model)
+    if session is not None:
+        session.dirty = False
+        session.active = False
+        model._weights_generation = session.generation
 
 
 def _refresh_model_local(model: torch.nn.Module) -> None:
@@ -673,9 +770,9 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
 # ---------------------------------------------------------------------------
 
 
-def start_reload(model: torch.nn.Module) -> None:
+def start_reload(model: torch.nn.Module, generation: int | None = None) -> None:
     """Begin a streaming reload (alias of `initialize_layerwise_reload`)."""
-    initialize_layerwise_reload(model)
+    initialize_layerwise_reload(model, generation=generation)
 
 
 def finish_reload(model: torch.nn.Module, model_config: ModelConfig) -> None:
@@ -704,6 +801,9 @@ def abort_reload(model: torch.nn.Module) -> None:
         model._do_torchao_reload = model._original_do_torchao_reload
     with _LOADING_LOCK:
         LOADING_LAYERS.clear()
+    session = get_reload_session(model)
+    if session is not None:
+        session.active = False
 
 
 @contextmanager
@@ -752,6 +852,7 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     """Copy processed values into original kernel tensor storage and restore
     kernel tensor references on the layer. Preserves cudagraph references."""
     assert info.kernel_tensors is not None
+    _mark_dirty(info)
     parameters, buffers = info.kernel_tensors
     non_persistent = info.kernel_non_persistent_buffers
     loaded_tensor_names = info.loaded_names | {name for name, _ in info.loaded_weights}

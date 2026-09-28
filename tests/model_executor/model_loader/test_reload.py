@@ -1859,3 +1859,89 @@ def test_reload_output_transform_permutes_before_landing(register_transform):
         # the permute, so the kernel would read a mismatched layout
         assert torch.equal(parent.wq_b.weight, B["weight"])
         assert not torch.equal(parent.wq_b.weight, B["weight"][perm])
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload: integrity (dirty flag, generation, incomplete modules)
+# ---------------------------------------------------------------------------
+
+
+def _two_expert_layers():
+    layers = [_ExpertLayer(device="cpu") for _ in range(2)]
+    model = torch.nn.Sequential(*layers)
+    record_metadata_for_reloading(model)
+    return model, layers
+
+
+def _load_layer(layer, value):
+    for e in (2, 5):
+        layer.w.weight_loader(layer.w, torch.full((4, 6), value), expert_id=e)
+
+
+def test_failure_after_live_write_leaves_model_dirty():
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        finish_reload,
+        is_model_dirty,
+        start_reload,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import check_can_serve
+
+    model, (a, b) = _two_expert_layers()
+    start_reload(model, generation=1)
+    with pytest.raises(RuntimeError, match="mid weight update"):
+        check_can_serve(model)
+    _load_layer(a, 1.0)  # completes and lands: live storage written
+    b.w.weight_loader(b.w, torch.ones(4, 6), expert_id=2)  # partial
+    abort_reload(model)  # e.g. the transport failed here
+    assert is_model_dirty(model)
+    with pytest.raises(RuntimeError, match="refuses to serve"):
+        check_can_serve(model)
+    # a new update starts dirty and only a full success clears it
+    start_reload(model, generation=2)
+    _load_layer(a, 2.0)
+    _load_layer(b, 2.0)
+    finish_reload(model, model_config=None)
+    assert not is_model_dirty(model)
+    check_can_serve(model)
+    assert model._weights_generation == 2
+
+
+def test_failure_before_any_live_write_is_clean():
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        is_model_dirty,
+        start_reload,
+    )
+
+    model, (a, b) = _two_expert_layers()
+    before = a.w.detach().clone()
+    start_reload(model)
+    a.w.weight_loader(a.w, torch.ones(4, 6), expert_id=2)  # partial, scratch only
+    abort_reload(model)
+    assert not is_model_dirty(model)
+    assert torch.equal(a.w, before)
+
+
+def test_incomplete_module_reported_or_raised(monkeypatch):
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        finish_reload,
+        get_reload_session,
+        start_reload,
+    )
+
+    model, (a, b) = _two_expert_layers()
+    start_reload(model)
+    _load_layer(a, 1.0)
+    b.w.weight_loader(b.w, torch.ones(4, 6), expert_id=2)  # expert 5 never sent
+    finish_reload(model, model_config=None)
+    assert len(get_reload_session(model).incomplete) == 1
+
+    monkeypatch.setattr(reload_layerwise, "REQUIRE_COMPLETE", True)
+    start_reload(model)
+    _load_layer(a, 1.0)
+    b.w.weight_loader(b.w, torch.ones(4, 6), expert_id=2)
+    with pytest.raises(reload_layerwise.ReloadIncompleteError):
+        finish_reload(model, model_config=None)
+    abort_reload(model)

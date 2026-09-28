@@ -165,7 +165,7 @@ class ReloadHarnessExtension:
     """Methods callable through ``LLM.collective_rpc``."""
 
     def _mw_model(self):
-        return self.model_runner.model
+        return self.model_runner.get_model()
 
     def mw_ptr_snapshot(self) -> dict:
         model = self._mw_model()

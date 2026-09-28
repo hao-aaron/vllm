@@ -71,6 +71,9 @@ from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
 )
+from vllm.model_executor.model_loader.reload.layerwise import (
+    check_can_serve,
+)
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -4156,6 +4159,9 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if getattr(self, "model", None) is not None:
+            # weight-update integrity: not mid-update, not after a failed one
+            check_can_serve(self.get_model())
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.

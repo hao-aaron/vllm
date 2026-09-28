@@ -1499,9 +1499,23 @@ class Worker(WorkerBase):
                     local_update_info = update_info
                 self.weight_transfer_engine.update_weights(local_update_info)
             except BaseException:
-                self._weight_update_active = False
-                self.weight_transfer_engine.reset_weight_update_target()
+                self._abort_weight_update()
                 raise
+
+    def _abort_weight_update(self) -> None:
+        """Put the original tensors back and end the session after a failure.
+        If live weights were already written, the model stays dirty and the
+        engine refuses to serve until a full update succeeds."""
+        assert self.weight_transfer_engine is not None
+        from vllm.model_executor.model_loader.reload import abort_reload
+
+        model = getattr(self.weight_transfer_engine, "model", None)
+        try:
+            if isinstance(model, torch.nn.Module):
+                abort_reload(model)
+        finally:
+            self._weight_update_active = False
+            self.weight_transfer_engine.reset_weight_update_target()
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
@@ -1514,7 +1528,13 @@ class Worker(WorkerBase):
             )
 
         with set_current_vllm_config(self.vllm_config):
-            self.weight_transfer_engine.finish_weight_update()
+            try:
+                self.weight_transfer_engine.finish_weight_update()
+            except BaseException:
+                # A failed finish used to leave `_weight_update_active` set, so
+                # the next start raised "already active".
+                self._abort_weight_update()
+                raise
             self.weight_transfer_engine.reset_weight_update_target()
             self._weight_update_active = False
 
