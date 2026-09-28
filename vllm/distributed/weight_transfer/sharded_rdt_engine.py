@@ -811,24 +811,15 @@ class ShardedRDTWeightTransferEngine(
     def _bake(self, init_info: ShardedRDTWeightTransferInitInfo) -> None:
         """Bake the replay plan once, as a self-driven meta dry run.
 
-        Puts the params on meta, then drives ``model.load_weights`` over
-        ``init_info.names`` through the model's ORIGINAL loaders (the stamps
-        bypass ``online_process_loader``, so ``_layerwise_process`` is never in
-        the path). Nothing materializes or pulls; the fake's ``copy_`` records
-        the source op chain and the meta destination's geometry. Afterwards one
-        scatter list per fully-loaded leaf module (copied numel == loadable
-        size) is indexed by source name; a partial or unrecordable module fails
-        the plan build. The model is restored.
-
-        This leans on layerwise internals a public API should expose first-class:
-        a currently-loading hook instead of monkeypatched stamps, a dry-run mode
-        instead of bypassing ``online_process_loader``, and an
-        ``abort_layerwise_reload`` instead of ``_restore_after_dry_run``.
+        Drives ``model.load_weights`` over ``init_info.names`` under
+        ``trace_loads``: loaders run on meta with nothing buffered,
+        materialized or processed, and the fake's ``copy_`` attributes each
+        recorded scatter with ``current_load()``. Afterwards one scatter list per
+        complete module (the same completion rule the live path uses) is indexed
+        by source name; a partial or unrecordable module fails the plan build.
+        ``trace_loads`` restores the model on exit.
         """
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            initialize_layerwise_reload,
-        )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_size
+        from vllm.model_executor.model_loader.reload import trace_loads
 
         names, dtype_names, shapes = (
             init_info.names,
@@ -843,31 +834,22 @@ class ShardedRDTWeightTransferEngine(
         recorder = BakeSink()
 
         _t0 = time.perf_counter()
-        with torch.device(self.device):
-            # Meta-restore params + save kernel tensors (we bypass the loader
-            # wrapping it installs, below).
-            initialize_layerwise_reload(model)
-            # Stamp the *original* loaders (bypassing online_process_loader), so
-            # the single load pass runs the loaders on meta and records via the
-            # fake's copy_ — with no inline _layerwise_process, no deferral.
-            self._install_recording_stamps(model, recorder)
+        with torch.device(self.device), trace_loads(model) as trace:
             model.load_weights(self._build_fake_weights(names, recorder, self.device))
-            # Keep only fully-loaded modules (copied numel >= loadable size, the
-            # test online_process_loader uses): a partial module leaves unwritten
-            # regions that finalize would init, so baking it scatters garbage.
-            for module, recorded in recorder.copies_by_layer.items():
-                if not recorded or any(c is None for c in recorded):
-                    continue  # unrecordable copy_ -> slow path
-                # Guard above guarantees every entry is a real _Scatter.
-                copies = cast("list[_Scatter]", recorded)
-                copied = sum(prod(c.shape) for c in copies)
-                if copied < get_layer_size(module):
-                    continue  # partial -> slow path
-                for c in copies:
-                    # Every name of the module shares ONE list, so identity
-                    # dedups them back to one module at plan time.
-                    self._name_to_plan[c.src[0]] = copies
-            self._restore_after_dry_run(model)
+        # Keep only complete modules: a partial module leaves unwritten regions
+        # that finalize would init, so baking it scatters garbage.
+        complete = set(trace.complete_modules())
+        for module, recorded in recorder.copies_by_layer.items():
+            if module not in complete:
+                continue  # partial -> slow path
+            if not recorded or any(c is None for c in recorded):
+                continue  # unrecordable copy_ -> slow path
+            # Guard above guarantees every entry is a real _Scatter.
+            copies = cast("list[_Scatter]", recorded)
+            for c in copies:
+                # Every name of the module shares ONE list, so identity
+                # dedups them back to one module at plan time.
+                self._name_to_plan[c.src[0]] = copies
 
         # Names whose copy_ fired during the bake. Names not in here no-op for
         # this worker (e.g. foreign-EP experts) and are skipped; live names that
@@ -884,94 +866,6 @@ class ShardedRDTWeightTransferEngine(
             len(self._live_names),
             time.perf_counter() - _t0,
         )
-
-    def _install_recording_stamps(
-        self, model: torch.nn.Module, recorder: "BakeSink"
-    ) -> None:
-        """Wrap each loadable param's ``weight_loader`` to stamp
-        ``recorder.current = (leaf_module, param_name)`` before delegating to the
-        original loader, so the fake's ``copy_`` can attribute each recorded copy.
-        ``functools.wraps`` keeps the loader's real signature (so vLLM's
-        ``_layerwise_process`` ``param`` redirect still works if a stamp leaks),
-        and ``_rdt_stamp_inner`` tags it so ``_restore_after_dry_run`` can unwrap it.
-        """
-        import functools
-
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            _get_original_loader,
-        )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
-        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-        def _make_stamp(layer, name, inner, added=False):
-            @functools.wraps(inner)  # keep ``inner``'s signature (incl. ``param``)
-            def stamp(*args, **kwargs):
-                recorder.current = (layer, name)
-                try:
-                    return inner(*args, **kwargs)
-                finally:
-                    recorder.current = None
-
-            # Tag so _restore_after_dry_run can detect and unwrap leaked stamps,
-            # and so a second bake doesn't double-wrap.
-            stamp._rdt_stamp_inner = inner  # type: ignore[attr-defined]
-            stamp._rdt_stamp_added = added  # type: ignore[attr-defined]
-            return stamp
-
-        for module in model.modules():
-            for name, tensor in get_layer_tensors(module).items():
-                if getattr(tensor, "weight_loader", None) is None:
-                    # A param with NO loader (e.g. GLM's router bias, a plain
-                    # nn.Parameter) is still loaded by the model's load_weights
-                    # through the getattr(param, "weight_loader",
-                    # default_weight_loader) fallback — unstamped, its bake copy
-                    # would be unattributable, failing the module's coverage
-                    # gate and the plan build. Stamp the same default loader
-                    # the fallback would pick; the restore deletes it again.
-                    tensor.weight_loader = _make_stamp(
-                        module, name, default_weight_loader, added=True
-                    )
-                    continue
-                # Bypass online_process_loader: stamp the *original* loader.
-                original = _get_original_loader(tensor)
-                tensor.weight_loader = _make_stamp(module, name, original)
-
-    def _restore_after_dry_run(self, model: torch.nn.Module) -> None:
-        """Restore each layerwise layer's saved kernel tensors without pulling
-        (a real ``finalize_layerwise_reload`` would materialize/load) and reset
-        its info. Also unwrap any recording ``stamp`` left on the params, since a
-        leaked stamp would sit under the next sync's ``online_process_loader`` and
-        silently break ``_layerwise_process``'s ``param`` redirect.
-        """
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
-            _place_kernel_tensors,
-        )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
-
-        for layer in model.modules():
-            info = LAYERWISE_INFO.get(layer)
-            if info is not None and info.can_load():
-                if info.kernel_tensors is not None:
-                    _place_kernel_tensors(layer, info)
-                info.reset()
-        # Unwrap any recording stamps left on the (now-restored) params so they
-        # never leak into a later update_weights. ``_rdt_stamp_inner`` is set by
-        # ``_install_recording_stamps``; unwrap repeatedly in case of nesting.
-        for module in model.modules():
-            for _name, tensor in get_layer_tensors(module).items():
-                loader = getattr(tensor, "weight_loader", None)
-                added = False
-                while loader is not None and hasattr(loader, "_rdt_stamp_inner"):
-                    added = added or getattr(loader, "_rdt_stamp_added", False)
-                    loader = loader._rdt_stamp_inner
-                    tensor.weight_loader = loader
-                if added:
-                    # The stamp was ATTACHED to a param that had no loader
-                    # (see _install_recording_stamps); leave none behind.
-                    del tensor.weight_loader
-        if hasattr(model, "_original_do_torchao_reload"):
-            model._do_torchao_reload = model._original_do_torchao_reload
 
     # ---------------- Background post-processing (pull/process pipeline) -------
 
@@ -1300,14 +1194,12 @@ class ShardedRDTWeightTransferEngine(
         scatter its slices on the process stream, publish the slot, then hand the
         modules it COMPLETES to the quant thread.
 
-        Mirrors ``_layerwise_process`` minus the loader replay. Once every scatter
-        reading ``item.slot`` is enqueued, records the slot's read-done event so
-        the RPC thread can block on it before overwriting the slot.
+        First touch goes through ``ensure_materialized``; completion through
+        ``complete_module``. Once every scatter reading ``item.slot`` is
+        enqueued, records the slot's read-done event so the RPC thread can block
+        on it before overwriting the slot.
         """
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
-        )
-        from vllm.model_executor.model_loader.reload.meta import materialize_layer
+        from vllm.model_executor.model_loader.reload import ensure_materialized
 
         results = item.results
         chunk = item.chunk
@@ -1324,22 +1216,20 @@ class ShardedRDTWeightTransferEngine(
             # the NEXT chunk's RDMA overwrite the buffer while quant still runs.
             try:
                 for layer in chunk.materialize:
-                    info = LAYERWISE_INFO.get(layer)
-                    if info is None or not info.can_load():
-                        raise RuntimeError(
-                            f"Baked replay: layer {type(layer).__name__} "
-                            "was not set up for reload this sync "
-                            "(start_weight_update must run before "
-                            "update_weights)."
-                        )
-                    materialize_layer(layer, info)
+                    # raises if start_weight_update didn't run this sync
+                    ensure_materialized(layer)
                 for sc in chunk.scatters:
                     param = getattr(sc.layer, sc.param_name)
                     # Through .data, exactly like default_weight_loader: params
                     # that keep requires_grad=True (plain nn.Parameters like
                     # GLM's router bias) reject an in-place copy through an
-                    # autograd view of the leaf.
-                    dst = param.data.as_strided(sc.shape, sc.stride, sc.offset)
+                    # autograd view of the leaf. Offsets are baked relative to
+                    # the target, which may itself sit at a nonzero storage
+                    # offset (e.g. a view into live storage).
+                    t = param.data
+                    dst = t.as_strided(
+                        sc.shape, sc.stride, t.storage_offset() + sc.offset
+                    )
                     with torch._C.DisableTorchFunctionSubclass():
                         dst.copy_(results[sc.src])
                 # All reads of this slot's buffer are now enqueued on the process
@@ -1365,19 +1255,14 @@ class ShardedRDTWeightTransferEngine(
                     self._quant_queue.put((chunk.quant, ready))
 
     def _run_quant(self, layers: "list[Any]", ready: "torch.cuda.Event") -> None:
-        """Quant/kernel-copy/reset the given COMPLETED leaf modules, exactly as
-        _layerwise_process. Runs on the quant thread's own stream, ordered after
-        the modules' scatters via ``ready``; touches only the scattered params
+        """Quant/kernel-copy/reset the given COMPLETED leaf modules through
+        ``complete_module``, the same completion the loader path uses. Runs on
+        the quant thread's own stream, ordered after the modules' scatters via
+        ``ready``; touches only the scattered params
         (never a receive slot), so it can overlap subsequent chunks' RDMA and
         scatters. ``info.reset()`` is what makes finalize skip the layer —
         drain_pending joins the quant queue before finalize runs."""
-        from vllm.model_executor.layers.quantization.base_config import (
-            QuantizeMethodBase,
-        )
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
-            _copy_and_restore_kernel_tensors,
-        )
+        from vllm.model_executor.model_loader.reload import complete_module
 
         stream = self._quant_stream or self._proc_stream
         assert stream is not None  # created in _ensure_proc_worker before use
@@ -1388,18 +1273,8 @@ class ShardedRDTWeightTransferEngine(
         ):
             stream.wait_event(ready)
             for layer in layers:
-                info = LAYERWISE_INFO.get(layer)
-                assert info is not None  # completed leaf module is set up for reload
-                quant_method = getattr(layer, "quant_method", None)
-                if isinstance(quant_method, QuantizeMethodBase):
-                    if hasattr(layer, "_already_called_process_weights_after_loading"):
-                        delattr(layer, "_already_called_process_weights_after_loading")
-                    quant_method.process_weights_after_loading(layer)
-                # Copy into persistent kernel storage (preserves cudagraph refs).
-                if info.kernel_tensors is not None:
-                    _copy_and_restore_kernel_tensors(layer, info)
-                # Reset so finalize_layerwise_reload skips this (loaded) layer.
-                info.reset()
+                # PWAL + landing + reset, so finalize skips this (loaded) layer.
+                complete_module(layer)
 
     def _quant_worker_loop(self) -> None:
         """Dedicated quant thread: drains (completed_modules, scatter-done event)

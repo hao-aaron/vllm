@@ -1367,3 +1367,169 @@ def test_first_touch_late_registered_bias():
     assert quant_method.bias_at_process is None
     layer.bias.weight_loader(layer.bias, loaded_bias)
     assert torch.equal(quant_method.bias_at_process, loaded_bias)
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload, PR 1b: public per-module API
+# ---------------------------------------------------------------------------
+
+
+class _LoaderlessLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = torch.nn.Parameter(torch.ones(3), requires_grad=False)
+
+
+def _qkv_model():
+    with torch.device("cuda"):
+        qkv = QKVParallelLinear(4, 2, 2, bias=True)
+        experts = _ExpertLayer()
+        plain = _LoaderlessLayer()
+        model = torch.nn.Sequential(qkv, experts, plain)
+        record_metadata_for_reloading(model)
+    return model, qkv, experts, plain
+
+
+def _state(model):
+    return {
+        n: (t.data_ptr(), t.detach().clone(), getattr(t, "weight_loader", None))
+        for n, t in list(model.named_parameters()) + list(model.named_buffers())
+    }
+
+
+@requires_cuda
+def test_trace_loads_leaves_model_identical_and_attributes(dist_init):
+    from vllm.model_executor.model_loader.reload import current_load, trace_loads
+
+    model, qkv, experts, plain = _qkv_model()
+    before = _state(model)
+    seen = []
+
+    class _Spy(torch.utils._python_dispatch.TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func is torch.ops.aten.copy_.default:
+                t = current_load()
+                seen.append((type(t.module).__name__, t.param_name) if t else None)
+            return func(*args, **(kwargs or {}))
+
+    with trace_loads(model) as trace, _Spy():
+        w = qkv.weight
+        for shard, rows in (("q", 4), ("k", 4), ("v", 4)):
+            w.weight_loader(w, torch.randn(rows, 4, device="cuda"), shard)
+            # `bias` stays live during reload; the trace must not write it
+            b = qkv.bias
+            b.weight_loader(b, torch.randn(rows, device="cuda"), shard)
+        for e in range(8):
+            experts.w.weight_loader(
+                experts.w, torch.randn(4, 6, device="cuda"), expert_id=e
+            )
+        plain.gate.weight_loader(plain.gate, torch.randn(3, device="cuda"))
+        assert qkv.weight.is_meta  # nothing materialized
+    assert ("QKVParallelLinear", "weight") in seen
+    assert ("_ExpertLayer", "w") in seen
+    assert ("_LoaderlessLayer", "gate") in seen
+    assert None not in seen
+    assert set(trace.complete_modules()) == {qkv, experts, plain}
+    after = _state(model)
+    assert before.keys() == after.keys()
+    for k in before:
+        assert before[k][0] == after[k][0], k
+        assert torch.equal(before[k][1], after[k][1]), k
+        assert before[k][2] is after[k][2], k  # loaders unwrapped / unchanged
+    # nothing processed
+    assert experts.quant_method.calls == []
+
+
+@requires_cuda
+def test_complete_module_matches_counter_path(dist_init):
+    from vllm.model_executor.model_loader.reload import (
+        complete_module,
+        ensure_materialized,
+        finish_reload,
+        start_reload,
+    )
+
+    model, qkv, experts, plain = _qkv_model()
+    values = {e: torch.full((4, 6), float(e), device="cuda") for e in (2, 5)}
+    # engine-driven: ensure_materialized + direct writes + complete_module
+    start_reload(model)
+    targets = ensure_materialized(experts)
+    targets["w"][0].copy_(values[2])
+    targets["w"][1].copy_(values[5])
+    complete_module(experts)
+    finish_reload(model, model_config=None)
+    engine_result = experts.w.detach().clone()
+    # counter-driven through the loader
+    start_reload(model)
+    for e, v in values.items():
+        experts.w.weight_loader(experts.w, v, expert_id=e)
+    finish_reload(model, model_config=None)
+    assert torch.equal(engine_result, experts.w)
+    assert len(experts.quant_method.calls) == 2
+
+
+@requires_cuda
+def test_abort_reload_after_partial_update(dist_init):
+    from vllm.model_executor.model_loader.reload import abort_reload, start_reload
+
+    model, qkv, experts, plain = _qkv_model()
+    before = _state(model)
+    start_reload(model)
+    experts.w.weight_loader(
+        experts.w, torch.zeros(4, 6, device="cuda"), expert_id=2
+    )  # partial: module open with scratch
+    qkv.weight.weight_loader(qkv.weight, torch.zeros(4, 4, device="cuda"), "q")
+    abort_reload(model)
+    after = _state(model)
+    for k in before:
+        assert before[k][0] == after[k][0], k
+        assert torch.equal(before[k][1], after[k][1]), k
+    assert reload_layerwise.scratch_bytes_in_flight() == 0
+    # the model can be reloaded again afterwards
+    start_reload(model)
+    abort_reload(model)
+
+
+@requires_cuda
+def test_bake_offsets_relative_to_target():
+    """A scatter baked against meta (offset 0) must land correctly in a target
+    that sits at a nonzero storage offset (e.g. a view into live storage)."""
+    from vllm.distributed.weight_transfer.sharded_rdt_fake import BakeSink
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _CURRENT_LOAD,
+        LoadTarget,
+    )
+
+    layer = torch.nn.Module()
+    base = torch.zeros(20, device="cuda")
+    layer.register_parameter(
+        "weight", torch.nn.Parameter(base[4:16].view(3, 4), requires_grad=False)
+    )
+    sink = BakeSink()
+
+    class _Src:
+        _name = "w"
+        shape = (1, 4)
+        dtype = torch.float32
+
+        def numel(self):
+            return 4
+
+        def _key(self):
+            return ("w", ())
+
+    token = _CURRENT_LOAD.set(LoadTarget(layer, "weight"))
+    try:
+        dest = layer.weight.data[1:2]
+        sink.copies_by_layer.clear()
+        rec = sink.copies_by_layer[layer]
+        # record without firing the meta copy (dest is real here)
+        sink.accept_copy(dest, _Src())
+    finally:
+        _CURRENT_LOAD.reset(token)
+    sc = rec[0]
+    assert sc.offset == 4  # relative to the target, not to the storage
+    t = layer.weight.data
+    t.as_strided(sc.shape, sc.stride, t.storage_offset() + sc.offset).fill_(1.0)
+    assert torch.equal(layer.weight[1], torch.ones(4, device="cuda"))
+    assert base[:8].sum() == 0 and base[12:].sum() == 4 * 0 + 0

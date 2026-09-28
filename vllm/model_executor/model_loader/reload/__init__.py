@@ -17,6 +17,15 @@ Limitations:
 """
 
 __all__ = [
+    "start_reload",
+    "finish_reload",
+    "abort_reload",
+    "trace_loads",
+    "current_load",
+    "ensure_materialized",
+    "complete_module",
+    "LoadTarget",
+    "LoadTrace",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -26,10 +35,19 @@ __all__ = [
 ]
 
 from .layerwise import (
+    LoadTarget,
+    LoadTrace,
+    abort_reload,
+    complete_module,
+    current_load,
+    ensure_materialized,
     finalize_layerwise_processing,
     finalize_layerwise_reload,
+    finish_reload,
     initialize_layerwise_reload,
     record_metadata_for_reloading,
+    start_reload,
+    trace_loads,
 )
 from .torchao_decorator import (
     set_torchao_reload_attrs,

@@ -93,8 +93,8 @@ class BakeSink:
     """``copy_`` sink for the dry-run bake: record how each slice would be fetched
     and where it would land, and move nothing.
 
-    ``_install_recording_stamps`` sets ``current = (leaf_module, param_name)``
-    around each loader so ``accept_copy`` can attribute the copy. An unstamped
+    ``accept_copy`` attributes each copy with the reload API's
+    ``current_load()`` (or ``current``, if a caller set it explicitly). An unstamped
     ``copy_`` cannot be attributed and stays unrecorded, so its module fails the
     coverage gate and takes the plain load. ``copies_by_layer`` is keyed by module
     object, so iterating it yields each leaf module once.
@@ -111,8 +111,24 @@ class BakeSink:
 
     def accept_copy(self, dest: torch.Tensor, src: "FakeRDTTensor") -> torch.Tensor:
         self.copied_names.add(src._name)
-        if self.current is not None:
-            layer, param_name = self.current
+        current = self.current
+        base_offset = 0
+        if current is None:
+            from vllm.model_executor.model_loader.reload import current_load
+
+            target = current_load()
+            if target is not None:
+                current = (target.module, target.param_name)
+                # Offsets are recorded relative to the load target, so replay
+                # can add the (possibly nonzero) offset of whatever target the
+                # next sync materializes.
+                param = target.tensor
+                if param is None:
+                    param = getattr(target.module, target.param_name, None)
+                if isinstance(param, torch.Tensor):
+                    base_offset = param.storage_offset()
+        if current is not None:
+            layer, param_name = current
             if dest.numel() != src.numel():
                 # The packed layout sizes each slice from the DESTINATION shape,
                 # while the producer packs what the replayed chain produces. A
@@ -132,7 +148,7 @@ class BakeSink:
                     layer=layer,
                     param_name=param_name,
                     src=src._key(),
-                    offset=dest.storage_offset(),
+                    offset=dest.storage_offset() - base_offset,
                     shape=tuple(dest.shape),
                     stride=tuple(dest.stride()),
                     dtype=src.dtype,
