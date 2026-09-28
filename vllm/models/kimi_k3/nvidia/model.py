@@ -88,7 +88,6 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
-from vllm.model_executor.utils import is_reloading
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -337,10 +336,6 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         self.activation = activation
         self.activation_beta = activation_beta
         self.activation_linear_beta = activation_linear_beta
-        self.register_buffer("_mega_l1_packed", None, persistent=False)
-        self.register_buffer("_mega_l1_scale", None, persistent=False)
-        self.register_buffer("_mega_l2_packed", None, persistent=False)
-        self.register_buffer("_mega_l2_scale", None, persistent=False)
 
     def synchronize_first_launch(self) -> None:
         ep_group = get_ep_group()
@@ -373,63 +368,8 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         )
         self._drop_raw_mega_weights()
 
-    # Modulewise reload (PR 2b): the MegaMoE transform is this module's own
-    # post-load step. On reload it runs per module on the freshly loaded raw
-    # params; its declared outputs are landed into the live `_mega_*` buffers,
-    # which `_transformed_*` keep pointing at.
-    reload_outputs = (
-        "_mega_l1_packed",
-        "_mega_l1_scale",
-        "_mega_l2_packed",
-        "_mega_l2_scale",
-    )
-
-    def _mega_transform(self):
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
-        w13_scale = deep_gemm.transform_sf_into_required_layout(
-            self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
-            2 * self.intermediate_size,
-            self.hidden_size,
-            (1, 32),
-            self.num_local_experts,
-        )
-        w2_scale = deep_gemm.transform_sf_into_required_layout(
-            self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
-            self.hidden_size,
-            self.intermediate_size,
-            (1, 32),
-            self.num_local_experts,
-        )
-        return deep_gemm.transform_weights_for_mega_moe(
-            (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-            (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-            activation=self.activation,
-        )
-
-    def _register_mega_outputs(self, l1, l2) -> None:
-        self.register_buffer("_mega_l1_packed", l1[0], persistent=False)
-        self.register_buffer("_mega_l1_scale", l1[1], persistent=False)
-        self.register_buffer("_mega_l2_packed", l2[0], persistent=False)
-        self.register_buffer("_mega_l2_scale", l2[1], persistent=False)
-
-    def process_weights_after_loading(self) -> None:
-        """Reload-only transform (cold start keeps finalize_weights from the
-        model hook, after the whole stream)."""
-        assert is_reloading(), "cold start finalizes from the model hook"
-        assert self._transformed_l1_weights is not None
-        l1, l2 = self._mega_transform()
-        # Results become landing targets; the live buffers keep their storage
-        # and `_transformed_*` keep referencing them.
-        self._register_mega_outputs(l1, l2)
-        self._drop_raw_mega_weights()
-
-    def _drop_raw_mega_weights(self) -> None:
-        self.w13_weight = None
-        self.w13_weight_scale = None
-        self.w2_weight = None
-        self.w2_weight_scale = None
+    def _mega_transform_kwargs(self) -> dict:
+        return {"activation": self.activation}
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm

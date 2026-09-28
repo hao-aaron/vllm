@@ -69,7 +69,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     spec_decode_needs_target_embed,
 )
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import is_reloading, set_weight_attrs
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -293,6 +293,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+        # The transformed MegaMoE weights, registered so a weight reload can
+        # land new values into them (see `reload_outputs`).
+        self.register_buffer("_mega_l1_packed", None, persistent=False)
+        self.register_buffer("_mega_l1_scale", None, persistent=False)
+        self.register_buffer("_mega_l2_packed", None, persistent=False)
+        self.register_buffer("_mega_l2_scale", None, persistent=False)
         self._transformed_shared_l1_weights: (
             tuple[torch.Tensor, torch.Tensor] | None
         ) = None
@@ -546,37 +552,20 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         if self._transformed_l1_weights is None:
             self._check_runtime_supported()
-            w13_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
-                2 * self.intermediate_size,
-                self.hidden_size,
-                (1, 32),
-                self.num_local_experts,
-            )
-            w2_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
-                self.hidden_size,
-                self.intermediate_size,
-                (1, 32),
-                self.num_local_experts,
-            )
             self._transformed_l1_weights, self._transformed_l2_weights = (
-                deep_gemm.transform_weights_for_mega_moe(
-                    (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                    (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-                )
+                self._mega_transform()
             )
             # Drop the original loader-side parameters: the MegaMoE kernels only
-            # consume the transformed views above. transform_weights_for_mega_moe
-            # allocates a fresh tensor for the L1 weight (see
-            # _interleave_l1_weights) and fresh SF tensors for L1/L2; the L2
-            # weight is the only tensor that aliases the original storage, and
-            # _transformed_l2_weights still holds it, so the storage stays live
-            # after we drop the Parameter.
-            self.w13_weight = None
-            self.w13_weight_scale = None
-            self.w2_weight = None
-            self.w2_weight_scale = None
+            # consume the transformed tensors (registered as `_mega_*`).
+            # transform_weights_for_mega_moe allocates a fresh tensor for the L1
+            # weight (see _interleave_l1_weights) and fresh SF tensors for
+            # L1/L2; the L2 weight is the only tensor that aliases the original
+            # storage, and _transformed_l2_weights still holds it, so the
+            # storage stays live after we drop the Parameter.
+            self._register_mega_outputs(
+                self._transformed_l1_weights, self._transformed_l2_weights
+            )
+            self._drop_raw_mega_weights()
 
         if shared_experts is None or self.num_shared_experts == 0:
             return
@@ -595,6 +584,70 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     @property
     def has_fused_shared_experts(self) -> bool:
         return self._transformed_shared_l1_weights is not None
+
+    # Modulewise reload (PR 2b): the MegaMoE transform is this module's own
+    # post-load step. On reload it runs per module on the freshly loaded raw
+    # params; its declared outputs are landed into the live `_mega_*` buffers,
+    # which `_transformed_*` keep pointing at.
+    reload_outputs: tuple[str, ...] = (
+        "_mega_l1_packed",
+        "_mega_l1_scale",
+        "_mega_l2_packed",
+        "_mega_l2_scale",
+    )
+
+    def _mega_transform_kwargs(self) -> dict:
+        return {}
+
+    def _mega_transform(self):
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        w13_scale = deep_gemm.transform_sf_into_required_layout(
+            self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
+            2 * self.intermediate_size,
+            self.hidden_size,
+            (1, 32),
+            self.num_local_experts,
+        )
+        w2_scale = deep_gemm.transform_sf_into_required_layout(
+            self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
+            self.hidden_size,
+            self.intermediate_size,
+            (1, 32),
+            self.num_local_experts,
+        )
+        return deep_gemm.transform_weights_for_mega_moe(
+            (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
+            (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
+            **self._mega_transform_kwargs(),
+        )
+
+    def _register_mega_outputs(self, l1, l2) -> None:
+        self.register_buffer("_mega_l1_packed", l1[0], persistent=False)
+        self.register_buffer("_mega_l1_scale", l1[1], persistent=False)
+        self.register_buffer("_mega_l2_packed", l2[0], persistent=False)
+        self.register_buffer("_mega_l2_scale", l2[1], persistent=False)
+
+    def process_weights_after_loading(self) -> None:
+        """Reload-only transform (cold start keeps finalize_weights from the
+        model hook, after the whole stream)."""
+        assert is_reloading(), "cold start finalizes from the model hook"
+        assert self._transformed_l1_weights is not None
+        assert not self.has_fused_shared_experts, (
+            "MegaMoE shared-expert fusion is not reload-safe"
+        )
+        l1, l2 = self._mega_transform()
+        # Results become landing targets; the live buffers keep their storage
+        # and `_transformed_*` keep referencing them.
+        self._register_mega_outputs(l1, l2)
+        self._drop_raw_mega_weights()
+
+    def _drop_raw_mega_weights(self) -> None:
+        self.w13_weight = None
+        self.w13_weight_scale = None
+        self.w2_weight = None
+        self.w2_weight_scale = None
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -2031,8 +2084,29 @@ class DeepseekV4ForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.process_weights_after_loading()
+        # A streamed reload calls load_weights per batch while modules are
+        # still on meta; its post-load work runs per module (mega-MoE
+        # reload_outputs) and in the model refresh() (mHC broadcast) instead.
+        from vllm.model_executor.model_loader.reload import get_reload_session
+
+        session = get_reload_session(self)
+        if session is None or not session.active:
+            self.process_weights_after_loading()
         return loaded_params
+
+    @property
+    def reload_safe(self) -> bool:
+        """Modulewise reload: the model hook's work is redone per module
+        (MegaMoE reload_outputs) and by `refresh()` (mHC broadcast), except
+        for MegaMoE shared-expert fusion (reads another module's checkpoint
+        tensors) and the FlashInfer MoE-EP experts (weights held in a
+        FlashInfer object), which fail closed."""
+        for module in self.modules():
+            if isinstance(module, DeepseekV4MegaMoEExperts) and (
+                module.has_fused_shared_experts or not module.reload_outputs
+            ):
+                return False
+        return True
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()

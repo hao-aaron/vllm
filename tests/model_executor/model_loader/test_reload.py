@@ -1693,24 +1693,29 @@ def _sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
-def _make_k3_mega_experts(vllm_config, prefix):
+def _make_k3_mega_experts(vllm_config, prefix, cls_name="kimi_k3"):
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
     from vllm.models.kimi_k3.nvidia.model import KimiK3MegaMoEExperts
 
+    kwargs = dict(
+        num_experts=4,
+        num_local_experts=4,
+        experts_start_idx=0,
+        top_k=2,
+        hidden_size=512,
+        intermediate_size=256,
+        prefix=prefix,
+    )
     with torch.device("cuda"):
-        experts = KimiK3MegaMoEExperts(
+        if cls_name == "deepseek_v4":
+            return DeepseekV4MegaMoEExperts(vllm_config, **kwargs)
+        return KimiK3MegaMoEExperts(
             vllm_config,
-            num_experts=4,
-            num_local_experts=4,
-            experts_start_idx=0,
-            top_k=2,
-            hidden_size=512,
-            intermediate_size=256,
-            prefix=prefix,
+            **kwargs,
             activation="swiglu",
             activation_beta=None,
             activation_linear_beta=None,
         )
-    return experts
 
 
 def _k3_raw(experts, seed):
@@ -1731,10 +1736,11 @@ def _k3_raw(experts, seed):
 
 
 @pytest.mark.skipif(not _sm100(), reason="DeepGEMM MegaMoE requires SM100")
-def test_kimi_k3_mega_moe_reload_updates_transformed_weights(default_vllm_config):
+@pytest.mark.parametrize("cls_name", ["kimi_k3", "deepseek_v4"])
+def test_mega_moe_reload_updates_transformed_weights(default_vllm_config, cls_name):
     """PR 2b premise: layerwise reload of a mega-MoE experts module (no quant
     method, transform run once from the model hook) must update the
-    transformed `_mega_*` buffers in place."""
+    transformed `_mega_*` buffers in place (DeepSeek-V4 base and Kimi K3)."""
     from vllm.model_executor.model_loader.reload import (
         complete_module,
         ensure_materialized,
@@ -1742,8 +1748,8 @@ def test_kimi_k3_mega_moe_reload_updates_transformed_weights(default_vllm_config
         start_reload,
     )
 
-    experts = _make_k3_mega_experts(default_vllm_config, "k3.experts.a")
-    fresh = _make_k3_mega_experts(default_vllm_config, "k3.experts.b")
+    experts = _make_k3_mega_experts(default_vllm_config, "mega.a." + cls_name, cls_name)
+    fresh = _make_k3_mega_experts(default_vllm_config, "mega.b." + cls_name, cls_name)
     model = torch.nn.Sequential(experts)
     with torch.device("cuda"):
         record_metadata_for_reloading(model)
@@ -2624,3 +2630,32 @@ def test_full_vs_partial_update(partial, send_proj):
     assert model.lm_head.weight is model.embed.weight
     expected = 3.0 if send_proj else 0.0  # untouched modules keep old weights
     assert torch.equal(model.proj.weight, torch.full((2, 2), expected))
+
+
+def test_deepseek_v4_reload_safe_fails_closed_for_unsupported_experts():
+    """DeepSeek-V4 declares reload safety only when every MegaMoE experts
+    module can redo its transform per module: shared-expert fusion and the
+    FlashInfer MoE-EP variant fail closed."""
+    from vllm.models.deepseek_v4.nvidia.fi_moe import DeepseekV4MegaMoEExpertsFI
+    from vllm.models.deepseek_v4.nvidia.model import (
+        DeepseekV4ForCausalLM,
+        DeepseekV4MegaMoEExperts,
+    )
+
+    def model_with(experts):
+        model = object.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.experts = experts
+        return model
+
+    def experts_of(cls, fused_shared=False):
+        experts = object.__new__(cls)
+        torch.nn.Module.__init__(experts)
+        experts._transformed_shared_l1_weights = object() if fused_shared else None
+        return experts
+
+    assert model_with(experts_of(DeepseekV4MegaMoEExperts)).reload_safe
+    assert not model_with(
+        experts_of(DeepseekV4MegaMoEExperts, fused_shared=True)
+    ).reload_safe
+    assert not model_with(experts_of(DeepseekV4MegaMoEExpertsFI)).reload_safe

@@ -129,6 +129,11 @@ def nvfp4_prequant_pack_and_alphas(
 class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
     """Same weight layout/loader as the native mega experts, FI compute path."""
 
+    # Modulewise reload: the transformed weights live inside a FlashInfer
+    # object (`_mega_layer`) that captured graphs read; there is no in-place
+    # refill yet, so this variant is not reload-safe (the model fails closed).
+    reload_outputs: tuple[str, ...] = ()
+
     def __init__(
         self,
         vllm_config: VllmConfig,

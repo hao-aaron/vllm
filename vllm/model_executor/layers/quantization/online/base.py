@@ -203,8 +203,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 if shorthand in _ONLINE_SHORTHANDS
             ]
         return any(
-            spec is not None and spec.weight == kFp8Static128BlockSym
-            for spec in specs
+            spec is not None and spec.weight == kFp8Static128BlockSym for spec in specs
         )
 
     @classmethod
