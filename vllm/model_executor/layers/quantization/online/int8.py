@@ -57,51 +57,68 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        self._quantize_weights(layer)
-        self._setup_kernel(layer)
+        staging = {
+            k: torch.zeros(shape, dtype=dtype, device=layer.w13_weight.device)
+            for k, (shape, dtype) in self.expert_staging_spec(layer).items()
+        }
+        w2_amax = weight_amax(layer.w2_weight, dim=-1)
+        w2_amax = amax_for_moe_weight_quant(w2_amax, self.moe.tp_size)
+        for expert in range(layer.local_num_experts):
+            self.quantize_expert(
+                layer, "w13_weight", expert, layer.w13_weight[expert], staging
+            )
+            self.quantize_expert(
+                layer,
+                "w2_weight",
+                expert,
+                layer.w2_weight[expert],
+                staging,
+                amax=w2_amax[expert],
+            )
+        self.finish_experts(layer, staging)
 
         layer._already_called_process_weights_after_loading = True
 
-    def _quantize_weights(self, layer: Module) -> None:
+    # ---- per-expert completion (modulewise reload): one code path for the
+    # module-level loop above and per-expert quantization during a reload.
+
+    def per_expert_needs_collective(self) -> bool:
+        # w2's per-row amax is all-reduced across TP ranks
+        return self.moe.tp_size > 1
+
+    def expert_staging_spec(
+        self, layer: Module
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        E = layer.w13_weight.shape[0]
+        return {
+            "w13": (tuple(layer.w13_weight.shape), torch.int8),
+            "w2": (tuple(layer.w2_weight.shape), torch.int8),
+            "w13_scale": ((E, layer.w13_weight.shape[1]), torch.float32),
+            "w2_scale": ((E, layer.w2_weight.shape[1]), torch.float32),
+        }
+
+    def quantize_expert(self, layer, name, expert, src, staging, amax=None):
         vmax = torch.iinfo(torch.int8).max
+        if name == "w13_weight":
+            # per-row quantization over the hidden_size dim
+            scales = src.abs().amax(dim=1) / vmax
+            key = "w13"
+        else:
+            # per-row quantization over the intermediate_size dim
+            if amax is None:
+                amax = weight_amax(src, dim=-1)
+            scales = amax / vmax
+            key = "w2"
+        q = src.div(scales.unsqueeze(1)).round().clamp(-vmax, vmax)
+        staging[key][expert] = q.to(torch.int8)
+        staging[f"{key}_scale"][expert] = scales
 
-        w13 = torch.empty_like(layer.w13_weight, dtype=torch.int8)
-        w2 = torch.empty_like(layer.w2_weight, dtype=torch.int8)
-        w13_scale = torch.zeros(
-            layer.num_experts,
-            layer.w13_weight.shape[1],
-            device=w13.device,
-            dtype=torch.float32,
-        )
-        w2_scale = torch.zeros(
-            layer.num_experts,
-            layer.w2_weight.shape[1],
-            device=w2.device,
-            dtype=torch.float32,
-        )
-
-        w2_amax = weight_amax(layer.w2_weight, dim=-1)
-        w2_amax = amax_for_moe_weight_quant(w2_amax, self.moe.tp_size)
-
-        for expert in range(layer.local_num_experts):
-            # w13: per-row quantization over hidden_size dim
-            w = layer.w13_weight[expert, :, :]
-            scales = w.abs().amax(dim=1) / vmax
-            q = w.div(scales.unsqueeze(1)).round().clamp(-vmax, vmax)
-            w13[expert, :, :] = q.to(torch.int8)
-            w13_scale[expert, :] = scales
-
-            # w2: per-row quantization over intermediate_size dim
-            w = layer.w2_weight[expert, :, :]
-            scales = w2_amax[expert] / vmax
-            q = w.div(scales.unsqueeze(1)).round().clamp(-vmax, vmax)
-            w2[expert, :, :] = q.to(torch.int8)
-            w2_scale[expert, :] = scales
-
-        replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w2_weight", w2)
-        replace_parameter(layer, "w13_scale", w13_scale)
-        replace_parameter(layer, "w2_scale", w2_scale)
+    def finish_experts(self, layer: Module, staging: dict[str, torch.Tensor]) -> None:
+        replace_parameter(layer, "w13_weight", staging["w13"])
+        replace_parameter(layer, "w2_weight", staging["w2"])
+        replace_parameter(layer, "w13_scale", staging["w13_scale"])
+        replace_parameter(layer, "w2_scale", staging["w2_scale"])
+        self._setup_kernel(layer)
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         w13, w2 = convert_to_int8_moe_kernel_format(
