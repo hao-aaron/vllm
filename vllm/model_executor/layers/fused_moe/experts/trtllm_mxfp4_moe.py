@@ -37,6 +37,11 @@ from vllm.utils.flashinfer import has_flashinfer
 class TrtLlmMxfp4ExpertsBase:
     """MXFP4 TRTLLM-Gen MoE kernels. Shared base for modular and monolithic."""
 
+    # per-expert gemm1 constants (register_derived), when configured
+    gemm1_alpha: torch.Tensor | None
+    gemm1_beta: torch.Tensor | None
+    gemm1_clamp_limit: torch.Tensor | None
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,

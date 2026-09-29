@@ -20,6 +20,8 @@ from vllm.v1.worker.gpu_worker import Worker
 class _RecordingEngine:
     """Minimal stand-in for a weight transfer engine."""
 
+    model: nn.Module  # set by tests that drive a reload session
+
     def __init__(self, raise_on_update: bool = False):
         self.raise_on_update = raise_on_update
         self.started = False
@@ -307,9 +309,12 @@ def test_finish_after_failed_update_joins_agreement(monkeypatch):
     record_metadata_for_reloading(engine.model)
     worker = _make_worker(engine)
     votes: list[bool] = []
-    monkeypatch.setattr(
-        worker, "_weight_update_ok_on_all_ranks", lambda ok: votes.append(ok) or ok
-    )
+
+    def vote(ok: bool) -> bool:
+        votes.append(ok)
+        return ok
+
+    monkeypatch.setattr(worker, "_weight_update_ok_on_all_ranks", vote)
     Worker.start_weight_update(worker)
     with pytest.raises(ValueError, match="boom"):
         Worker.update_weights(worker, {"x": 1})

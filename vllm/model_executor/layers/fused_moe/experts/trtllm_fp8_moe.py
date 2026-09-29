@@ -344,6 +344,11 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
+    # derived buffers (register_derived), per-tensor quantization only
+    _g1_alphas: torch.Tensor
+    _g2_alphas: torch.Tensor
+    _g1_scale_c: torch.Tensor
+
     """Fp8 TRTLLM-Gen MoE kernels. Supports monolithic interface."""
 
     def supports_routing_replay_capture(self) -> bool:
@@ -383,6 +388,8 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         if not self.quant_config.is_per_tensor:
             return
         qc = self.quant_config  # references the live scale params
+        assert qc.w1_scale is not None and qc.a1_scale is not None
+        assert qc.w2_scale is not None and qc.a2_scale is not None
         self._g1_alphas.copy_((qc.w1_scale * qc.a1_scale).squeeze())
         self._g2_alphas.copy_((qc.w2_scale * qc.a2_scale).squeeze())
         if self.moe_config.is_act_and_mul:

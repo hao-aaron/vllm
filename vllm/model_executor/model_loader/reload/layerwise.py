@@ -719,8 +719,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
             # reloading: place kernel tensors back as a fallback. Always place, even
             # when nothing is loadable (load_numel_total == 0), so parameter-alias
             # buffers on such layers are restored rather than left deleted.
+            # (modules that own checkpoint tensors and received none are
+            # reported by `_check_full_update`)
             if info.load_numel_total > 0:  # type: ignore[operator]
-                logger.warning("%s: Failed to load weights", layer.__class__.__name__)
+                logger.debug("%s: received no weights", layer.__class__.__name__)
             _place_kernel_tensors(layer, info)
 
         # Process non-attention layers which did not load all elements. This can happen
@@ -739,8 +741,8 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         layer
         for layer in model.modules()
         if not is_deferred_attention_layer(layer)
-        and (info := LAYERWISE_INFO.get(layer)) is not None
-        and info.hosted
+        and (layer_info := LAYERWISE_INFO.get(layer)) is not None
+        and layer_info.hosted
     ]
     assert not still_open, f"modules not landed before attention: {still_open}"
 
@@ -1130,7 +1132,7 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
             _warn_if_not_reload_safe(layer, quant_method)
         with reload_mode() if reloading else nullcontext():
             if slots is not None:
-                quant_method.finish_experts(layer, slots.staging)
+                quant_method.finish_experts(layer, slots.staging)  # type: ignore[attr-defined]
                 layer._already_called_process_weights_after_loading = True
             else:
                 quant_method.process_weights_after_loading(layer)

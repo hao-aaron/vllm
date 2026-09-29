@@ -40,7 +40,7 @@ def eligible(
     if not PER_EXPERT:
         return False
     quant_method = getattr(layer, "quant_method", None)
-    if not hasattr(quant_method, "quantize_expert"):
+    if quant_method is None or not hasattr(quant_method, "quantize_expert"):
         return False
     if quant_method.per_expert_needs_collective():
         return False

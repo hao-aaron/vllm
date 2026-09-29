@@ -25,6 +25,7 @@ import re
 import time
 import weakref
 from collections.abc import Iterator
+from typing import Any
 
 import torch
 
@@ -47,7 +48,7 @@ def _checkpoint_files(path: str) -> list[str]:
 def _read_names(files: list[str]) -> list[tuple[str, str]]:
     from safetensors import safe_open
 
-    out = []
+    out: list[tuple[str, str]] = []
     for fn in files:
         with safe_open(fn, "pt") as f:
             out.extend((name, fn) for name in f.keys())  # noqa: SIM118
@@ -164,6 +165,16 @@ def _collect_off_registry(
 class ReloadHarnessExtension:
     """Methods callable through ``LLM.collective_rpc``."""
 
+    # provided by the Worker this extension is mixed into
+    model_runner: Any
+    vllm_config: Any
+    model_config: Any
+    weight_transfer_engine: Any
+    rank: int
+    start_weight_update: Any
+    finish_weight_update: Any
+    _abort_weight_update: Any
+
     def _mw_model(self):
         return self.model_runner.get_model()
 
@@ -263,7 +274,7 @@ class ReloadHarnessExtension:
             # emulate the pre-PR-2 behavior: every MoE kernel is rebuilt
             for m in model.modules():
                 qm = getattr(m, "quant_method", None)
-                if hasattr(qm, "reload_safe"):
+                if qm is not None and hasattr(qm, "reload_safe"):
                     qm.reload_safe = False
         files = _checkpoint_files(path)
         names = order_names(_read_names(files), order, seed)

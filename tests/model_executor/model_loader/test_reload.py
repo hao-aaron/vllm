@@ -2416,11 +2416,12 @@ def test_fused_router_gate_refresh_in_place():
     assert runner._combined_gate_weight is None
     runner._maybe_fuse_gate_weights()
     fused = runner._combined_gate_weight
+    assert fused is not None
     ptr = fused.data_ptr()
     with torch.no_grad():
         runner.gate.weight.fill_(3.0)  # a reload lands new gate weights
     runner.refresh()
-    assert runner._combined_gate_weight.data_ptr() == ptr
+    assert runner._combined_gate_weight is fused and fused.data_ptr() == ptr
     assert torch.equal(fused[:4], torch.full((4, 8), 3.0, device="cuda"))
     assert torch.equal(fused[4:], runner.shared_expert_gate.weight)
 
