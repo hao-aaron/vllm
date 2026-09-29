@@ -8,7 +8,8 @@ load target, instead of scratch. Check 2 (after PWAL): each result is found to
 already sit in the live tensor ("in place"), or is copied (cloned first if it
 overlaps live storage).
 
-Off by default (stage-all); VLLM_RELOAD_DIRECT_LOAD=1 enables it.
+On by default; VLLM_RELOAD_DIRECT_LOAD=0 falls back to stage-all (scratch for every
+tensor).
 """
 
 import os
@@ -17,7 +18,7 @@ from weakref import WeakKeyDictionary
 
 import torch
 
-DIRECT_LOAD = os.getenv("VLLM_RELOAD_DIRECT_LOAD", "0") == "1"
+DIRECT_LOAD = os.getenv("VLLM_RELOAD_DIRECT_LOAD", "1") == "1"
 
 # Byte alignment required of a hosted view's start (kernels such as CUTLASS
 # read 16-byte vectors; fresh allocations are far more aligned than this).
