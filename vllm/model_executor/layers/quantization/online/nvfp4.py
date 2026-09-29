@@ -134,6 +134,44 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w13_input_scale", ones)
         replace_parameter(layer, "w2_input_scale", ones.clone())
 
+    # ---- per-expert completion (modulewise reload): one FP32 global scale
+    # per expert, so an expert can be quantized as soon as it arrived (at TP1;
+    # the amax is all-reduced across TP ranks otherwise).
+
+    def per_expert_needs_collective(self) -> bool:
+        return self.moe.tp_size > 1
+
+    def expert_staging_spec(
+        self, layer: Module
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        spec = {}
+        for key, name in (("w13", "w13_weight"), ("w2", "w2_weight")):
+            E, N, K = getattr(layer, name).shape
+            spec[key] = ((E, N, K // 2), torch.uint8)
+            spec[f"{key}_scale"] = ((E, N, K // 16), torch.float8_e4m3fn)
+            spec[f"{key}_scale_2"] = ((E,), torch.float32)
+        return spec
+
+    def quantize_expert(self, layer, name, expert, src, staging, amax=None):
+        key = "w13" if name == "w13_weight" else "w2"
+        # same arithmetic as _quantize_moe_weight_to_nvfp4, for one expert
+        q, block_scale, scale_2 = _quantize_moe_weight_to_nvfp4(src.unsqueeze(0))
+        staging[key][expert] = q[0]
+        staging[f"{key}_scale"][expert] = block_scale[0]
+        staging[f"{key}_scale_2"][expert] = scale_2[0]
+
+    def finish_experts(self, layer: Module, staging: dict[str, torch.Tensor]) -> None:
+        for key in ("w13", "w2"):
+            replace_parameter(layer, f"{key}_weight", staging[key])
+            replace_parameter(layer, f"{key}_weight_scale", staging[f"{key}_scale"])
+            replace_parameter(layer, f"{key}_weight_scale_2", staging[f"{key}_scale_2"])
+        ones = torch.ones(
+            layer.num_experts, device=staging["w13"].device, dtype=torch.float32
+        )
+        replace_parameter(layer, "w13_input_scale", ones)
+        replace_parameter(layer, "w2_input_scale", ones.clone())
+        self._setup_kernel(layer)
+
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         (
             w13,
