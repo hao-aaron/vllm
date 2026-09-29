@@ -31,7 +31,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4DynamicToken,
     kNvfp4Static,
 )
-from vllm.model_executor.utils import is_weights_pre_processed
+from vllm.model_executor.utils import is_reloading, is_weights_pre_processed
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
@@ -137,34 +137,49 @@ class TrtLlmNvFp4ExpertsBase:
             clamp,
         )
 
-    def _compute_g1_scale_c(self) -> torch.Tensor:
-        assert self.quant_config.g1_alphas is not None
-        assert self.quant_config.a2_gscale is not None
+    def _compute_g1_scale_c(
+        self,
+        g1_alphas: torch.Tensor | None = None,
+        a2_gscale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        g1_alphas = self.quant_config.g1_alphas if g1_alphas is None else g1_alphas
+        a2_gscale = self.quant_config.a2_gscale if a2_gscale is None else a2_gscale
+        assert g1_alphas is not None
+        assert a2_gscale is not None
         if not self.moe_config.is_act_and_mul:
-            return self.quant_config.a2_gscale.clone()
+            return a2_gscale.clone()
         if self.is_situ:
             # SITU applies its nonlinear activation after g1_alphas, so only
             # the output quantization factor belongs in g1_scale_c.
-            return self.quant_config.a2_gscale.clone()
+            return a2_gscale.clone()
 
         # g1_alphas = a13_scale * w13_scale_2
         # a2_gscale = 1 / a2_scale
         # g1_scale_c = a13_scale * w13_scale_2 / a2_scale
-        return self.quant_config.g1_alphas * self.quant_config.a2_gscale
+        return g1_alphas * a2_gscale
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not is_weights_pre_processed():
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+        # Derived values are computed from the layer's tensors (the ones the
+        # quant config references at cold start). On a modulewise reload this
+        # runs on the reload's fresh tensors while the built-once quant config
+        # still references the live ones; the registered results are landed
+        # into the live parameters, which this kernel keeps referencing.
+        reloading = is_reloading()
+        g1_alphas = layer.w13_weight_scale_2
         # Recompute g1_scale_c since g1_alphas was just fused in-place.
         # Register as a layer parameter so EPLB rearranges it alongside
         # other expert weights.
-        g1_scale_c = self._compute_g1_scale_c()
+        # a2_gscale = 1 / a2_scale, as in make_nvfp4_moe_quant_config
+        g1_scale_c = self._compute_g1_scale_c(g1_alphas, 1.0 / layer.w2_input_scale)
         layer.register_parameter(
             "g1_scale_c",
             torch.nn.Parameter(g1_scale_c, requires_grad=False),
         )
-        self.g1_scale_c = layer.g1_scale_c
+        if not reloading:
+            self.g1_scale_c = layer.g1_scale_c
 
         # Pre-fold the per-expert g1_alphas (= output1_scale_gate_scalar)
         # division so the TRTLLM kernel receives the raw-GEMM-space clamp
@@ -176,12 +191,13 @@ class TrtLlmNvFp4ExpertsBase:
         # g1_alphas fold used by the SwiGLU-OAI clamp/beta below.
         clamp_limit = self._gemm1_clamp_limit_unfolded
         if clamp_limit is not None and not self.is_situ:
-            gemm1_clamp_limit = clamp_limit / self.quant_config.g1_alphas
+            gemm1_clamp_limit = clamp_limit / g1_alphas
             layer.register_parameter(
                 "gemm1_clamp_limit",
                 torch.nn.Parameter(gemm1_clamp_limit, requires_grad=False),
             )
-            self.gemm1_clamp_limit = layer.gemm1_clamp_limit
+            if not reloading:
+                self.gemm1_clamp_limit = layer.gemm1_clamp_limit
 
         # beta shifts the raw GEMM1 accumulator, so fold by g1_alphas like the
         # clamp limit. alpha is applied to the dequantized gate, so it stays
@@ -189,12 +205,13 @@ class TrtLlmNvFp4ExpertsBase:
         # other per-expert tensors.
         beta = self._gemm1_beta_unfolded
         if beta is not None:
-            gemm1_beta = beta if self.is_situ else beta / self.quant_config.g1_alphas
+            gemm1_beta = beta if self.is_situ else beta / g1_alphas
             layer.register_parameter(
                 "gemm1_beta",
                 torch.nn.Parameter(gemm1_beta, requires_grad=False),
             )
-            self.gemm1_beta = layer.gemm1_beta
+            if not reloading:
+                self.gemm1_beta = layer.gemm1_beta
 
         if self.gemm1_alpha is not None:
             layer.register_parameter(

@@ -567,11 +567,13 @@ def make_nvfp4_moe_quant_config(
     # The expert's process_weights_after_loading will fuse activation
     # scales in-place. Since the quant config references the same tensor
     # as the registered parameter, EPLB rearrangement stays in sync.
-    return nvfp4_moe_quant_config(
+    a1_gscale = 1.0 / a13_scale
+    a2_gscale = 1.0 / a2_scale
+    quant_config = nvfp4_moe_quant_config(
         g1_alphas=w13_scale_2,
         g2_alphas=w2_scale_2,
-        a1_gscale=(1.0 / a13_scale),
-        a2_gscale=(1.0 / a2_scale),
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
         w1_scale=w13_scale,
         w2_scale=w2_scale,
         # NOTE(rob): this is a hack until the MoE kernels
@@ -588,6 +590,15 @@ def make_nvfp4_moe_quant_config(
         gemm1_beta=swiglu_beta,
         gemm1_clamp_limit=swiglu_limit,
     )
+
+    # Derived from the (live) activation scales: refreshed in place after a
+    # reload lands new scales, so captured graphs read current values.
+    def _refresh() -> None:
+        a1_gscale.copy_(1.0 / a13_scale)
+        a2_gscale.copy_(1.0 / a2_scale)
+
+    quant_config.add_refresh(_refresh)
+    return quant_config
 
 
 def make_nvfp4_moe_kernel(

@@ -30,7 +30,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import (
+    is_reloading,
+    replace_parameter,
+    set_weight_attrs,
+)
 
 # NVFP4 backends that have been verified to support EPLB for this quantization recipe.
 _EPLB_SUPPORTED_NVFP4_BACKENDS = frozenset(
@@ -61,6 +65,9 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             weight_key=kNvfp4Static,
             activation_key=None if use_a16 else kNvfp4Dynamic,
         )
+        # Modulewise reload: TRTLLM reads registered layer tensors through the
+        # quant config and keeps its derived values in registered parameters.
+        self.reload_safe = self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
@@ -240,19 +247,32 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
-        layer.w13_input_scale = a13_scale
-        layer.w2_input_scale = a2_scale
+        # Registered (not plain attributes) so a weight reload lands the new
+        # activation scales into the tensors the kernel and graphs read.
+        for name, scale in (
+            ("w13_input_scale", a13_scale),
+            ("w2_input_scale", a2_scale),
+        ):
+            if isinstance(getattr(layer, name, None), torch.nn.Parameter):
+                replace_parameter(layer, name, scale)
+            else:
+                layer.register_parameter(
+                    name, torch.nn.Parameter(scale, requires_grad=False)
+                )
 
         # Setup modular kernel.
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        assert self.experts_cls is not None
-        self.moe_kernel = make_nvfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-            backend=self.nvfp4_backend,
-            routing_tables=layer._expert_routing_tables(),
-        )
+        if not (is_reloading() and self.reload_safe and self.moe_kernel is not None):
+            # built once; on reload landing updates what it reads in place
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.experts_cls is not None
+            self.moe_kernel = make_nvfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                backend=self.nvfp4_backend,
+                routing_tables=layer._expert_routing_tables(),
+            )
+        # the experts' scale folding runs on every (re)load
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:

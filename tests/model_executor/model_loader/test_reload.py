@@ -2726,3 +2726,60 @@ def test_wrapper_models_delegate_reload_safe(module, cls_name, inner_safe):
         inner.reload_safe = inner_safe
     model.language_model = inner
     assert model.reload_safe is bool(inner_safe)
+
+
+def test_nvfp4_quant_config_gscales_refresh_in_place():
+    """NVFP4 MoE: a1/a2_gscale (= 1 / activation scale) are copies the quant
+    config derives; refresh() recomputes them in place from the (landed)
+    activation scales, with the same expression as at build time."""
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        NvFp4MoeBackend,
+        make_nvfp4_moe_quant_config,
+    )
+
+    E = 4
+    a13, a2 = torch.full((E,), 0.5), torch.full((E,), 0.25)
+    qc = make_nvfp4_moe_quant_config(
+        backend=NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        w13_scale=torch.ones(E, 8, 2),
+        w2_scale=torch.ones(E, 4, 2),
+        w13_scale_2=torch.ones(E),
+        w2_scale_2=torch.ones(E),
+        a13_scale=a13,
+        a2_scale=a2,
+    )
+    g1, g2 = qc.a1_gscale, qc.a2_gscale
+    assert torch.equal(g1, 1.0 / a13) and torch.equal(g2, 1.0 / a2)
+    ptrs = (g1.data_ptr(), g2.data_ptr())
+    a13.fill_(0.3)  # a reload lands new activation scales in place
+    a2.fill_(0.7)
+    qc.refresh()
+    assert (qc.a1_gscale.data_ptr(), qc.a2_gscale.data_ptr()) == ptrs
+    assert torch.equal(qc.a1_gscale, 1.0 / a13)
+    assert torch.equal(qc.a2_gscale, 1.0 / a2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_reload_attention_scales_use_model_dtype(monkeypatch, dtype):
+    """KV-cache scale params are 0-dim tensors of the default dtype, which is
+    the model dtype at model init. Reload recreates them under the same dtype,
+    so an fp32 checkpoint scale is rounded the same way as on a fresh load."""
+    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    layer = torch.nn.Module()
+    method = object.__new__(BaseKVCacheMethod)
+    layer.quant_method = method
+    info = SimpleNamespace(loaded_weights=[])
+    seen = {}
+
+    def create_weights(layer):
+        BaseKVCacheMethod.create_weights(method, layer)
+        seen["dtype"] = layer.k_scale.dtype
+
+    method.create_weights = create_weights
+    method.process_weights_after_loading = lambda layer: None
+    monkeypatch.setattr(
+        reload_layerwise, "_copy_and_restore_kernel_tensors", lambda layer, info: None
+    )
+    reload_layerwise._reload_attention_scales(layer, info, SimpleNamespace(dtype=dtype))
+    assert seen["dtype"] == dtype
