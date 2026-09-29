@@ -208,8 +208,52 @@ class ReloadHarnessExtension:
         perturb: float | None = None,
         use_public_api: bool = True,
         force_rebuild: bool = False,
+        direct_load: bool | None = None,
+        per_expert: bool | None = None,
     ) -> dict:
-        """Stream ``path`` into the live model. Returns memory/retention stats."""
+        """Stream ``path`` into the live model. Returns memory/retention stats.
+
+        ``direct_load`` / ``per_expert`` override VLLM_RELOAD_DIRECT_LOAD /
+        VLLM_RELOAD_PER_EXPERT for this call (read at import time otherwise)."""
+        from vllm.model_executor.model_loader.reload import direct as reload_direct
+        from vllm.model_executor.model_loader.reload import (
+            per_expert as reload_per_expert,
+        )
+
+        saved_flags = (reload_direct.DIRECT_LOAD, reload_per_expert.PER_EXPERT)
+        if direct_load is not None:
+            reload_direct.DIRECT_LOAD = direct_load
+        if per_expert is not None:
+            reload_per_expert.PER_EXPERT = per_expert
+        try:
+            return self._mw_reload(
+                path,
+                order,
+                batch_size,
+                seed,
+                skip_regex,
+                fail_after,
+                on_cpu,
+                perturb,
+                use_public_api,
+                force_rebuild,
+            )
+        finally:
+            reload_direct.DIRECT_LOAD, reload_per_expert.PER_EXPERT = saved_flags
+
+    def _mw_reload(
+        self,
+        path,
+        order,
+        batch_size,
+        seed,
+        skip_regex,
+        fail_after,
+        on_cpu,
+        perturb,
+        use_public_api,
+        force_rebuild,
+    ) -> dict:
         from safetensors import safe_open
 
         from vllm.config import set_current_vllm_config
