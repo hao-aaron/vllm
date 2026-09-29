@@ -34,7 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 
-from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
+from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model, reload_active
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -338,6 +338,17 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         # mask_embedding is an unused placeholder param; DSpark masks via the vocab row.
         # embed_tokens / lm_head are optional; when omitted they are shared from
         # the target by load_dspark_model, so skip the unloaded params here.
+        if reload_active(self):
+            # A streamed reload sends the checkpoint in batches: load what
+            # arrived; whole-checkpoint checks and the confidence-head drop
+            # are cold start only, and the fused buffers are refilled by the
+            # model's refresh().
+            AutoWeightsLoader(self).load_weights(
+                model_weights.items(),
+                mapper=WeightsMapper(orig_to_new_substr={"mask_embedding": None}),
+            )
+            return
+
         uses_expanded_input_vocab = self.config.vocab_size > self.target_vocab_size
         uses_reduced_vocab = self.config.draft_vocab_size < self.target_vocab_size
         if uses_expanded_input_vocab and not includes_embed_tokens:

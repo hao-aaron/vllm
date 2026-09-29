@@ -260,6 +260,24 @@ class K3DSparkModel(nn.Module):
                 [attn._k_scale.reshape(()) for attn in attentions]
             )
 
+    @torch.no_grad()
+    def refresh(self) -> None:
+        """Modulewise reload, kind A: the stacked KV-norm weights (and KV
+        scales) are derived from the live per-layer params; refill in place."""
+        if not hasattr(self, "_num_context_layers"):
+            return
+        attentions = [layer.self_attn for layer in self.layers]
+        torch.stack(
+            [attn.kv_a_layernorm.weight.detach() for attn in attentions],
+            dim=0,
+            out=self._context_kv_norm_weights,
+        )
+        if self._context_kv_scales is not None:
+            torch.stack(
+                [attn._k_scale.reshape(()) for attn in attentions],
+                out=self._context_kv_scales,
+            )
+
     def _precompute_fused_context_kv(
         self,
         context_states: torch.Tensor,
@@ -527,6 +545,10 @@ class K3DSparkForCausalLM(nn.Module):
         # read: 1. all weights. 2. context kv weights
         weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    # Modulewise reload: the hook's derived state is refilled in place by
+    # K3DSparkModel.refresh().
+    reload_safe = True
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()

@@ -2784,3 +2784,94 @@ def test_reload_attention_scales_use_model_dtype(monkeypatch, dtype):
     )
     reload_layerwise._reload_attention_scales(layer, info, SimpleNamespace(dtype=dtype))
     assert seen["dtype"] == dtype
+
+
+def _stub_attn(**tensors):
+    attn = torch.nn.Module()
+    for name, value in tensors.items():
+        if isinstance(value, torch.nn.Module):
+            attn.add_module(name, value)
+        else:
+            setattr(attn, name, value)
+    return attn
+
+
+def _stub_linear(rows, cols, bias=False):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    linear = torch.nn.Linear(cols, rows, bias=bias)
+    linear.quant_method = object.__new__(UnquantizedLinearMethod)
+    return linear
+
+
+@pytest.mark.parametrize("model", ["qwen3_dflash", "gemma4_dspark"])
+def test_dflash_fused_context_kv_buffers_refresh_in_place(model):
+    """DFlash/DSpark drafters stack per-layer KV weights and K-norms into
+    fused buffers (kind A). refresh() refills them in place from the live
+    per-layer params after a reload landed them."""
+    if model == "qwen3_dflash":
+        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model as cls
+    else:
+        from vllm.model_executor.models.gemma4_dspark import Gemma4DSparkModel as cls
+
+    m = object.__new__(cls)
+    torch.nn.Module.__init__(m)
+    m.hidden_norm = torch.nn.LayerNorm(8)
+    attns = []
+    for _ in range(2):
+        attns.append(
+            _stub_attn(
+                qkv_proj=_stub_linear(12, 8, bias=True),
+                k_proj=_stub_linear(4, 8, bias=True),
+                k_norm=torch.nn.LayerNorm(4),
+                q_size=4,
+                head_dim=4,
+            )
+        )
+    m.layers = torch.nn.ModuleList([_stub_attn(self_attn=a) for a in attns])
+    m._build_context_kv_buffers(attns, True)
+    fused_name = "_fused_kv_weight" if model == "qwen3_dflash" else "_fused_k_weight"
+    fused, norms = getattr(m, fused_name), m._k_norm_weights
+    ptrs = (fused.data_ptr(), norms.data_ptr())
+    with torch.no_grad():
+        for a in attns:  # a reload lands new per-layer weights
+            for p in a.parameters():
+                p.add_(1.0)
+    m.refresh()
+    assert (getattr(m, fused_name).data_ptr(), m._k_norm_weights.data_ptr()) == ptrs
+    rebuilt = object.__new__(cls)
+    torch.nn.Module.__init__(rebuilt)
+    rebuilt.hidden_norm = m.hidden_norm
+    rebuilt._build_context_kv_buffers(attns, True)
+    assert torch.equal(fused, getattr(rebuilt, fused_name))
+    assert torch.equal(norms, rebuilt._k_norm_weights)
+
+
+def test_k3_dspark_context_kv_norms_refresh_in_place():
+    from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkModel
+
+    m = object.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(m)
+    layers = []
+    for _ in range(3):
+        norm = torch.nn.LayerNorm(16)
+        norm.variance_epsilon = 1e-6
+        attn = _stub_attn(
+            kv_a_layernorm=norm,
+            q_lora_rank=32,
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            kv_cache_dtype="auto",
+        )
+        layers.append(_stub_attn(self_attn=attn))
+    m.layers = torch.nn.ModuleList(layers)
+    m._build_fused_context_kv_metadata()
+    norms = m._context_kv_norm_weights
+    ptr = norms.data_ptr()
+    with torch.no_grad():
+        for layer in layers:
+            layer.self_attn.kv_a_layernorm.weight.mul_(3.0)
+    m.refresh()
+    assert m._context_kv_norm_weights is norms and norms.data_ptr() == ptr
+    expected = torch.stack([la.self_attn.kv_a_layernorm.weight for la in layers])
+    assert torch.equal(norms, expected)
