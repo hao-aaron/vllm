@@ -40,6 +40,12 @@ CASES = [
         id="mla-moe",
     ),
     pytest.param(
+        "tiiuae/Falcon-H1-0.5B-Base",
+        "tiiuae/Falcon-H1-0.5B-Instruct",
+        {},
+        id="mamba-hybrid",
+    ),
+    pytest.param(
         "allenai/OLMoE-1B-7B-0924",
         "allenai/OLMoE-1B-7B-0924-Instruct",
         {"quantization": "fp8_per_tensor"},

@@ -2875,3 +2875,56 @@ def test_k3_dspark_context_kv_norms_refresh_in_place():
     assert m._context_kv_norm_weights is norms and norms.data_ptr() == ptr
     expected = torch.stack([la.self_attn.kv_a_layernorm.weight for la in layers])
     assert torch.equal(norms, expected)
+
+
+def test_plan_input_refuses_tensor_subclasses(direct_load):
+    """Tensor subclasses (e.g. torchao quantized weights) may not expose plain
+    storage for `set_`: direct loading never hosts in them (scratch)."""
+
+    class _Subclass(torch.Tensor):
+        pass
+
+    d = direct_load
+    meta = torch.empty(4, 6, device="meta")
+    plain = torch.zeros(4, 6)
+    sub = torch.zeros(4, 6).as_subclass(_Subclass)
+    d._STORAGE_USERS.clear()
+    for t in (plain, sub):
+        d._STORAGE_USERS[t.untyped_storage().data_ptr()] = 1
+    assert d.plan_input(meta, plain, "cpu") is None
+    assert d.plan_input(meta, sub, "cpu") == "tensor subclass"
+
+
+@requires_cuda
+def test_per_expert_stacked_loads_take_module_level_path(monkeypatch):
+    """Stacked [E, ...] expert loads (one loader call per shard for every
+    local expert) take the module-level path, and count as covering every
+    local expert for the required-keys check."""
+    import vllm.model_executor.model_loader.reload.per_expert as per_expert
+
+    monkeypatch.setattr(per_expert, "PER_EXPERT", True)
+    method = _PerExpertMethod()
+    layer = _routed_experts(method, local=(0, 1), num_global=2)
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    info = reload_layerwise.get_layerwise_info(layer)
+    hidden, inter = 4, 3
+    for name, shard, shape, value in (
+        ("w13_weight", "w1", (2, inter, hidden), 1.0),
+        ("w13_weight", "w3", (2, inter, hidden), 2.0),
+        ("w2_weight", "w2", (2, hidden, inter), 3.0),
+    ):
+        p = getattr(layer, name)
+        p.weight_loader(
+            p, torch.full(shape, value, device="cuda"), name, shard, 0, True
+        )
+        # (the last call completes the module, which resets its info)
+        assert not info.per_expert and info.expert_slots is None
+    finalize_layerwise_reload(model, model_config=None)  # no missing experts
+    # module-level quantization over every expert, same values as per expert
+    assert sorted((n, e) for n, e, _ in method.quantized) == [
+        (n, e) for n in ("w13_weight", "w2_weight") for e in (0, 1)
+    ]
+    assert torch.equal(layer.w2_weight, torch.full((2, 4, 3), 6.0, device="cuda"))
