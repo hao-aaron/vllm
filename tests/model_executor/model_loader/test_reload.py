@@ -2442,6 +2442,7 @@ def test_flashinfer_bmm_scales_refresh_in_place():
     impl.kv_cache_dtype = "fp8"
     impl.bmm1_scale = impl.bmm2_scale = impl.o_sf_scale = None
     impl._bmm_scale_tensors = None
+    impl._xqa_bmm1_tensors = None
     impl.float_scales_in_decode = False
     layer = SimpleNamespace(
         _q_scale_float=1.0,
@@ -2466,6 +2467,12 @@ def test_flashinfer_bmm_scales_refresh_in_place():
     expected_log2 = torch.tensor([0.125 * 0.9 * math.log2(math.e)], dtype=torch.float32)
     assert torch.equal(bmm1_log2.cpu(), expected_log2)
     assert torch.equal(bmm2.cpu(), torch.tensor([0.2], dtype=torch.float32))
+
+    # XQA (SM90) reads bmm1 per query dtype (q_scale only for an FP8 query)
+    xqa = impl._xqa_bmm1_tensors
+    assert xqa is not None
+    assert xqa[True].item() == pytest.approx(0.125 * 1.0 * 0.9)
+    assert xqa[False].item() == pytest.approx(0.125 * 0.9)
 
     # output-quant fusion folds the o-scale into bmm2: host floats (flagged)
     assert impl._trtllm_decode_bmm_scales(torch.ones(1)) == (None, impl.bmm2_scale)

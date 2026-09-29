@@ -3,7 +3,6 @@
 """Attention layer with FlashInfer."""
 
 import math
-import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
@@ -104,14 +103,6 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
-
-# Pass the q/k/v-derived bmm scales to the trtllm-gen decode kernel as device
-# tensors (allocated once, refilled in place by `FlashInferImpl.refresh`), so
-# FULL CUDA graphs read the current scales after a weight reload instead of
-# the floats they were captured with. Prefill runs outside FULL graphs and keeps
-# the host floats. The values match the float path bit for bit (the launcher
-# computes float(double(bmm1) * log2(e)) and float(double(bmm2))).
-_TENSOR_BMM_SCALES = os.getenv("VLLM_FLASHINFER_TENSOR_BMM_SCALES", "1") == "1"
 
 trtllm_workspace_buffer = None
 
@@ -1935,8 +1926,14 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
-        # device (bmm1_scale * log2e, bmm2_scale) for trtllm-gen decode
+        # Decode reads the q/k/v-derived bmm scales from device tensors
+        # (allocated once, refilled in place by refresh()), so FULL CUDA graphs
+        # see scales changed by a weight reload; prefill runs outside FULL
+        # graphs and keeps host floats. trtllm-gen: (bmm1 * log2e, bmm2), bit
+        # for bit what the launcher computes from the floats. XQA: bmm1 for an
+        # FP8 / non-FP8 query (it folds q_scale only for an FP8 query).
         self._bmm_scale_tensors: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._xqa_bmm1_tensors: dict[bool, torch.Tensor] | None = None
         # Set once a decode path consumed host-side scale floats; FULL CUDA
         # graphs bake those, so a reload that changes the scales is not seen.
         self.float_scales_in_decode = False
@@ -2009,16 +2006,24 @@ class FlashInferImpl(AttentionImpl):
         self.o_sf_scale = None
         if getattr(layer, "_o_scale_float", None) is not None:
             layer._o_scale_float = None
-        if not (_TENSOR_BMM_SCALES and is_quantized_kv_cache(self.kv_cache_dtype)):
+        if not is_quantized_kv_cache(self.kv_cache_dtype):
             return
-        if self._bmm_scale_tensors is None:
+        if self._bmm_scale_tensors is None or self._xqa_bmm1_tensors is None:
             device = layer._k_scale.device
-            self._bmm_scale_tensors = (
-                torch.empty(1, dtype=torch.float32, device=device),
-                torch.empty(1, dtype=torch.float32, device=device),
-            )
+
+            def scalar() -> torch.Tensor:
+                return torch.empty(1, dtype=torch.float32, device=device)
+
+            self._bmm_scale_tensors = (scalar(), scalar())
+            self._xqa_bmm1_tensors = {True: scalar(), False: scalar()}
         self._bmm_scale_tensors[0].fill_(bmm1_scale * math.log2(math.e))
         self._bmm_scale_tensors[1].fill_(bmm2_scale)
+        self._xqa_bmm1_tensors[True].fill_(
+            self.get_xqa_bmm1_scale(layer, torch.float8_e4m3fn)
+        )
+        self._xqa_bmm1_tensors[False].fill_(
+            self.get_xqa_bmm1_scale(layer, torch.bfloat16)
+        )
 
     def _trtllm_decode_bmm_scales(self, output_scale: torch.Tensor | None):
         """(bmm1_scale_log2, bmm2_scale) for trtllm-gen decode: the device
@@ -2578,10 +2583,23 @@ class FlashInferImpl(AttentionImpl):
                     decode_query = canonicalize_singleton_dim_strides(decode_query)
 
                 if decode_with_xqa:
-                    self.float_scales_in_decode = True
-                    bmm1_scale = self.get_xqa_bmm1_scale(
-                        layer, attn_metadata.q_data_type_decode
+                    q_is_fp8 = attn_metadata.q_data_type_decode in (
+                        torch.float8_e4m3fn,
+                        torch.float8_e5m2,
                     )
+                    xqa_bmm2: float | torch.Tensor
+                    if (
+                        self._xqa_bmm1_tensors is not None
+                        and self._bmm_scale_tensors is not None
+                    ):
+                        bmm1_scale = self._xqa_bmm1_tensors[q_is_fp8]
+                        xqa_bmm2 = self._bmm_scale_tensors[1]
+                    else:
+                        self.float_scales_in_decode = True
+                        bmm1_scale = self.get_xqa_bmm1_scale(
+                            layer, attn_metadata.q_data_type_decode
+                        )
+                        xqa_bmm2 = self.bmm2_scale
                     q_len_per_req: int | None = attn_metadata.decode.q_len_per_req
 
                     flashinfer_xqa_batch_decode_with_kv_cache(
@@ -2592,7 +2610,7 @@ class FlashInferImpl(AttentionImpl):
                         seq_lens=seq_lens_decode,
                         max_seq_len=attn_metadata.decode.max_seq_len,
                         bmm1_scale=bmm1_scale,
-                        bmm2_scale=self.bmm2_scale,
+                        bmm2_scale=xqa_bmm2,
                         window_left=self.window_left,
                         out=output_padded[:decode_query_tokens],
                         sinks=self.sinks,

@@ -254,6 +254,11 @@ class ReloadUnsafeModelError(RuntimeError):
     pass
 
 
+class ReloadUnsupportedError(RuntimeError):
+    """An update this configuration cannot apply correctly (the model is left
+    dirty: the engine refuses to serve until a supported full update)."""
+
+
 def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
     hook = getattr(type(model), "process_weights_after_loading", None)
     if hook is None or getattr(model, "reload_safe", False):
@@ -816,12 +821,13 @@ def _finalize_attention_layer(
         and getattr(impl, "float_scales_in_decode", False)
         and _cudagraphs_captured()
     ):
-        logger.warning_once(
-            "Attention q/k/v scales changed on reload, but this attention "
-            "backend's decode path (%s) reads them as host floats, which "
-            "captured CUDA graphs bake in: decode uses the old scales until "
-            "the graphs are re-captured.",
-            type(impl).__name__,
+        raise ReloadUnsupportedError(
+            f"{type(layer).__name__}: attention q/k/v scales changed in this "
+            f"update, but the decode path of {type(impl).__name__} reads them "
+            "as host floats, which captured CUDA graphs bake in (FlashInfer "
+            "native decode wrapper, DCP decode, or attention+output-quant "
+            "fusion). Decode would keep the old scales. Keep KV-cache scales "
+            "fixed across updates, or run with enforce_eager."
         )
     for name, old in before.items():
         new = getattr(layer, name, None)
