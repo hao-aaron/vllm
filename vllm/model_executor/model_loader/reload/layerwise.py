@@ -63,6 +63,7 @@ __all__ = [
     "get_reload_session",
     "is_model_dirty",
     "check_can_serve",
+    "refresh_derived_state",
     "mark_dirty",
 ]
 
@@ -1042,6 +1043,20 @@ def _warn_if_not_reload_safe(layer: torch.nn.Module, quant_method) -> None:
             or getattr(quant_method, "mxfp4_backend", None)
             or "",
         )
+
+
+@torch.no_grad()
+def refresh_derived_state(model: torch.nn.Module) -> None:
+    """Recompute weight-derived state in place after weights were written
+    directly in kernel format (sparse patches, `is_checkpoint_format=False`
+    reloads), without a streaming reload session: the declared quant-method
+    `refresh()` (e.g. MoE alphas / activation gscales) and model-local
+    `refresh()` (kind A). Host-side attention scale floats are not covered."""
+    for layer in model.modules():
+        quant_method = getattr(layer, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase):
+            _refresh_quant_method(layer, quant_method)
+    _refresh_model_local(model)
 
 
 def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:

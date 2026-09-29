@@ -2928,3 +2928,38 @@ def test_per_expert_stacked_loads_take_module_level_path(monkeypatch):
         (n, e) for n in ("w13_weight", "w2_weight") for e in (0, 1)
     ]
     assert torch.equal(layer.w2_weight, torch.full((2, 4, 3), 6.0, device="cuda"))
+
+
+def test_refresh_derived_state_runs_declared_refreshes():
+    """Kernel-format writes (sparse patches, is_checkpoint_format=False) have
+    no reload session: refresh_derived_state recomputes derived state via the
+    declared quant-method and model-local refresh() hooks only."""
+    from vllm.model_executor.model_loader.reload import refresh_derived_state
+
+    calls: list[str] = []
+
+    class _Method(QuantizeMethodBase):
+        def __init__(self, safe: bool):
+            self.reload_safe = safe
+
+        def create_weights(self, layer, *a, **k):
+            pass
+
+        def apply(self, layer, *a, **k):
+            raise NotImplementedError
+
+        def refresh(self, layer):
+            calls.append(f"quant:{self.reload_safe}")
+
+    class _Local(torch.nn.Module):
+        def refresh(self):
+            calls.append("local")
+
+    model = torch.nn.Module()
+    model.safe = torch.nn.Module()
+    model.safe.quant_method = _Method(True)
+    model.unsafe = torch.nn.Module()
+    model.unsafe.quant_method = _Method(False)  # rebuilds; no declared refresh
+    model.local = _Local()
+    refresh_derived_state(model)
+    assert sorted(calls) == ["local", "quant:True"]
