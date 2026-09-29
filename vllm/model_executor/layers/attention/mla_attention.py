@@ -1325,9 +1325,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Convert from (L, N, P) to (N, P, L)
             replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
             if self.dcp_q_replicate:
-                self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
-                    self.W_UK_T.contiguous(), dim=0
-                )
+                qrep = get_dcp_group().all_gather(self.W_UK_T.contiguous(), dim=0)
+                # Allocated once: on a weight reload, refill it in place so
+                # captured graphs keep reading the same tensor.
+                live_qrep = self.W_UK_T_dcp_qrep
+                if live_qrep is not None and (live_qrep.shape, live_qrep.dtype) == (
+                    qrep.shape,
+                    qrep.dtype,
+                ):
+                    live_qrep.copy_(qrep)
+                else:
+                    self.W_UK_T_dcp_qrep = qrep
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
