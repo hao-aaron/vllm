@@ -9,6 +9,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
+from typing import Literal
 from weakref import WeakKeyDictionary, WeakSet
 
 import torch
@@ -62,6 +63,7 @@ __all__ = [
     "attach_processing_plan",
     "get_reload_session",
     "is_model_dirty",
+    "is_reload_active",
     "check_can_serve",
     "refresh_derived_state",
     "mark_dirty",
@@ -401,6 +403,17 @@ class ReloadIncompleteError(RuntimeError):
 
 def get_reload_session(model: torch.nn.Module) -> ReloadSession | None:
     return getattr(model, "_reload_session", None)
+
+
+def is_reload_active(module: torch.nn.Module) -> bool:
+    """True between start and finish/abort of a streamed reload that covers
+    `module`. Works on any submodule (e.g. a VL wrapper's language model,
+    whose parent holds the session)."""
+    info = LAYERWISE_INFO.get(module)
+    session = info.session if info is not None else None
+    if session is None:
+        session = get_reload_session(module)
+    return session is not None and session.active
 
 
 def is_model_dirty(model: torch.nn.Module) -> bool:
@@ -1052,6 +1065,17 @@ def ensure_param_materialized(
     tensor = getattr(layer, name)
     if not tensor.is_meta or name in SKIP_TENSORS:
         return tensor
+    live = None
+    if info.kernel_tensors is not None:
+        params, buffers = info.kernel_tensors
+        live = params.get(name, buffers.get(name))
+        if live is not None and live.is_meta:
+            # never materialized (e.g. a disabled vision tower): loads are a
+            # no-op on meta, and landing skips it
+            return tensor
+    # The checkpoint-format copy lives where the live tensor does (e.g. a
+    # CPU-resident engram table), so landing never crosses devices
+    device = live.device if live is not None else info.restore_device
     target = None
     if (
         _direct.DIRECT_LOAD
@@ -1063,7 +1087,7 @@ def ensure_param_materialized(
         # Check 1: can the live tensor's own bytes hold the checkpoint tensor?
         params, buffers = info.kernel_tensors
         live = params.get(name, buffers.get(name))
-        reason = _direct.plan_input(tensor, live, info.restore_device)
+        reason = _direct.plan_input(tensor, live, device)
         plan = _direct.PLAN_OUTCOMES.setdefault(layer, {})
         if reason is None:
             assert live is not None
@@ -1075,7 +1099,7 @@ def ensure_param_materialized(
         else:
             plan[name] = f"scratch:{reason}"
     if target is None:
-        with info.restore_device:
+        with device:
             target = _meta.materialize_meta_tensor(tensor)
         info.scratch_bytes += target.nbytes
     # Zero-filled, hosted or not: loaders don't write padding, and a slice no
@@ -1171,7 +1195,9 @@ def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:
 
 
 def attach_processing_plan(
-    module: torch.nn.Module, process: Callable[[torch.nn.Module], None]
+    module: torch.nn.Module,
+    process: Callable[[torch.nn.Module], None],
+    stage: Literal["checkpoint", "kernel"] = "checkpoint",
 ) -> None:
     """Attach another module's processing step to `module`.
 
@@ -1190,11 +1216,22 @@ def attach_processing_plan(
     A quant method's PWAL re-runs on reload, so its plan needs nothing more.
     A step that a parent applies to a child's tensors from a model-level hook
     (which reload does not call) is attached here: at cold start the owner
-    calls `process(module)` itself; on reload the framework calls it on
-    `module`'s PWAL results, before they land. See `MegaAttnLayoutPlan`
-    (DeepSeek-V4.1) and `Fp8MoEProcessingPlan`."""
+    calls `process(module)` itself; on reload the framework calls it on the
+    same tensors the cold path sees. `stage` says which: "checkpoint" runs on
+    `module`'s freshly loaded checkpoint-format tensors, before its PWAL (the
+    owner's cold step runs from `load_weights`, before the quant PWAL);
+    "kernel" runs on its PWAL results, before they land (the cold step runs
+    after PWAL). See `MegaAttnLayoutPlan` (DeepSeek-V4.1) and
+    `Fp8MoEProcessingPlan`."""
     plans = module.__dict__.setdefault("_attached_processing_plans", [])
-    plans.append(process)
+    plans.append((stage, process))
+
+
+def _run_attached_plans(layer: torch.nn.Module, stage: str) -> None:
+    for plan_stage, process in getattr(layer, "_attached_processing_plans", ()):
+        if plan_stage == stage:
+            with reload_mode(), torch.no_grad():
+                process(layer)
 
 
 def _use_per_expert(
@@ -1264,6 +1301,8 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     # Process weights (quantization, repacking, etc.). On reload this runs in
     # reload mode: kernel objects are built once, `replace_parameter` rebinds.
     reloading = info.kernel_tensors is not None
+    if reloading:
+        _run_attached_plans(layer, "checkpoint")
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
         with reload_mode() if reloading else nullcontext():
@@ -1284,13 +1323,10 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         with reload_mode():
             layer.process_weights_after_loading()
 
-    # Attached processing plans (kind B hooks, e.g. a parent's layout permute of
-    # this module's weights): run on the PWAL results before landing, so the
-    # live tensors receive the final layout exactly once.
+    # Kernel-stage attached plans run on the PWAL results before landing, so
+    # the live tensors receive the final layout exactly once.
     if reloading:
-        for process in getattr(layer, "_attached_processing_plans", ()):
-            with reload_mode(), torch.no_grad():
-                process(layer)
+        _run_attached_plans(layer, "kernel")
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)
@@ -1400,9 +1436,14 @@ def _get_weight_loader(tensor: torch.Tensor):
 def _skip_landing(
     layer: torch.nn.Module, info: LayerReloadingInfo, name: str, is_buffer: bool
 ) -> bool:
-    """Copy-back rules, shared by every landing: skip buffers that are no
-    longer registered, and non-persistent buffers no loader wrote (#44371),
+    """Copy-back rules, shared by every landing: skip live tensors that were
+    never materialized (meta, e.g. a disabled vision tower), buffers that are
+    no longer registered, and non-persistent buffers no loader wrote (#44371),
     unless a module-level PWAL declares them as outputs."""
+    params, buffers = info.kernel_tensors or ({}, {})
+    live = (buffers if is_buffer else params).get(name)
+    if live is not None and live.is_meta:
+        return True
     if not is_buffer:
         return False
     declared = name in getattr(layer, "reload_outputs", ())

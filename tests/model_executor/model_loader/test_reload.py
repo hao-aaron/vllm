@@ -3129,3 +3129,49 @@ def test_side_buffer_copies_do_not_count_toward_completion():
     finalize_layerwise_reload(model, model_config=None)
     assert len(layer.quant_method.calls) == 1
     assert torch.equal(layer.weight, torch.tensor([[1.0] * 4, [2.0] * 4]))
+
+
+class _TransposePWAL(QuantizeMethodBase):
+    """PWAL that changes the layout (like DeepGEMM's MXFP8 BMM repack)."""
+
+    def create_weights(self, layer, *a, **k):
+        pass
+
+    def apply(self, layer, *a, **k):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        from vllm.model_executor.utils import replace_parameter
+
+        replace_parameter(layer, "weight", layer.weight.t().contiguous())
+
+
+def test_attached_plan_runs_on_checkpoint_format_before_pwal():
+    """A parent step that cold start runs from `load_weights` (before the
+    child's PWAL) must see checkpoint-format tensors on reload too."""
+    from vllm.model_executor.model_loader.reload import attach_processing_plan
+
+    perm = torch.tensor([2, 0, 3, 1])
+    child = torch.nn.Module()
+    child.quant_method = _TransposePWAL()
+    w = torch.nn.Parameter(torch.zeros(4, 3), requires_grad=False)
+    w.weight_loader = default_weight_loader
+    child.register_parameter("weight", w)
+
+    def permute_rows(m):  # checkpoint layout: rows are output channels
+        m.weight.data.copy_(m.weight.data[perm])
+
+    attach_processing_plan(child, permute_rows)
+    model = torch.nn.Sequential(child)
+    record_metadata_for_reloading(model)
+    a = torch.arange(12.0).view(4, 3)
+    child.weight.data.copy_(a)
+    permute_rows(child)  # cold start: the owner's hook, before PWAL
+    child.quant_method.process_weights_after_loading(child)
+    assert torch.equal(child.weight, a[perm].t())
+
+    b = torch.arange(12.0, 24.0).view(4, 3)
+    initialize_layerwise_reload(model)
+    child.weight.weight_loader(child.weight, b)
+    finalize_layerwise_reload(model, model_config=None)
+    assert torch.equal(child.weight, b[perm].t())

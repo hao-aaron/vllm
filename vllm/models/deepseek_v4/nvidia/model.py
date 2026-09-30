@@ -2123,10 +2123,9 @@ class DeepseekV4ForCausalLM(
         # A streamed reload calls load_weights per batch while modules are
         # still on meta; its post-load work runs per module (mega-MoE
         # reload_outputs) and in the model refresh() (mHC broadcast) instead.
-        from vllm.model_executor.model_loader.reload import get_reload_session
+        from vllm.model_executor.model_loader.reload import is_reload_active
 
-        session = get_reload_session(self)
-        if session is None or not session.active:
+        if not is_reload_active(self):
             self.process_weights_after_loading()
         return loaded_params
 

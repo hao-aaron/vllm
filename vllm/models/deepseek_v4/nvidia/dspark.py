@@ -567,10 +567,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # still on meta: a batch without the confidence head says nothing about
         # the checkpoint, and the post-load work runs per module (MegaMoE
         # reload_outputs, attached attention layout plans) instead.
-        from vllm.model_executor.model_loader.reload import get_reload_session
+        from vllm.model_executor.model_loader.reload import is_reload_active
 
-        session = get_reload_session(self)
-        if session is not None and session.active:
+        if is_reload_active(self):
             return loaded_params
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None

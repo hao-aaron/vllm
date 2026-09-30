@@ -370,6 +370,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         Non-mtp weights (embed/head/main layers) belong to the target model and
         are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
         """
+        from vllm.models.deepseek_v4.nvidia.model import is_dropped_mega_weight
+
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
         # Draft MoE layers use the dspark_* expert counts, not the
@@ -447,6 +449,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name_mapped = name.replace(weight_name, param_name)
+                    if name_mapped not in params_dict and is_dropped_mega_weight(
+                        self, name_mapped
+                    ):
+                        continue
                     param = params_dict[name_mapped]
                     success = param.weight_loader(
                         param,
@@ -489,11 +495,27 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        # A streamed reload calls load_weights per batch while modules are
+        # still on meta: a batch without the confidence head says nothing about
+        # the checkpoint, and the post-load work runs per module (MegaMoE
+        # reload_outputs, attached attention layout plans) instead.
+        from vllm.model_executor.model_loader.reload import is_reload_active
+
+        if is_reload_active(self):
+            return loaded_params
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
         self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
+
+    @property
+    def reload_safe(self) -> bool:
+        """Modulewise reload: the hook's work is redone per module; see
+        `mega_moe_reload_safe` for what fails closed."""
+        from vllm.models.deepseek_v4.nvidia.model import mega_moe_reload_safe
+
+        return mega_moe_reload_safe(self)
 
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:

@@ -182,10 +182,9 @@ def _resolve_layer_attention(
 
 def reload_active(model: nn.Module) -> bool:
     """Whether a streamed weight reload (modulewise reload) is in progress."""
-    from vllm.model_executor.model_loader.reload import get_reload_session
+    from vllm.model_executor.model_loader.reload import is_reload_active
 
-    session = get_reload_session(model)
-    return session is not None and session.active
+    return is_reload_active(model)
 
 
 class DFlashQwen3Attention(nn.Module):

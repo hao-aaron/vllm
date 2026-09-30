@@ -104,6 +104,8 @@ def _tensor_digest(t: torch.Tensor) -> str:
     import hashlib
 
     t = t.detach()
+    if t.is_meta:
+        return f"meta{tuple(t.shape)}"
     if t.numel() == 0:
         return f"empty{tuple(t.shape)}"
     b = t.contiguous().view(-1).view(torch.uint8) if t.element_size() else t

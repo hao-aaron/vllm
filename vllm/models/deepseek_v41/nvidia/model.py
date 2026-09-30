@@ -79,7 +79,9 @@ from vllm.models.deepseek_v4.nvidia.model import (
 )
 from vllm.models.deepseek_v4.nvidia.model import (
     MegaGateRoutingMetadata,
+    is_dropped_mega_weight,
     make_deepseek_v4_expert_params_mapping,
+    mega_moe_reload_safe,
     prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
@@ -1071,6 +1073,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
+                        if name_mapped not in params_dict and is_dropped_mega_weight(
+                            self, name_mapped
+                        ):
+                            continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -1174,6 +1180,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             finalize = getattr(layer.attn, "finalize_loaded_weights", None)
             if finalize is not None:
                 finalize()
+
+    def refresh(self) -> None:
+        """Modulewise reload, kind A: the mHC broadcast is derived from live
+        `hc_attn_fn`; once built it is recomputed in place after landing."""
+        if get_pp_group().is_first_rank and self.start_layer < self.end_layer:
+            layer = self.layers[self.start_layer]
+            if getattr(layer, "hc_attn_fn_broadcast", None) is not None:
+                self.finalize_mhc_broadcast_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -1423,6 +1437,14 @@ class DeepseekV41LLMForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        # A streamed reload calls load_weights per batch while modules are
+        # still on meta; its post-load work runs per module (MegaMoE
+        # reload_outputs, the mega-attention layout plan) and in the model
+        # refresh() (mHC broadcast) instead.
+        from vllm.model_executor.model_loader.reload import is_reload_active
+
+        if is_reload_active(self):
+            return loaded_params
         self.process_weights_after_loading()
         config = self.model.vllm_config
         if config.engram_config and config.engram_config.use_thp:
@@ -1439,6 +1461,14 @@ class DeepseekV41LLMForCausalLM(
                 if layer.engram is not None:
                     layer.engram.embed_tokens.collapse_huge_pages()
         return loaded_params
+
+    @property
+    def reload_safe(self) -> bool:
+        """Modulewise reload: the model hook's work is redone per module
+        (MegaMoE reload_outputs, the mega-attention layout plan attached to
+        wq_b / wo_a) and by `refresh()` (mHC broadcast); see
+        `mega_moe_reload_safe` for what fails closed."""
+        return mega_moe_reload_safe(self)
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
