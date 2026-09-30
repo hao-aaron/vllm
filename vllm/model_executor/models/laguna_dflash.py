@@ -173,6 +173,30 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
 
+    @torch.no_grad()
+    def _refresh_context_kv_buffers(self, layers_attn: list[nn.Module]) -> None:
+        # Modulewise reload: refill the stacked buffers in place (captured
+        # graphs keep reading them); mirrors _build_context_kv_buffers.
+        torch.stack(
+            [a.qkv_proj.weight[a.q_size :] for a in layers_attn],
+            dim=0,
+            out=self._kv_weights,
+        )
+        if self._kv_biases is not None:
+            torch.stack(
+                [a.qkv_proj.bias[a.q_size :] for a in layers_attn],
+                dim=0,
+                out=self._kv_biases,
+            )
+        torch.stack(
+            [layer.input_layernorm.weight.data for layer in self.layers],
+            dim=0,
+            out=self._input_layernorm_weights,
+        )
+        torch.stack(
+            [a.k_norm.weight.data for a in layers_attn], dim=0, out=self._k_norm_weights
+        )
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,

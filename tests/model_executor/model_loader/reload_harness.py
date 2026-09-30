@@ -178,7 +178,14 @@ class ReloadHarnessExtension:
     _abort_weight_update: Any
 
     def _mw_model(self):
+        if getattr(self, "_mw_target", "target") == "draft":
+            return self.model_runner.get_draft_model()
         return self.model_runner.get_model()
+
+    def mw_set_target(self, which: str) -> None:
+        """Point reload / checksum / pointer calls at "target" or "draft"."""
+        assert which in ("target", "draft")
+        self._mw_target = which
 
     def mw_ptr_snapshot(self) -> dict:
         model = self._mw_model()
