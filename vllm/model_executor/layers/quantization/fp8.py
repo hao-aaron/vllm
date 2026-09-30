@@ -516,7 +516,8 @@ class Fp8MoEProcessingPlan:
 
         Reads the layer's static attributes (block size, activation) but writes
         neither the layer nor its config. (The Marlin and Humming conversions
-        still write the layer; neither backend is `reload_safe`.)"""
+        still write the layer; Marlin's writes are verified reload-safe by the
+        refit matrix, Humming isn't declared.)"""
         w13, w2 = w.w13, w.w2
         w13_scale, w2_scale = w.w13_scale, w.w2_scale
         w13_input_scale, w2_input_scale = w.w13_input_scale, w.w2_input_scale
@@ -631,6 +632,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             Fp8MoeBackend.FLASHINFER_TRTLLM,
             Fp8MoeBackend.TRITON,
             Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.MARLIN,
         )
         # Created in the first cold PWAL (processing-plan convention)
         self.processing_plan: Fp8MoEProcessingPlan | None = None

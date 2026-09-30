@@ -177,12 +177,12 @@ BACKEND_CASES = [
     *(
         _backend("fp8-block", "hub", QWEN3_MOE_FP8, b)
         # (FlashInfer CUTLASS doesn't support block FP8 MoE on SM100)
-        for b in ("triton", "deep_gemm", "flashinfer_trtllm")
+        for b in ("triton", "deep_gemm", "flashinfer_trtllm", "marlin")
     ),
     # Fp8MoEMethod, per-tensor FP8 with static activation scales
     *(
         _backend("fp8-tensor-static", "fp8_static", OLMOE, b)
-        for b in ("triton", "flashinfer_cutlass")
+        for b in ("triton", "flashinfer_cutlass", "marlin")
     ),
     # (TRT-LLM's per-tensor FP8 MoE kernel doesn't support OLMoE's routing)
     _backend("fp8-tensor-static", "fp8_static", QWEN3_MOE, "flashinfer_trtllm"),
@@ -195,7 +195,7 @@ BACKEND_CASES = [
     # MXFP4
     *(
         _backend("mxfp4", "hub", "openai/gpt-oss-20b", b)
-        for b in ("triton", "flashinfer_trtllm")
+        for b in ("triton", "flashinfer_trtllm", "marlin")
     ),
     # NVFP4 (ModelOpt and compressed-tensors)
     *(
