@@ -168,12 +168,23 @@ class CopyCounter(TorchDispatchMode):
     Useful for keeping track of weight loading where underlying weights can be
     arbitrarily transformed (such as with `narrow`) before calling copy.
 
+    With `target`, only copies into `target`'s storage count: a loader may also
+    write side buffers (e.g. KDA's decode copy of conv1d), which must not make
+    the target look loaded. Meta targets have no storage to compare, so every
+    copy counts.
+
     Note: Assumes that copy kwargs are not used.
     """
 
-    def __init__(self):
+    def __init__(self, target: torch.Tensor | None = None):
         super().__init__()
         self.copied_numel = 0
+        self._target_ptr = None
+        if isinstance(target, torch.Tensor) and not target.is_meta:
+            try:
+                self._target_ptr = target.untyped_storage().data_ptr()
+            except (RuntimeError, NotImplementedError):  # e.g. tensor subclasses
+                self._target_ptr = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -181,9 +192,18 @@ class CopyCounter(TorchDispatchMode):
 
         if func is torch.ops.aten.copy_.default:
             assert args[0].numel() == args[1].numel()
-            self.copied_numel += args[0].numel()
+            if self._counts(args[0]):
+                self.copied_numel += args[0].numel()
 
         return func(*args, **kwargs)
+
+    def _counts(self, dst: torch.Tensor) -> bool:
+        if self._target_ptr is None or dst.is_meta:
+            return True
+        try:
+            return dst.untyped_storage().data_ptr() == self._target_ptr
+        except (RuntimeError, NotImplementedError):
+            return True
 
 
 def get_numel_loaded(
@@ -200,7 +220,7 @@ def get_numel_loaded(
         weight loader
 
     """
-    with CopyCounter() as counter:
+    with CopyCounter(args.arguments.get("param", None)) as counter:
         return_value = weight_loader(*args.args, **args.kwargs)
 
     # A weight loader fills a single destination parameter, so the number of

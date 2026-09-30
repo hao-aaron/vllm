@@ -3091,3 +3091,41 @@ def test_attn_sink_padding_keeps_neg_inf_on_reload():
     assert layer.attn_sink is sink and sink.data_ptr() == ptr
     assert torch.equal(sink[:6], new)
     assert torch.isneginf(sink[6:]).all()  # padding stays -inf, not zeros
+
+
+class _SideBufferLayer(torch.nn.Module):
+    """Two-shard param whose loader also writes a live side buffer, like KDA's
+    conv1d (it copies each shard into `decode_conv1d_weight` as well)."""
+
+    def __init__(self):
+        super().__init__()
+        self.quant_method = _ProcessRecorder()
+        self.side = torch.zeros(2, 4)
+        w = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+
+        def loader(param, loaded_weight, shard_id):
+            param.data[shard_id].copy_(loaded_weight)
+            if not param.is_meta:
+                self.side[shard_id].copy_(loaded_weight)
+
+        w.weight_loader = loader
+        self.register_parameter("weight", w)
+
+
+def test_side_buffer_copies_do_not_count_toward_completion():
+    layer = _SideBufferLayer()
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    orig = reload_layerwise._has_device_incoming
+    reload_layerwise._has_device_incoming = lambda _: True
+    try:
+        layer.weight.weight_loader(layer.weight, torch.full((4,), 1.0), 0)
+        # the side-buffer copy must not make shard 0 look like the whole param
+        assert not layer.quant_method.calls
+        layer.weight.weight_loader(layer.weight, torch.full((4,), 2.0), 1)
+    finally:
+        reload_layerwise._has_device_incoming = orig
+    finalize_layerwise_reload(model, model_config=None)
+    assert len(layer.quant_method.calls) == 1
+    assert torch.equal(layer.weight, torch.tensor([[1.0] * 4, [2.0] * 4]))

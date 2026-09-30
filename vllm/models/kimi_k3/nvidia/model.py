@@ -97,6 +97,7 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MegaMoEExperts,
     DeepseekV4MLP,
+    is_dropped_mega_weight,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
@@ -1499,6 +1500,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     name = name.replace(expert_weight_name, expert_param_name)
                     if is_pp_missing_parameter(name, self):
                         continue
+                    if name not in params_dict and is_dropped_mega_weight(self, name):
+                        break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(

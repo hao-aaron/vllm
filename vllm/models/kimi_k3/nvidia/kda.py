@@ -576,6 +576,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         if self.in_proj_padding:
             self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+            # Weight reload: the padding rows are never loaded
+            weight = self.in_proj_qkvgfab.weight
+            rows = weight.shape[0]
+            weight.weight_loader_numel = (
+                weight.numel() // rows * (rows - self.in_proj_padding)
+            )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,

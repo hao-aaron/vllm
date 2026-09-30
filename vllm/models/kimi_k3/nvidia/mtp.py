@@ -249,6 +249,8 @@ class KimiK3MTP(nn.Module):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm.models.deepseek_v4.nvidia.model import is_dropped_mega_weight
+
         # Mirror KimiLinearForCausalLM.load_weights naming: leading-dot shard
         # names, q_lora-conditional fused QKV, and w1/w2/w3 expert weights.
         kda_config = self.config.linear_attn_config
@@ -362,6 +364,10 @@ class KimiK3MTP(nn.Module):
                     name_mapped = name.replace(expert_weight_name, expert_param_name)
                     if name_mapped in pp_missing_layer_names:
                         continue
+                    if name_mapped not in params_dict and is_dropped_mega_weight(
+                        self, name_mapped
+                    ):
+                        break
                     param = params_dict[name_mapped]
                     weight_loader = param.weight_loader
                     weight_loader(

@@ -1196,6 +1196,25 @@ class DeepseekV4MoE(nn.Module):
             self.experts.finalize_weights(self.shared_experts)
 
 
+_RAW_MEGA_WEIGHTS = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+
+
+def is_dropped_mega_weight(model: nn.Module, name: str) -> bool:
+    """Whether `name` is a MegaMoE raw weight already dropped after its
+    transform. On reload a rank's experts module completes once its local
+    experts arrived, so later (non-local) experts find nothing to load."""
+    module_name, _, attr = name.rpartition(".")
+    try:
+        module = model.get_submodule(module_name)
+    except AttributeError:
+        return False
+    return (
+        isinstance(module, DeepseekV4MegaMoEExperts)
+        and attr in _RAW_MEGA_WEIGHTS
+        and getattr(module, attr, None) is None
+    )
+
+
 def mega_moe_reload_safe(model: nn.Module) -> bool:
     """Whether every MegaMoE experts module of `model` redoes its transform
     per module on reload. MegaMoE shared-expert fusion (reads another
@@ -1792,6 +1811,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             continue
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
+                            continue
+                        if name_mapped not in params_dict and is_dropped_mega_weight(
+                            self, name_mapped
+                        ):
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not

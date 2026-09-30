@@ -226,10 +226,25 @@ class ReloadHarnessExtension:
 
         ``direct_load`` / ``per_expert`` override VLLM_RELOAD_DIRECT_LOAD /
         VLLM_RELOAD_PER_EXPERT for this call (read at import time otherwise)."""
-        from vllm.model_executor.model_loader.reload import direct as reload_direct
-        from vllm.model_executor.model_loader.reload import (
-            per_expert as reload_per_expert,
+        args = (
+            path,
+            order,
+            batch_size,
+            seed,
+            skip_regex,
+            fail_after,
+            on_cpu,
+            perturb,
+            use_public_api,
+            force_rebuild,
         )
+        try:
+            from vllm.model_executor.model_loader.reload import direct as reload_direct
+            from vllm.model_executor.model_loader.reload import (
+                per_expert as reload_per_expert,
+            )
+        except ImportError:  # a baseline without modulewise reload (main)
+            return self._mw_reload(*args)
 
         saved_flags = (reload_direct.DIRECT_LOAD, reload_per_expert.PER_EXPERT)
         if direct_load is not None:
@@ -237,18 +252,7 @@ class ReloadHarnessExtension:
         if per_expert is not None:
             reload_per_expert.PER_EXPERT = per_expert
         try:
-            return self._mw_reload(
-                path,
-                order,
-                batch_size,
-                seed,
-                skip_regex,
-                fail_after,
-                on_cpu,
-                perturb,
-                use_public_api,
-                force_rebuild,
-            )
+            return self._mw_reload(*args)
         finally:
             reload_direct.DIRECT_LOAD, reload_per_expert.PER_EXPERT = saved_flags
 
@@ -298,6 +302,7 @@ class ReloadHarnessExtension:
         retained: list[str] = []
         max_batch_bytes = 0
         max_held_after_batch = 0
+        held_series: list[int] = []
         t0 = time.perf_counter()
         sent = 0
         with set_current_vllm_config(self.vllm_config):
@@ -331,6 +336,7 @@ class ReloadHarnessExtension:
                     retained.extend(alive)
                     held = torch.cuda.memory_allocated() - base
                     max_held_after_batch = max(max_held_after_batch, held)
+                    held_series.append(held)
                 finish(model, self.model_config)
             except BaseException:
                 abort = getattr(reload_api, "abort_reload", None)
@@ -347,6 +353,9 @@ class ReloadHarnessExtension:
             "end_over_base": torch.cuda.memory_allocated() - base,
             "retained": retained[:50],
             "num_retained": len(retained),
+            "held_series": held_series,
+            "batch_size": batch_size,
+            "order": order,
             "seconds": dt,
         }
         try:
@@ -360,6 +369,75 @@ class ReloadHarnessExtension:
         if get_outcomes is not None:
             stats["landing"] = get_outcomes(model)
         return stats
+
+    def mw_module_map(self, path: str) -> dict:
+        """Dry-run every checkpoint tensor of ``path`` through the model's own
+        ``load_weights`` (``trace_loads``, meta tensors) and record where each
+        lands: (module, param, counted numel). Also returns each module's
+        loadable total and each param's checkpoint-format bytes on this rank.
+        Feeds an independent prediction of reload memory."""
+        from safetensors import safe_open
+
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import current_load, trace_loads
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        model = self._mw_model()
+        modname = {id(m): n for n, m in model.named_modules()}
+        files = _checkpoint_files(path)
+        names = _read_names(files)
+        dtypes = {
+            "BF16": torch.bfloat16,
+            "F16": torch.float16,
+            "F32": torch.float32,
+            "U8": torch.uint8,
+            "I8": torch.int8,
+            "I32": torch.int32,
+            "I64": torch.int64,
+            "F8_E4M3": torch.float8_e4m3fn,
+            "F8_E8M0": torch.uint8,
+        }
+        hits: dict[str, list] = {}
+        incoming: dict[str, int] = {}
+        errors: dict[str, str] = {}
+        with set_current_vllm_config(self.vllm_config), trace_loads(model) as trace:
+            record = trace._record
+
+            def _record(module, numel, total, record=record):
+                target = current_load()
+                hits.setdefault(current, []).append(
+                    (modname[id(module)], target.param_name if target else "", numel)
+                )
+                record(module, numel, total)
+
+            trace._record = _record  # type: ignore[method-assign]
+            for name, fn in names:
+                with safe_open(fn, "pt") as f:
+                    sl = f.get_slice(name)
+                    shape, dtype = sl.get_shape(), dtypes[sl.get_dtype()]
+                current = name
+                t = torch.empty(shape, dtype=dtype, device="meta")
+                incoming[name] = t.numel() * t.element_size()
+                try:
+                    model.load_weights([(name, t)])
+                except Exception as e:  # e.g. a loader that bypasses reload
+                    errors[name] = f"{type(e).__name__}: {e}"[:200]
+            totals = {modname[id(m)]: n for m, n in trace._totals.items()}
+            param_bytes = {}
+            for m, info in LAYERWISE_INFO.items():
+                if modname.get(id(m)) in totals:
+                    params, buffers = info.restore_metadata
+                    param_bytes[modname[id(m)]] = {
+                        n: t.numel() * t.element_size()
+                        for n, t in {**params, **buffers}.items()
+                    }
+        return {
+            "hits": hits,
+            "incoming": incoming,
+            "totals": totals,
+            "param_bytes": param_bytes,
+            "errors": errors,
+        }
 
     def mw_call(self, fn_path: str, *args, **kwargs):
         """Call ``module:function(model, *args)`` in the worker."""

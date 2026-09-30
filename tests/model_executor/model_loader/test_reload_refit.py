@@ -250,9 +250,10 @@ def _copy_non_weights(src: str, dst: str, skip=()) -> None:
 def make_variant(src: str, dst: str, eps: float = 0.02) -> str:
     """A perturbed copy of `src` in the same format: float weights get
     multiplicative noise, float scales x1.1 (input scales x1.25), and 1-byte
-    stacked expert tensors ([E, ...]) are rolled by one expert. Noise is seeded
-    per tensor name, and a tied `lm_head` gets the embedding's noise, so tied
-    checkpoints stay consistent."""
+    tensors (FP8, packed FP4, e8m0 scales) are rolled by one row (one expert
+    for stacked [E, ...] tensors), so every quantized weight changes too.
+    Noise is seeded per tensor name, and a tied `lm_head` gets the embedding's
+    noise, so tied checkpoints stay consistent."""
     if os.path.exists(os.path.join(dst, _DONE)):
         return dst
     src = _source_dir(src)
@@ -277,12 +278,23 @@ def make_variant(src: str, dst: str, eps: float = 0.02) -> str:
                     g = torch.Generator().manual_seed(zlib.crc32(name.encode()))
                     n = torch.randn(t.shape, generator=g, dtype=torch.float32)
                     t = (t.float() * (1 + eps * n)).to(t.dtype)
-            elif "experts" in k and t.dim() >= 3:
+            elif t.element_size() == 1 and t.dim() >= 1 and t.shape[0] > 1:
+                # FP8 / packed FP4 / e8m0: any permutation is still valid data
                 t = torch.roll(t, 1, dims=0)
             out[k] = t.contiguous()
         save_file(out, os.path.join(dst, os.path.basename(fn)), {"format": "pt"})
-    open(os.path.join(dst, _DONE), "w").close()
+    _mark_done(src, dst)
     return dst
+
+
+def _mark_done(src: str, dst: str) -> None:
+    missing = [
+        f
+        for f in os.listdir(src)
+        if f.endswith(".safetensors") and not os.path.exists(os.path.join(dst, f))
+    ]
+    assert not missing, f"{dst}: weight files not written: {missing}"
+    open(os.path.join(dst, _DONE), "w").close()
 
 
 _FP8_PROJECTIONS = (
