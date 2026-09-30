@@ -1553,17 +1553,29 @@ class Worker(WorkerBase):
         """All ranks of this engine (TP x PP) agree on the outcome before any
         of them serves: a forward runs on all of them together, so one rank's
         failure (e.g. an expert missing on its EP shard) makes every rank's
-        weights unusable. DP replicas are separate engines and not included."""
+        weights unusable. With expert parallelism across DP replicas their
+        forwards are coupled too (MoE dispatch/combine), so the DP replicas
+        agree as well; independent DP replicas decide on their own."""
         from vllm.distributed import parallel_state
 
-        if parallel_state._WORLD is None or parallel_state._WORLD.world_size == 1:
-            return ok
-        group = parallel_state.get_world_group()
-        flag = torch.tensor([int(ok)], dtype=torch.int32)
-        torch.distributed.all_reduce(
-            flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-        )
-        return bool(flag.item())
+        groups = []
+        if parallel_state._WORLD is not None and parallel_state._WORLD.world_size > 1:
+            groups.append(parallel_state.get_world_group())
+        pc = getattr(self, "parallel_config", None)
+        if (
+            pc is not None
+            and pc.enable_expert_parallel
+            and pc.data_parallel_size > 1
+            and parallel_state._DP is not None
+        ):
+            groups.append(parallel_state.get_dp_group())
+        for group in groups:
+            flag = torch.tensor([int(ok)], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
+            ok = bool(flag.item())
+        return ok
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
