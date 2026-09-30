@@ -499,7 +499,18 @@ def prepare_fp8_moe_layer_for_fi(
             layer.moe_config.is_act_and_mul,
             min_alignment,
         )
-        layer.moe_config.intermediate_size_per_partition = new_intermediate
+        # Config writes are cold-only (processing-plan convention). A reload
+        # pads the same checkpoint shapes, so it must land on the same size.
+        from vllm.model_executor.utils import is_reloading
+
+        if not is_reloading():
+            layer.moe_config.intermediate_size_per_partition = new_intermediate
+        elif layer.moe_config.intermediate_size_per_partition != new_intermediate:
+            raise RuntimeError(
+                "FlashInfer FP8 MoE reload: padded intermediate size "
+                f"{new_intermediate} differs from the cold load's "
+                f"{layer.moe_config.intermediate_size_per_partition}"
+            )
 
     # FI kernels require W31 layout rather than W13.
     if layer.moe_config.is_act_and_mul:

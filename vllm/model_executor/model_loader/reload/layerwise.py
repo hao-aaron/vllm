@@ -59,7 +59,7 @@ __all__ = [
     "ensure_materialized",
     "LoadTarget",
     "LoadTrace",
-    "add_reload_transform",
+    "attach_processing_plan",
     "get_reload_session",
     "is_model_dirty",
     "check_can_serve",
@@ -159,6 +159,8 @@ def record_metadata_for_reloading(model: torch.nn.Module):
 # Small scale tensors keep their create-time value as the reload initial value:
 # scales are created with deliberate values (ones, or FP8_SCALE_SENTINEL, which
 # process_weights_after_loading uses to detect shards the checkpoint lacks).
+# So do small tensors that set `reload_keep_init_value`: padding a loader never
+# writes whose create-time value matters (e.g. -inf attention sinks).
 # Everything else is zero-filled (weights are often created with torch.empty).
 INIT_VALUE_MAX_NUMEL = 4096
 
@@ -171,7 +173,7 @@ def _capture_init_values(
     for name in (*params, *buffers):
         t = getattr(layer, name, None)
         if (
-            "scale" in name
+            ("scale" in name or getattr(t, "reload_keep_init_value", False))
             and isinstance(t, torch.Tensor)
             and not t.is_meta
             and 0 < t.numel() <= INIT_VALUE_MAX_NUMEL
@@ -204,6 +206,8 @@ def initialize_layerwise_reload(
     4. Copy processed values back to original tensor storage
     """
     _check_model_hook_reload_safe(model)
+    _check_moe_methods_reload_safe(model)
+    _check_live_tensors_unchanged(model)
 
     # A failed update leaves the model dirty until a full update succeeds
     previous = get_reload_session(model)
@@ -273,6 +277,115 @@ def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
         logger.warning_once(msg)
         return
     raise ReloadUnsafeModelError(msg)
+
+
+# MoE methods that don't declare `reload_safe` rebuild their kernel on reload.
+# Captured CUDA graphs keep reading the old kernel's weight-derived state, so
+# under graphs reload fails closed for them (before any live write).
+# VLLM_RELOAD_ALLOW_UNSAFE_MOE=1 downgrades this to a warning.
+ALLOW_UNSAFE_MOE = os.getenv("VLLM_RELOAD_ALLOW_UNSAFE_MOE", "0") == "1"
+
+
+def _check_moe_methods_reload_safe(model: torch.nn.Module) -> None:
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+
+    if not _cudagraphs_captured():
+        return  # eager: a rebuilt kernel is read directly, nothing goes stale
+    unsafe: dict[str, str] = {}  # method (backend) -> first module using it
+    for name, module in model.named_modules():
+        method = getattr(module, "quant_method", None)
+        if (
+            isinstance(method, FusedMoEMethodBase)
+            and not method.reload_safe
+            and method.moe_kernel is not None
+        ):
+            unsafe.setdefault(_moe_method_label(method), name)
+    if not unsafe:
+        return
+    found = ", ".join(f"{label} (e.g. {name})" for label, name in unsafe.items())
+    msg = (
+        f"MoE methods that don't declare reload_safe: {found}. Reload would "
+        "rebuild their kernel, and captured CUDA graphs would keep reading the "
+        "old kernel's weight-derived state. To make a method reload-safe, build "
+        "its kernel once (skip the build under is_reloading()), keep derived "
+        "values in refresh(), and set reload_safe (a method with no derived "
+        "state only sets it); Fp8MoEMethod and Fp8MoEProcessingPlan are the "
+        "reference. Or run with enforce_eager, or set "
+        "VLLM_RELOAD_ALLOW_UNSAFE_MOE=1 to reload anyway."
+    )
+    if ALLOW_UNSAFE_MOE:
+        logger.warning_once(msg)
+        return
+    raise ReloadUnsafeModelError(msg)
+
+
+def _moe_method_label(method) -> str:
+    backend = next(
+        (
+            getattr(method, attr)
+            for attr in ("fp8_backend", "mxfp4_backend", "nvfp4_backend")
+            if getattr(method, attr, None) is not None
+        ),
+        None,
+    )
+    name = type(method).__name__
+    return f"{name} ({getattr(backend, 'name', backend)})" if backend else name
+
+
+# Live tensors as the last successful update left them, per module. Captured
+# CUDA graphs and built-once kernels hold these objects, so a tensor replaced
+# (or moved) between updates is one the next update would not write where they
+# read. Checked at the start of each update, before any live write.
+_LIVE_SIGNATURES: WeakKeyDictionary[torch.nn.Module, dict[str, tuple]] = (
+    WeakKeyDictionary()
+)
+
+
+def _live_signature(t: torch.Tensor) -> tuple:
+    try:
+        ptr = t.data_ptr()
+    except (RuntimeError, NotImplementedError):  # e.g. tensor subclasses
+        ptr = None
+    return (id(t), ptr, tuple(t.shape), t.stride(), t.dtype)
+
+
+def _record_live_signatures(model: torch.nn.Module) -> None:
+    for layer in model.modules():
+        _LIVE_SIGNATURES[layer] = {
+            name: _live_signature(t) for name, t in get_layer_tensors(layer).items()
+        }
+
+
+def _check_live_tensors_unchanged(model: torch.nn.Module) -> None:
+    changed = []
+    for module_name, layer in model.named_modules():
+        expected = _LIVE_SIGNATURES.get(layer)
+        if expected is None:
+            continue
+        current = get_layer_tensors(layer)
+        for name, signature in expected.items():
+            t = current.get(name)
+            if t is None:
+                changed.append(f"{module_name}.{name} (removed)")
+            elif _live_signature(t) != signature:
+                changed.append(f"{module_name}.{name}")
+    if not changed:
+        return
+    shown = ", ".join(changed[:5]) + (
+        f" and {len(changed) - 5} more" if len(changed) > 5 else ""
+    )
+    msg = (
+        f"Live tensors changed since the last weight update: {shown}. Something "
+        "outside reload replaced, resized or moved them. Reload writes the "
+        "tensors on the module now, so captured CUDA graphs and built-once "
+        "kernels would keep reading the old ones. Update tensors in place "
+        "(copy_ into the existing tensor) instead of replacing them."
+    )
+    if _cudagraphs_captured():
+        raise ReloadUnsupportedError(msg)
+    logger.warning_once(msg)
 
 
 # Integrity. A module left partially loaded at finish would keep zeros (or,
@@ -771,6 +884,8 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         session.dirty = False
         session.active = False
         model._weights_generation = session.generation
+    if reloading:
+        _record_live_signatures(model)
 
 
 def _refresh_model_local(model: torch.nn.Module) -> None:
@@ -887,12 +1002,14 @@ def _reload_attention_scales(
         # on reload as on a fresh load.
         from vllm.utils.torch_utils import set_default_torch_dtype
 
+        # On the model's device, as at model init: they land in the live scales
         dtype = model_config.dtype if model_config is not None else None
-        if isinstance(dtype, torch.dtype):
-            with set_default_torch_dtype(dtype):
+        with info.restore_device:
+            if isinstance(dtype, torch.dtype):
+                with set_default_torch_dtype(dtype):
+                    quant_method.create_weights(layer)
+            else:
                 quant_method.create_weights(layer)
-        else:
-            quant_method.create_weights(layer)
 
     for name, args in info.loaded_weights:
         param = getattr(layer, name)
@@ -1034,23 +1151,6 @@ def scratch_bytes_in_flight() -> int:
     return sum(LAYERWISE_INFO[layer].scratch_bytes for layer in in_flight)
 
 
-def _warn_if_not_reload_safe(layer: torch.nn.Module, quant_method) -> None:
-    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-        FusedMoEMethodBase,
-    )
-
-    if isinstance(quant_method, FusedMoEMethodBase) and not quant_method.reload_safe:
-        logger.warning_once(
-            "%s (%s) does not declare reload_safe: its MoE kernel is rebuilt on "
-            "reload, so weight-derived state held off-registry may be stale under "
-            "CUDA graphs.",
-            type(quant_method).__name__,
-            getattr(quant_method, "fp8_backend", None)
-            or getattr(quant_method, "mxfp4_backend", None)
-            or "",
-        )
-
-
 @torch.no_grad()
 def refresh_derived_state(model: torch.nn.Module) -> None:
     """Recompute weight-derived state in place after weights were written
@@ -1070,14 +1170,31 @@ def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:
         quant_method.refresh(layer)
 
 
-def add_reload_transform(
-    module: torch.nn.Module, transform: Callable[[torch.nn.Module], None]
+def attach_processing_plan(
+    module: torch.nn.Module, process: Callable[[torch.nn.Module], None]
 ) -> None:
-    """Register an output transform on `module`: on reload it runs on the
-    module's PWAL results, before they land in the live tensors. At cold start
-    the owner runs the same function where it does today."""
-    transforms = module.__dict__.setdefault("_reload_output_transforms", [])
-    transforms.append(transform)
+    """Attach another module's processing step to `module`.
+
+    Processing-plan convention (optional; the framework never requires one).
+    A PWAL that follows it:
+
+    1. creates its plan once, before anything changes the layer (at init or in
+       the first cold PWAL); the plan holds structural decisions only;
+    2. keeps the conversion in `plan.process(...)`, which maps checkpoint-format
+       tensors to kernel-format tensors and writes nothing else (not the layer's
+       attributes, not its config);
+    3. puts every other side effect (config writes, "already done" flags, the
+       kernel build) behind `if not is_reloading()`;
+    4. keeps weight-derived values in `refresh()`.
+
+    A quant method's PWAL re-runs on reload, so its plan needs nothing more.
+    A step that a parent applies to a child's tensors from a model-level hook
+    (which reload does not call) is attached here: at cold start the owner
+    calls `process(module)` itself; on reload the framework calls it on
+    `module`'s PWAL results, before they land. See `MegaAttnLayoutPlan`
+    (DeepSeek-V4.1) and `Fp8MoEProcessingPlan`."""
+    plans = module.__dict__.setdefault("_attached_processing_plans", [])
+    plans.append(process)
 
 
 def _use_per_expert(
@@ -1149,8 +1266,6 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     reloading = info.kernel_tensors is not None
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
-        if reloading:
-            _warn_if_not_reload_safe(layer, quant_method)
         with reload_mode() if reloading else nullcontext():
             if slots is not None:
                 quant_method.finish_experts(layer, slots.staging)  # type: ignore[attr-defined]
@@ -1169,13 +1284,13 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         with reload_mode():
             layer.process_weights_after_loading()
 
-    # Output transforms (kind B hooks, e.g. a parent's layout permute of this
-    # module's weights): applied to the PWAL results before landing, so the
+    # Attached processing plans (kind B hooks, e.g. a parent's layout permute of
+    # this module's weights): run on the PWAL results before landing, so the
     # live tensors receive the final layout exactly once.
     if reloading:
-        for transform in getattr(layer, "_reload_output_transforms", ()):
+        for process in getattr(layer, "_attached_processing_plans", ()):
             with reload_mode(), torch.no_grad():
-                transform(layer)
+                process(layer)
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)
@@ -1359,8 +1474,11 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     _place_kernel_tensors(layer, info)
 
 
-# Landing: strict by default in log-only mode; VLLM_RELOAD_STRICT_LANDING=1 raises
-STRICT_LANDING_RAISE = os.getenv("VLLM_RELOAD_STRICT_LANDING", "0") == "1"
+# Landing: a result whose shape, dtype or device differs from the live tensor
+# raises (copy_ would broadcast or convert); VLLM_RELOAD_STRICT_LANDING=0
+# downgrades it to a warning. A stride-only difference always warns: copy_
+# still writes the right values, in the live tensor's layout.
+STRICT_LANDING_RAISE = os.getenv("VLLM_RELOAD_STRICT_LANDING", "1") == "1"
 
 
 class LandingMismatchError(RuntimeError):
@@ -1394,9 +1512,14 @@ def _land(
     problem = check_exact_landing(dst, src)
     if problem is not None:
         msg = f"reload landing {type(layer).__name__}.{name}: {problem}"
-        if STRICT_LANDING_RAISE:
+        layout_only = (
+            dst.shape == src.shape
+            and dst.dtype == src.dtype
+            and dst.device == src.device
+        )
+        if STRICT_LANDING_RAISE and not layout_only:
             raise LandingMismatchError(msg)
-        logger.warning_once("Inexact %s (copy_ would broadcast/convert)", msg)
+        logger.warning_once("Inexact %s", msg)
     dst.data.copy_(src)
 
 

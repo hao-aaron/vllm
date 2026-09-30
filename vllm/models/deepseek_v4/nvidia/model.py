@@ -1816,9 +1816,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    param = params_dict[name]
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    param.weight_loader(param, narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:

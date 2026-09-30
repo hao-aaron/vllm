@@ -386,8 +386,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 if "attn_sink" in name:
                     if name not in params_dict:
                         continue
-                    narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
+                    param = params_dict[name]
+                    narrow_weight = loaded_weight[head_start:head_end]
+                    param.weight_loader(param, narrow_weight)
                     loaded_params.add(name)
                     continue
                 if ".shared_experts.w2" in name:

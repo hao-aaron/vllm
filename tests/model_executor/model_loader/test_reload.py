@@ -1790,7 +1790,7 @@ def test_mega_moe_reload_updates_transformed_weights(default_vllm_config, cls_na
 
 
 # ---------------------------------------------------------------------------
-# Modulewise reload, PR 2c: output transforms before landing
+# Modulewise reload, PR 2c: attached processing plans run before landing
 # ---------------------------------------------------------------------------
 
 
@@ -1814,13 +1814,13 @@ class _MegaAttnLike(torch.nn.Module):
 
     def __init__(self, register_transform):
         super().__init__()
-        from vllm.model_executor.model_loader.reload import add_reload_transform
+        from vllm.model_executor.model_loader.reload import attach_processing_plan
 
         self.heads = 2
         self.wq_b = _WqB(self.heads * 32, 8)
         self._fused_layouts_ready = False
         if register_transform:
-            add_reload_transform(self.wq_b, self._permute)
+            attach_processing_plan(self.wq_b, self._permute)
 
     def _permute(self, wq_b):
         from vllm.models.deepseek_v41.common.ops.fused_layout import permute_wq_b_
@@ -1828,14 +1828,17 @@ class _MegaAttnLike(torch.nn.Module):
         permute_wq_b_(wq_b.weight.data, wq_b.weight_scale.data, self.heads)
 
     def finalize_loaded_weights(self):
+        from vllm.model_executor.utils import is_reloading
+
         if self._fused_layouts_ready:
             return
         self._permute(self.wq_b)
-        self._fused_layouts_ready = True
+        if not is_reloading():
+            self._fused_layouts_ready = True
 
 
 @pytest.mark.parametrize("register_transform", [False, True])
-def test_reload_output_transform_permutes_before_landing(register_transform):
+def test_attached_processing_plan_permutes_before_landing(register_transform):
     from vllm.models.deepseek_v41.common.ops.fused_layout import q_fused_permutation
 
     parent = _MegaAttnLike(register_transform)
@@ -2777,7 +2780,7 @@ def test_reload_attention_scales_use_model_dtype(monkeypatch, dtype):
     layer = torch.nn.Module()
     method = object.__new__(BaseKVCacheMethod)
     layer.quant_method = method
-    info = SimpleNamespace(loaded_weights=[])
+    info = SimpleNamespace(loaded_weights=[], restore_device=torch.device("cpu"))
     seen = {}
 
     def create_weights(layer):
@@ -2970,3 +2973,121 @@ def test_refresh_derived_state_runs_declared_refreshes():
     model.local = _Local()
     refresh_derived_state(model)
     assert sorted(calls) == ["local", "quant:True"]
+
+
+# ---------------------------------------------------------------------------
+# Modulewise reload: fail closed for undeclared MoE methods, live-tensor
+# identity between updates, padding that keeps its create-time value
+# ---------------------------------------------------------------------------
+
+
+def _stub_moe_method(reload_safe: bool):
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+
+    class _StubMoEMethod(FusedMoEMethodBase):
+        def create_weights(self, layer, *a, **k):
+            pass
+
+        def get_fused_moe_quant_config(self, layer):
+            return None
+
+        def apply(self, layer, *a, **k):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            pass
+
+    method = _StubMoEMethod.__new__(_StubMoEMethod)
+    method.moe_kernel = object()  # a kernel was built at cold start
+    method.reload_safe = reload_safe
+    return method
+
+
+def _one_weight_model(quant_method=None):
+    layer = torch.nn.Module()
+    if quant_method is not None:
+        layer.quant_method = quant_method
+    w = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    w.weight_loader = default_weight_loader
+    layer.register_parameter("weight", w)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    return model, layer
+
+
+@pytest.mark.parametrize(
+    "graphs,reload_safe,allow,raises",
+    [
+        (True, False, False, True),
+        (True, True, False, False),  # declared
+        (False, False, False, False),  # eager: a rebuilt kernel is fine
+        (True, False, True, False),  # VLLM_RELOAD_ALLOW_UNSAFE_MOE=1
+    ],
+)
+def test_undeclared_moe_method_fails_closed_under_graphs(
+    monkeypatch, graphs, reload_safe, allow, raises
+):
+    from vllm.model_executor.model_loader.reload import abort_reload, is_model_dirty
+
+    monkeypatch.setattr(reload_layerwise, "_cudagraphs_captured", lambda: graphs)
+    monkeypatch.setattr(reload_layerwise, "ALLOW_UNSAFE_MOE", allow)
+    model, _ = _one_weight_model(_stub_moe_method(reload_safe))
+    if raises:
+        with pytest.raises(reload_layerwise.ReloadUnsafeModelError, match="_StubMoE"):
+            initialize_layerwise_reload(model)
+        assert not is_model_dirty(model)  # refused before any live write
+    else:
+        initialize_layerwise_reload(model)
+        abort_reload(model)
+
+
+@pytest.mark.parametrize("graphs", [True, False])
+def test_live_tensor_replaced_between_updates_is_caught(monkeypatch, graphs):
+    from vllm.model_executor.model_loader.reload import abort_reload, is_model_dirty
+
+    monkeypatch.setattr(reload_layerwise, "_cudagraphs_captured", lambda: graphs)
+    model, layer = _one_weight_model(_ProcessRecorder())
+
+    def update(value):
+        initialize_layerwise_reload(model)
+        layer.weight.weight_loader(layer.weight, torch.full((4, 4), value))
+        finalize_layerwise_reload(model, model_config=None)
+
+    update(1.0)
+    layer.weight.data.copy_(torch.full((4, 4), 2.0))  # in place: fine
+    update(3.0)
+    assert torch.equal(layer.weight, torch.full((4, 4), 3.0))
+
+    # replaced outside reload: graphs and built-once kernels hold the old one
+    layer.weight = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    layer.weight.weight_loader = default_weight_loader
+    if graphs:
+        with pytest.raises(reload_layerwise.ReloadUnsupportedError, match=r"0\.weight"):
+            initialize_layerwise_reload(model)
+        assert not is_model_dirty(model)
+    else:
+        initialize_layerwise_reload(model)  # eager: warns
+        abort_reload(model)
+
+
+def test_attn_sink_padding_keeps_neg_inf_on_reload():
+    from vllm.models.deepseek_v4.common.weight_loader import make_attn_sink
+
+    layer = torch.nn.Module()
+    layer.attn_sink = make_attn_sink(padded_heads=8, num_local_heads=6)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    sink = layer.attn_sink
+    sink.weight_loader(sink, torch.zeros(6))  # cold load
+    ptr = sink.data_ptr()
+
+    initialize_layerwise_reload(model)
+    new = torch.arange(6.0)
+    layer.attn_sink.weight_loader(layer.attn_sink, new)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert layer.attn_sink is sink and sink.data_ptr() == ptr
+    assert torch.equal(sink[:6], new)
+    assert torch.isneginf(sink[6:]).all()  # padding stays -inf, not zeros

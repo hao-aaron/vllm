@@ -28,8 +28,10 @@ logger = init_logger(__name__)
 class FusedMoEMethodBase(QuantizeMethodBase):
     # Modulewise reload: an instance that builds its kernel once (skipping the
     # rebuild under `reload_mode()`) and keeps all weight-derived state in
-    # declared, refreshable tensors sets this. Undeclared instances rebuild
-    # their kernel on every reload, as before.
+    # declared, refreshable tensors sets this; so does one with no derived
+    # state. Undeclared instances that built a kernel make reload fail closed
+    # under CUDA graphs (VLLM_RELOAD_ALLOW_UNSAFE_MOE=1: rebuild and warn).
+    # Reference: `Fp8MoEMethod` / `Fp8MoEProcessingPlan`.
     reload_safe: bool = False
 
     def refresh(self, layer: torch.nn.Module) -> None:

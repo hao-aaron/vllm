@@ -12,7 +12,17 @@ reads. Checksums, not logits, are compared: logits of separately started
 processes can differ (kernel selection), weights cannot.
 """
 
+import glob
+import json
+import os
+import shutil
+import zlib
+
 import pytest
+import torch
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 
 from vllm.platforms import current_platform
 
@@ -89,7 +99,15 @@ def test_refit_equals_fresh(
         pytest.skip("per-expert completion applies to online-quantized MoE")
     if "FP8" in model_a and _fp8_reload_unsupported():
         pytest.skip("Requires FP8 support")
+    _check_refit_equals_fresh(
+        vllm_runner, model_a, model_b, kwargs, direct_load, per_expert
+    )
 
+
+def _check_refit_equals_fresh(
+    vllm_runner, model_a, model_b, kwargs, direct_load=True, per_expert=False
+):
+    kwargs = dict(kwargs)
     common = dict(
         enable_prefix_caching=False,
         max_model_len=256,
@@ -97,7 +115,10 @@ def test_refit_equals_fresh(
         gpu_memory_utilization=0.4,
         worker_extension_cls=HARNESS,
         # graphs on; autotuning off keeps kernel choice stable across engines
-        kernel_config={"enable_flashinfer_autotune": False},
+        kernel_config={
+            "enable_flashinfer_autotune": False,
+            **kwargs.pop("kernel_config", {}),
+        },
         **kwargs,
     )
     with vllm_runner(model_b, **common) as fresh:
@@ -123,3 +144,206 @@ def test_refit_equals_fresh(
             f"rank {rank}: tensors moved (captured graphs read the old ones)"
         )
         assert st["end_over_base"] == 0, f"rank {rank}: reload left memory held"
+
+
+# ---------------------------------------------------------------------------
+# One case per MoE backend that declares `reload_safe` (SM100), plus FP8 KV.
+# B is derived from A (`make_variant`), so each case only needs A on the Hub. Generated
+# checkpoints go to VLLM_TEST_RELOAD_CKPT_DIR (reused across runs) or a
+# session temp dir; the 30B cases need ~35 GB each.
+# ---------------------------------------------------------------------------
+
+QWEN3_MOE_FP8 = "Qwen/Qwen3-30B-A3B-FP8"
+OLMOE = "allenai/OLMoE-1B-7B-0924"
+QWEN3_MOE = "Qwen/Qwen3-30B-A3B"
+DSV3_CT_FP8 = "inference-optimization/DeepSeek-V3-debug-empty-FP8_DYNAMIC"
+NVFP4_MODELOPT = "nvidia/Qwen3-30B-A3B-NVFP4"
+NVFP4_CT = "RedHatAI/Qwen3-30B-A3B-NVFP4"
+
+
+def _backend(name, recipe, source, moe_backend, **kwargs):
+    kernel_config = {"moe_backend": moe_backend} if moe_backend else {}
+    return pytest.param(
+        recipe,
+        source,
+        {"kernel_config": kernel_config, **kwargs},
+        id=f"{name}-{moe_backend or 'default'}",
+        marks=[pytest.mark.slow_test],
+    )
+
+
+BACKEND_CASES = [
+    # Fp8MoEMethod, block FP8
+    *(
+        _backend("fp8-block", "hub", QWEN3_MOE_FP8, b)
+        # (FlashInfer CUTLASS doesn't support block FP8 MoE on SM100)
+        for b in ("triton", "deep_gemm", "flashinfer_trtllm")
+    ),
+    # Fp8MoEMethod, per-tensor FP8 with static activation scales
+    *(
+        _backend("fp8-tensor-static", "fp8_static", OLMOE, b)
+        for b in ("triton", "flashinfer_cutlass")
+    ),
+    # (TRT-LLM's per-tensor FP8 MoE kernel doesn't support OLMoE's routing)
+    _backend("fp8-tensor-static", "fp8_static", QWEN3_MOE, "flashinfer_trtllm"),
+    # compressed-tensors W8A8 FP8 MoE
+    *(
+        _backend("ct-fp8", "hub", DSV3_CT_FP8, b)
+        # (FlashInfer CUTLASS doesn't support per-channel FP8 MoE)
+        for b in ("triton", "cutlass")
+    ),
+    # MXFP4
+    *(
+        _backend("mxfp4", "hub", "openai/gpt-oss-20b", b)
+        for b in ("triton", "flashinfer_trtllm")
+    ),
+    # NVFP4 on FlashInfer TRT-LLM (ModelOpt and compressed-tensors)
+    _backend("nvfp4-modelopt", "hub", NVFP4_MODELOPT, "flashinfer_trtllm"),
+    _backend("nvfp4-ct", "hub", NVFP4_CT, "flashinfer_trtllm"),
+    # FP8 KV cache: attention q/k/v scales are recreated and landed on reload
+    _backend("fp8-kv", "hub", "nm-testing/Llama-3.2-1B-Instruct-FP8-KV", None),
+]
+
+
+@pytest.fixture(scope="session")
+def reload_ckpt_dir(tmp_path_factory):
+    root = os.environ.get("VLLM_TEST_RELOAD_CKPT_DIR")
+    return root or str(tmp_path_factory.mktemp("reload_ckpts"))
+
+
+@pytest.mark.parametrize("recipe,source,kwargs", BACKEND_CASES)
+def test_moe_backend_refit_equals_fresh(
+    vllm_runner, reload_ckpt_dir, recipe, source, kwargs
+):
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA graphs and device-tensor streaming")
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("backend matrix is for SM100")
+    slug = source.replace("/", "--")
+    if recipe == "fp8_static":
+        model_a = make_fp8_static(source, os.path.join(reload_ckpt_dir, f"{slug}-fp8s"))
+    else:
+        model_a = source
+    model_b = make_variant(model_a, os.path.join(reload_ckpt_dir, f"{slug}-{recipe}-B"))
+    _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+_DONE = ".reload_checkpoint_done"
+
+
+def _source_dir(src: str) -> str:
+    return src if os.path.isdir(src) else snapshot_download(src)
+
+
+def _copy_non_weights(src: str, dst: str, skip=()) -> None:
+    os.makedirs(dst, exist_ok=True)
+    for f in os.listdir(src):
+        p = os.path.join(src, f)
+        if os.path.isfile(p) and not f.endswith(".safetensors") and f not in skip:
+            shutil.copy(p, os.path.join(dst, f))
+
+
+def make_variant(src: str, dst: str, eps: float = 0.02) -> str:
+    """A perturbed copy of `src` in the same format: float weights get
+    multiplicative noise, float scales x1.1 (input scales x1.25), and 1-byte
+    stacked expert tensors ([E, ...]) are rolled by one expert. Noise is seeded
+    per tensor name, and a tied `lm_head` gets the embedding's noise, so tied
+    checkpoints stay consistent."""
+    if os.path.exists(os.path.join(dst, _DONE)):
+        return dst
+    src = _source_dir(src)
+    _copy_non_weights(src, dst)
+    with open(os.path.join(src, "config.json")) as f:
+        cfg = json.load(f)
+    tied = cfg.get("tie_word_embeddings", False)
+    for fn in sorted(glob.glob(os.path.join(src, "*.safetensors"))):
+        out = {}
+        for k, t in load_file(fn).items():
+            if t.is_floating_point() and t.element_size() >= 2:
+                if "input_scale" in k:
+                    t = t * 1.25
+                elif "scale" in k:
+                    t = t * 1.1
+                else:
+                    name = (
+                        "model.embed_tokens.weight"
+                        if tied and k == "lm_head.weight"
+                        else k
+                    )
+                    g = torch.Generator().manual_seed(zlib.crc32(name.encode()))
+                    n = torch.randn(t.shape, generator=g, dtype=torch.float32)
+                    t = (t.float() * (1 + eps * n)).to(t.dtype)
+            elif "experts" in k and t.dim() >= 3:
+                t = torch.roll(t, 1, dims=0)
+            out[k] = t.contiguous()
+        save_file(out, os.path.join(dst, os.path.basename(fn)), {"format": "pt"})
+    open(os.path.join(dst, _DONE), "w").close()
+    return dst
+
+
+_FP8_PROJECTIONS = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
+def make_fp8_static(src: str, dst: str) -> str:
+    """Quantize a BF16 checkpoint to serialized per-tensor FP8 with static
+    activation scales (`quant_method: fp8`, `activation_scheme: static`), the
+    `Fp8MoEMethod` per-tensor path. Activation scales are synthetic
+    (deterministic, per module), which is enough for refit-equals-fresh."""
+    if os.path.exists(os.path.join(dst, _DONE)):
+        return dst
+    src = _source_dir(src)
+    _copy_non_weights(src, dst, skip=("model.safetensors.index.json",))
+    cfg_path = os.path.join(dst, "config.json")
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    # MoE routers stay unquantized: vLLM would quantize them without scales
+    routers = sorted(
+        k[: -len(".weight")]
+        for fn in glob.glob(os.path.join(src, "*.safetensors"))
+        for k in safe_open(fn, "pt").keys()  # noqa: SIM118
+        if k.endswith(".mlp.gate.weight")
+    )
+    cfg["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "static",
+        "ignored_layers": ["lm_head", *routers],
+    }
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    weight_map = {}
+    for fn in sorted(glob.glob(os.path.join(src, "*.safetensors"))):
+        out = {}
+        for k, t in load_file(fn).items():
+            if (
+                k.endswith(".weight")
+                and t.dim() == 2
+                and any(f".{p}." in k for p in _FP8_PROJECTIONS)
+            ):
+                w = t.float()
+                scale = w.abs().max().clamp(min=1e-8) / fp8_max
+                base = k[: -len(".weight")]
+                out[k] = (w / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+                out[base + ".weight_scale"] = scale.reshape(()).float()
+                out[base + ".input_scale"] = (0.01 + 0.05 * w.abs().mean()).reshape(())
+            else:
+                out[k] = t.contiguous()
+        name = os.path.basename(fn)
+        save_file(out, os.path.join(dst, name), {"format": "pt"})
+        weight_map.update(dict.fromkeys(out, name))
+    with open(os.path.join(dst, "model.safetensors.index.json"), "w") as f:
+        json.dump({"metadata": {}, "weight_map": weight_map}, f)
+    open(os.path.join(dst, _DONE), "w").close()
+    return dst
