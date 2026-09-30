@@ -110,7 +110,11 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
 
         # Backends verified to read the (landed) layer weights and scales
         # through the quant config, with no other weight-derived state.
-        self.reload_safe = self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
+        self.reload_safe = self.fp8_backend in (
+            Fp8MoeBackend.FLASHINFER_TRTLLM,
+            Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.MARLIN,
+        )
 
     def create_weights(
         self,

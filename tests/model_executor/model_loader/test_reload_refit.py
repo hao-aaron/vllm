@@ -209,6 +209,12 @@ BACKEND_CASES = [
             "marlin",
         )
     ),
+    # online MXFP8 (BF16 checkpoint, quantized at load)
+    *(
+        _backend("online-mxfp8", "hub", OLMOE, b, quantization="mxfp8")
+        # (TRITON_MXFP8 doesn't run on SM100)
+        for b in ("flashinfer_trtllm", "deep_gemm", "marlin")
+    ),
     # FP8 KV cache: attention q/k/v scales are recreated and landed on reload
     _backend("fp8-kv", "hub", "nm-testing/Llama-3.2-1B-Instruct-FP8-KV", None),
 ]
