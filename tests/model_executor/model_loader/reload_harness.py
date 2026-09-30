@@ -55,6 +55,19 @@ def _read_names(files: list[str]) -> list[tuple[str, str]]:
     return out
 
 
+def _stream_load(model, weights):
+    """`load_weights` the way the weight transfer engines call it: each call is
+    one streamed batch, so whole-checkpoint MTP completeness checks are off."""
+    try:
+        from vllm.model_executor.model_loader.mtp_validation import (
+            disable_mtp_completeness_check,
+        )
+    except ImportError:  # a baseline without the check
+        from contextlib import nullcontext as disable_mtp_completeness_check
+    with disable_mtp_completeness_check():
+        return model.load_weights(weights)
+
+
 def _layer_index(name: str) -> int:
     m = re.search(r"\.layers\.(\d+)\.", name)
     return int(m.group(1)) if m else -1
@@ -335,7 +348,7 @@ class ReloadHarnessExtension:
                         while batch:
                             yield batch.pop(0)
 
-                    model.load_weights(gen())
+                    _stream_load(model, gen())
                     del batch
                     sent += len(refs)
                     if fail_after is not None and sent >= fail_after:
@@ -428,7 +441,7 @@ class ReloadHarnessExtension:
                 t = torch.empty(shape, dtype=dtype, device="meta")
                 incoming[name] = t.numel() * t.element_size()
                 try:
-                    model.load_weights([(name, t)])
+                    _stream_load(model, [(name, t)])
                 except Exception as e:  # e.g. a loader that bypasses reload
                     errors[name] = f"{type(e).__name__}: {e}"[:200]
             totals = {modname[id(m)]: n for m, n in trace._totals.items()}
@@ -490,7 +503,7 @@ class ReloadHarnessExtension:
                         (n, handles[fn].get_tensor(n).to(device))
                         for n, fn in names[i : i + batch_size]
                     ]
-                    model.load_weights(iter(batch))
+                    _stream_load(model, iter(batch))
         except BaseException as e:  # noqa: BLE001
             self._abort_weight_update()
             out["error"] = f"update: {type(e).__name__}: {e}"[:400]
@@ -524,4 +537,4 @@ class ReloadHarnessExtension:
                     (n, handles[fn].get_tensor(n).to(device))
                     for n, fn in names[i : i + batch_size]
                 ]
-                model.load_weights(iter(batch))
+                _stream_load(model, iter(batch))

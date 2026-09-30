@@ -531,7 +531,12 @@ class DeepSeekV4MTP(nn.Module):
                     f"Use a checkpoint that includes MTP layer weights, "
                     f"or disable speculative decoding."
                 )
-        self.process_weights_after_loading()
+        # A streamed reload calls load_weights per batch; MegaMoE's reload
+        # transform runs per module instead.
+        from vllm.model_executor.model_loader.reload import is_reload_active
+
+        if not is_reload_active(self):
+            self.process_weights_after_loading()
         logger.info_once("MTP draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
