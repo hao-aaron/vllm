@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    RELOAD_SAFE_NVFP4_MOE_BACKENDS,
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
@@ -65,9 +66,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             weight_key=kNvfp4Static,
             activation_key=None if use_a16 else kNvfp4Dynamic,
         )
-        # Modulewise reload: TRTLLM reads registered layer tensors through the
-        # quant config and keeps its derived values in registered parameters.
-        self.reload_safe = self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
+        self.reload_safe = self.nvfp4_backend in RELOAD_SAFE_NVFP4_MOE_BACKENDS
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
@@ -253,7 +252,9 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             ("w13_input_scale", a13_scale),
             ("w2_input_scale", a2_scale),
         ):
-            if isinstance(getattr(layer, name, None), torch.nn.Parameter):
+            if scale is None:  # the backend has none (e.g. Marlin)
+                layer.register_parameter(name, None)
+            elif isinstance(getattr(layer, name, None), torch.nn.Parameter):
                 replace_parameter(layer, name, scale)
             else:
                 layer.register_parameter(

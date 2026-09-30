@@ -52,6 +52,16 @@ class NvFp4MoeBackend(Enum):
     EMULATION = "EMULATION"
 
 
+# Modulewise reload: backends built once whose weight-derived state is read
+# from registered layer tensors or refreshed in place (`FusedMoEMethodBase`).
+RELOAD_SAFE_NVFP4_MOE_BACKENDS = (
+    NvFp4MoeBackend.FLASHINFER_TRTLLM,
+    NvFp4MoeBackend.FLASHINFER_CUTLASS,
+    NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+    NvFp4MoeBackend.VLLM_CUTLASS,
+    NvFp4MoeBackend.MARLIN,
+)
+
 FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_TRTLLM,
     NvFp4MoeBackend.FLASHINFER_CUTLASS,

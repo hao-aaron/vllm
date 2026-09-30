@@ -197,9 +197,18 @@ BACKEND_CASES = [
         _backend("mxfp4", "hub", "openai/gpt-oss-20b", b)
         for b in ("triton", "flashinfer_trtllm")
     ),
-    # NVFP4 on FlashInfer TRT-LLM (ModelOpt and compressed-tensors)
-    _backend("nvfp4-modelopt", "hub", NVFP4_MODELOPT, "flashinfer_trtllm"),
-    _backend("nvfp4-ct", "hub", NVFP4_CT, "flashinfer_trtllm"),
+    # NVFP4 (ModelOpt and compressed-tensors)
+    *(
+        _backend(name, "hub", src, b)
+        for name, src in (("nvfp4-modelopt", NVFP4_MODELOPT), ("nvfp4-ct", NVFP4_CT))
+        for b in (
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_cutedsl",
+            "cutlass",
+            "marlin",
+        )
+    ),
     # FP8 KV cache: attention q/k/v scales are recreated and landed on reload
     _backend("fp8-kv", "hub", "nm-testing/Llama-3.2-1B-Instruct-FP8-KV", None),
 ]
