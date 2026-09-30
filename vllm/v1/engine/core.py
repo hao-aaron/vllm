@@ -2284,6 +2284,16 @@ class DPEngineCoreProc(EngineCoreProc):
                         new_wave,
                     )
                     self.engines_running = True
+        elif request_type == EngineCoreRequestType.ADD and self._weights_dirty:
+            # Rejected (error output), but joins the wave like a request that
+            # finished at once: peers' collectives need this rank's dummy
+            # batches, and the client waits for the wave to complete.
+            super()._handle_client_request(request_type, request)
+            if (
+                not self.engines_running
+                and self.scheduler.pause_state == PauseState.UNPAUSED
+            ):
+                self.engines_running = True
         else:
             super()._handle_client_request(request_type, request)
 

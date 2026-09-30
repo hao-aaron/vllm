@@ -100,3 +100,27 @@ def test_dp_engine_not_auto_paused():
     engine = _engine(dp=2)
     engine.collective_rpc("start_weight_update")
     assert engine.scheduler.pause_state == PauseState.UNPAUSED
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_dp_dirty_engine_rejects_but_joins_wave(paused):
+    """A dirty DP engine answers an add with an error and still steps the wave
+    (dummy batches): peers' collectives need it, and the offline client waits
+    for the wave to complete (it hung before)."""
+    from vllm.v1.engine import EngineCoreRequestType
+    from vllm.v1.engine.core import DPEngineCoreProc
+
+    engine = object.__new__(DPEngineCoreProc)
+    engine.scheduler = _Scheduler()
+    if paused:
+        engine.scheduler.pause_state = PauseState.PAUSED_ALL
+    engine._weights_dirty = True
+    engine.engines_running = False
+    engine.shutdown_state = None
+    engine._reject_add_in_shutdown = lambda req: False
+    errors = []
+    engine._send_error_outputs_to_client = lambda ids, idx: errors.append(ids)
+    req = SimpleNamespace(request_id="r", client_index=0)
+    engine._handle_client_request(EngineCoreRequestType.ADD, (req, 0))
+    assert errors == [["r"]]
+    assert engine.engines_running is not paused
