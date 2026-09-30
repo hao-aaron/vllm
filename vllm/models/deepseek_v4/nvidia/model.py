@@ -540,6 +540,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         # As at cold start, the loader param holds the interleaved copy and its
         # own PWAL runs on it (the serial shared MLP is never called)
         weight.copy_(l1_w)
+        assert self._transformed_shared_l1_weights is not None
         live_w, live_sf = self._transformed_shared_l1_weights
         if live_w.data_ptr() != weight.data_ptr():
             live_w.copy_(l1_w)
@@ -550,6 +551,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         deep_gemm = _import_deep_gemm()
         weight = down.weight.data
+        assert self._transformed_shared_l2_weights is not None
         live_w, live_sf = self._transformed_shared_l2_weights
         if live_w.data_ptr() != weight.data_ptr():
             live_w.copy_(weight)
