@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -105,7 +106,11 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
 )
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import (
+    is_reloading,
+    replace_parameter,
+    set_weight_attrs,
+)
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -650,6 +655,16 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
             weight_key=self.weight_quant_key,
             activation_key=self.activation_quant_key,
         )
+        # Build-once backends (as `Fp8MoEMethod`): the kernel keeps reading the
+        # live tensors and its weight-derived state is refreshed in place.
+        self.reload_safe = self.fp8_backend in (
+            Fp8MoeBackend.FLASHINFER_CUTLASS,
+            Fp8MoeBackend.FLASHINFER_TRTLLM,
+            Fp8MoeBackend.TRITON,
+            Fp8MoeBackend.DEEPGEMM,
+        )
+        # The checkpoint's w1/w3 shard size, taken before any backend padding
+        self._w13_shard_size: int | None = None
 
         self.model_type = getattr(
             get_current_vllm_config().model_config.hf_config, "model_type", None
@@ -877,7 +892,9 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
         # for w13 per expert. Use max then dequant and requant each expert.
         if self.weight_qscheme == "per_tensor":
             assert layer.w13_weight_scale is not None
-            shard_size = layer.intermediate_size_per_partition
+            if self._w13_shard_size is None:
+                self._w13_shard_size = layer.intermediate_size_per_partition
+            shard_size = self._w13_shard_size
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
 
             # For gpt_oss, w1 and w3 are fused into a single combined
@@ -942,6 +959,10 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
 
+        # Build once: under reload the framework lands the new values in the
+        # live tensors the kernel (and captured graphs) read, then refreshes.
+        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+            return
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
