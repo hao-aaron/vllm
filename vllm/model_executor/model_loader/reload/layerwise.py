@@ -1227,9 +1227,13 @@ def attach_processing_plan(
     plans.append((stage, process))
 
 
-def _run_attached_plans(layer: torch.nn.Module, stage: str) -> None:
+def _run_attached_plans(
+    layer: torch.nn.Module, info: LayerReloadingInfo, stage: str
+) -> None:
     for plan_stage, process in getattr(layer, "_attached_processing_plans", ()):
         if plan_stage == stage:
+            # a plan may refill live tensors its owner's kernel reads
+            _mark_dirty(info)
             with reload_mode(), torch.no_grad():
                 process(layer)
 
@@ -1302,7 +1306,7 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     # reload mode: kernel objects are built once, `replace_parameter` rebinds.
     reloading = info.kernel_tensors is not None
     if reloading:
-        _run_attached_plans(layer, "checkpoint")
+        _run_attached_plans(layer, info, "checkpoint")
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
         with reload_mode() if reloading else nullcontext():
@@ -1326,7 +1330,7 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     # Kernel-stage attached plans run on the PWAL results before landing, so
     # the live tensors receive the final layout exactly once.
     if reloading:
-        _run_attached_plans(layer, "kernel")
+        _run_attached_plans(layer, info, "kernel")
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)

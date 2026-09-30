@@ -492,6 +492,72 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             transformed_l1[1],
         )
         self._transformed_shared_l2_weights = transformed_l2
+        self._attach_shared_expert_reload(deep_gemm, shared_experts)
+
+    # Modulewise reload of the fused shared expert. The fusion runs at cold
+    # start from the model hook on the shared expert's checkpoint-format
+    # tensors, before its own PWAL. On reload each shared-expert linear redoes
+    # its half at the same point (a checkpoint-stage processing plan) and
+    # refills the tensors the MegaMoE kernel reads, in place.
+    def _attach_shared_expert_reload(self, deep_gemm, shared_experts) -> None:
+        mega = getattr(deep_gemm, "mega", None)
+        if not (
+            hasattr(mega, "_interleave_weights")
+            and hasattr(mega, "_transpose_sf_for_utccp")
+        ):
+            return  # reload stays fail-closed (mega_moe_reload_safe)
+        from vllm.model_executor.model_loader.reload import attach_processing_plan
+
+        attach_processing_plan(shared_experts.gate_up_proj, self._refill_shared_l1)
+        attach_processing_plan(shared_experts.down_proj, self._refill_shared_l2)
+        self._shared_expert_reload_attached = True
+
+    def _shared_scale_1x32(self, deep_gemm, linear: nn.Module) -> torch.Tensor:
+        scale = (
+            linear.weight_scale
+            if hasattr(linear, "weight_scale")
+            else linear.weight_scale_inv
+        ).data
+        if scale.dtype not in (torch.float8_e8m0fnu, torch.uint8):
+            return scale
+        weight = linear.weight.data
+        out = self._prepare_shared_expert_scale(
+            deep_gemm, linear, scale, weight.shape[0], weight.shape[1]
+        )
+        assert out is not None
+        return out
+
+    def _refill_shared_l1(self, gate_up: nn.Module) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        mega = deep_gemm.mega
+        weight = gate_up.weight.data
+        l1_w = mega._interleave_weights(weight).contiguous()
+        l1_sf = mega._transpose_sf_for_utccp(
+            mega._interleave_weights(self._shared_scale_1x32(deep_gemm, gate_up))
+        )
+        # As at cold start, the loader param holds the interleaved copy and its
+        # own PWAL runs on it (the serial shared MLP is never called)
+        weight.copy_(l1_w)
+        live_w, live_sf = self._transformed_shared_l1_weights
+        if live_w.data_ptr() != weight.data_ptr():
+            live_w.copy_(l1_w)
+        live_sf.copy_(l1_sf)
+
+    def _refill_shared_l2(self, down: nn.Module) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        weight = down.weight.data
+        live_w, live_sf = self._transformed_shared_l2_weights
+        if live_w.data_ptr() != weight.data_ptr():
+            live_w.copy_(weight)
+        live_sf.copy_(
+            deep_gemm.mega._transpose_sf_for_utccp(
+                self._shared_scale_1x32(deep_gemm, down)
+            )
+        )
 
     def _prepare_shared_expert_scale(
         self,
@@ -634,9 +700,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         model hook, after the whole stream)."""
         assert is_reloading(), "cold start finalizes from the model hook"
         assert self._transformed_l1_weights is not None
-        assert not self.has_fused_shared_experts, (
-            "MegaMoE shared-expert fusion is not reload-safe"
-        )
+        assert not self.has_fused_shared_experts or getattr(
+            self, "_shared_expert_reload_attached", False
+        ), "MegaMoE shared-expert fusion without its reload steps"
         l1, l2 = self._mega_transform()
         # Results become landing targets; the live buffers keep their storage
         # and `_transformed_*` keep referencing them.
@@ -1217,12 +1283,17 @@ def is_dropped_mega_weight(model: nn.Module, name: str) -> bool:
 
 def mega_moe_reload_safe(model: nn.Module) -> bool:
     """Whether every MegaMoE experts module of `model` redoes its transform
-    per module on reload. MegaMoE shared-expert fusion (reads another
-    module's checkpoint tensors) and the FlashInfer MoE-EP experts (weights
-    held in a FlashInfer object) fail closed."""
+    per module on reload. Shared-expert fusion is redone by processing plans
+    attached to the shared expert's linears; it fails closed only if those
+    could not be attached (an older DeepGEMM). The FlashInfer MoE-EP experts
+    (weights held in a FlashInfer object) fail closed."""
     for module in model.modules():
         if isinstance(module, DeepseekV4MegaMoEExperts) and (
-            module.has_fused_shared_experts or not module.reload_outputs
+            (
+                module.has_fused_shared_experts
+                and not getattr(module, "_shared_expert_reload_attached", False)
+            )
+            or not module.reload_outputs
         ):
             return False
     return True

@@ -53,6 +53,9 @@ _RELOAD_SAFE_MXFP4_BACKENDS = (
     Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
     Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
     Mxfp4MoeBackend.TRITON,
+    # weights and packed scales are registered; the experts keep no
+    # weight-derived state (verified bitwise on tiny Kimi K3)
+    Mxfp4MoeBackend.DEEPGEMM_MXFP4,
 )
 
 
