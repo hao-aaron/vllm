@@ -1627,8 +1627,17 @@ def test_model_hook_fail_closed_and_model_phase_refresh(monkeypatch):
     layer = _ExpertLayer(device="cpu")
     unsafe = _HookModel(layer)
     record_metadata_for_reloading(unsafe)
+    warnings = []
+    monkeypatch.setattr(
+        reload_layerwise.logger, "warning", lambda *a: warnings.append(a[1])
+    )
+    initialize_layerwise_reload(unsafe)  # warns loudly by default
+    assert warnings and "_HookModel" in warnings[0]
+    reload_layerwise.abort_reload(unsafe)
+    monkeypatch.setattr(reload_layerwise, "STRICT_MODEL_HOOK", True)
     with pytest.raises(reload_layerwise.ReloadUnsafeModelError):
         initialize_layerwise_reload(unsafe)
+    monkeypatch.setattr(reload_layerwise, "STRICT_MODEL_HOOK", False)
 
     layer = _ExpertLayer(device="cpu")
     model = _HookModel(layer, reload_safe=True)

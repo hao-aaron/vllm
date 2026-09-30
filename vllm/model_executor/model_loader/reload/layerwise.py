@@ -250,10 +250,10 @@ def initialize_layerwise_reload(
 
 
 # Reload never calls the free-form model hook `model.process_weights_after_loading()`
-# (cold start only). A model that has one must declare `reload_safe = True`
-# (its reload work lives in module-level PWAL / `refresh()`), else reload fails
-# closed. VLLM_RELOAD_ALLOW_UNSAFE_MODEL_HOOK=1 downgrades this to a warning.
-ALLOW_UNSAFE_MODEL_HOOK = os.getenv("VLLM_RELOAD_ALLOW_UNSAFE_MODEL_HOOK", "0") == "1"
+# (cold start only). A model that has one should declare `reload_safe = True`
+# (its reload work lives in module-level PWAL / `refresh()`). Undeclared hooks
+# warn loudly on every update; VLLM_RELOAD_STRICT_MODEL_HOOK=1 raises instead.
+STRICT_MODEL_HOOK = os.getenv("VLLM_RELOAD_STRICT_MODEL_HOOK", "0") == "1"
 
 
 class ReloadUnsafeModelError(RuntimeError):
@@ -272,13 +272,14 @@ def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
     msg = (
         f"{type(model).__name__} has a model-level process_weights_after_loading() "
         "hook, which reload does not call, and does not declare reload_safe. Its "
-        "post-load work would not be redone on reload (stale or wrong weights). "
-        "Set VLLM_RELOAD_ALLOW_UNSAFE_MODEL_HOOK=1 to reload anyway."
+        "post-load work is NOT redone by this weight update, so the model may "
+        "serve stale or wrong weights. Convert the hook (module-level PWAL / "
+        "refresh()) and declare reload_safe; VLLM_RELOAD_STRICT_MODEL_HOOK=1 "
+        "makes this an error."
     )
-    if ALLOW_UNSAFE_MODEL_HOOK:
-        logger.warning_once(msg)
-        return
-    raise ReloadUnsafeModelError(msg)
+    if STRICT_MODEL_HOOK:
+        raise ReloadUnsafeModelError(msg)
+    logger.warning("UNSAFE WEIGHT UPDATE: %s", msg)
 
 
 # MoE methods that don't declare `reload_safe` rebuild their kernel on reload.
