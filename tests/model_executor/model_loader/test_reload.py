@@ -1781,6 +1781,43 @@ def test_unloaded_scale_keeps_create_time_sentinel():
 
 
 @requires_cuda
+def test_trtllm_mxfp4_situ_constants_refresh_in_place():
+    """The per-expert gemm1 constants are allocated once and refilled by
+    refresh() (a rebuilt kernel used to allocate fresh ones while a captured
+    graph kept reading the freed ones)."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+        TrtLlmMxfp4ExpertsBase,
+    )
+
+    moe_config = SimpleNamespace(
+        routing_method=None,
+        experts_per_token=2,
+        intermediate_size_per_partition=256,
+        hidden_dim=512,
+        hidden_dim_unpadded=512,
+        num_local_experts=4,
+        moe_parallel_config=SimpleNamespace(ep_rank=0),
+        activation=MoEActivation.SITU,
+        activation_situ_beta=1.5,
+        activation_situ_linear_beta=0.75,
+    )
+    quant_config = SimpleNamespace(
+        gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None
+    )
+    experts = object.__new__(TrtLlmMxfp4ExpertsBase)
+    TrtLlmMxfp4ExpertsBase.__init__(experts, moe_config, quant_config)
+    ptrs = (experts.gemm1_alpha.data_ptr(), experts.gemm1_beta.data_ptr())
+    assert torch.equal(experts.gemm1_alpha, torch.full((4,), 1.5, device="cuda"))
+    assert torch.equal(experts.gemm1_beta, torch.full((4,), 0.75, device="cuda"))
+    assert experts.gemm1_clamp_limit is None
+    experts.gemm1_alpha.zero_()  # e.g. garbage after an old path
+    experts.refresh()
+    assert torch.equal(experts.gemm1_alpha, torch.full((4,), 1.5, device="cuda"))
+    assert ptrs == (experts.gemm1_alpha.data_ptr(), experts.gemm1_beta.data_ptr())
+
+
+@requires_cuda
 def test_fused_router_gate_refresh_in_place():
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -1903,6 +1940,37 @@ def test_full_vs_partial_update(partial, send_proj):
     assert model.lm_head.weight is model.embed.weight
     expected = 3.0 if send_proj else 0.0  # untouched modules keep old weights
     assert torch.equal(model.proj.weight, torch.full((2, 2), expected))
+
+
+def test_nvfp4_quant_config_gscales_refresh_in_place():
+    """NVFP4 MoE: a1/a2_gscale (= 1 / activation scale) are copies the quant
+    config derives; refresh() recomputes them in place from the (landed)
+    activation scales, with the same expression as at build time."""
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        NvFp4MoeBackend,
+        make_nvfp4_moe_quant_config,
+    )
+
+    E = 4
+    a13, a2 = torch.full((E,), 0.5), torch.full((E,), 0.25)
+    qc = make_nvfp4_moe_quant_config(
+        backend=NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        w13_scale=torch.ones(E, 8, 2),
+        w2_scale=torch.ones(E, 4, 2),
+        w13_scale_2=torch.ones(E),
+        w2_scale_2=torch.ones(E),
+        a13_scale=a13,
+        a2_scale=a2,
+    )
+    g1, g2 = qc.a1_gscale, qc.a2_gscale
+    assert torch.equal(g1, 1.0 / a13) and torch.equal(g2, 1.0 / a2)
+    ptrs = (g1.data_ptr(), g2.data_ptr())
+    a13.fill_(0.3)  # a reload lands new activation scales in place
+    a2.fill_(0.7)
+    qc.refresh()
+    assert (qc.a1_gscale.data_ptr(), qc.a2_gscale.data_ptr()) == ptrs
+    assert torch.equal(qc.a1_gscale, 1.0 / a13)
+    assert torch.equal(qc.a2_gscale, 1.0 / a2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

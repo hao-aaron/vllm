@@ -40,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    RELOAD_SAFE_NVFP4_MOE_BACKENDS,
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
@@ -102,6 +103,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import (
+    is_reloading,
     is_weights_pre_processed,
     replace_parameter,
     set_weight_attrs,
@@ -845,6 +847,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             weight_key=kNvfp4Static,
             activation_key=None if self.use_a16 else kNvfp4Dynamic,
         )
+        self.reload_safe = self.nvfp4_backend in RELOAD_SAFE_NVFP4_MOE_BACKENDS
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
@@ -1029,15 +1032,18 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        assert self.experts_cls is not None
-        self.moe_kernel = make_nvfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-            backend=self.nvfp4_backend,
-            routing_tables=layer._expert_routing_tables(),
-        )
+        if not (is_reloading() and self.reload_safe and self.moe_kernel is not None):
+            # built once; on reload landing updates what it reads in place
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.experts_cls is not None
+            self.moe_kernel = make_nvfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                backend=self.nvfp4_backend,
+                routing_tables=layer._expert_routing_tables(),
+            )
+        # the experts' scale folding runs on every (re)load
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:

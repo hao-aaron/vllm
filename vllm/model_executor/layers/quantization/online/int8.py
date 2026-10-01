@@ -28,7 +28,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
     weight_amax,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import is_reloading, replace_parameter
 
 
 class Int8OnlineMoEMethod(OnlineMoEMethodBase):
@@ -47,6 +47,11 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
             weight_key=kInt8StaticChannelSym,
             activation_key=kInt8DynamicTokenSym,
         )
+        from vllm.model_executor.layers.fused_moe.oracle.int8 import Int8MoeBackend
+
+        # Triton reads the (landed) layer weights and scales through the quant
+        # config: nothing weight-derived lives in the kernel.
+        self.reload_safe = self.int8_backend == Int8MoeBackend.TRITON
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -109,16 +114,19 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w2_weight", w2)
 
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        assert self.moe_quant_config is not None
-        assert self.experts_cls is not None
-        self.moe_kernel = make_int8_moe_kernel(
-            int8_backend=self.int8_backend,
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-            routing_tables=layer._expert_routing_tables(),
-        )
+        if not (is_reloading() and self.reload_safe and self.moe_kernel is not None):
+            # built once; on reload landing + refresh() update it in place
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
+            assert self.experts_cls is not None
+            self.moe_kernel = make_int8_moe_kernel(
+                int8_backend=self.int8_backend,
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+            )
+        # the experts' own weight transform runs on every (re)load
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(

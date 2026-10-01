@@ -60,12 +60,7 @@ CASES = [
         "allenai/OLMoE-1B-7B-0924-Instruct",
         {"quantization": "fp8_per_tensor"},
         id="online-fp8-moe",
-        marks=[
-            pytest.mark.slow_test,
-            pytest.mark.xfail(
-                strict=True, reason="online FP8 MoE rebuilds its kernel on reload"
-            ),
-        ],
+        marks=[pytest.mark.slow_test],
     ),
 ]
 
@@ -179,6 +174,35 @@ BACKEND_CASES = [
     ),
     # (TRT-LLM's per-tensor FP8 MoE kernel doesn't support OLMoE's routing)
     _backend("fp8-tensor-static", "fp8_static", QWEN3_MOE, "flashinfer_trtllm"),
+    # compressed-tensors W8A8 FP8 MoE
+    *(
+        _backend("ct-fp8", "hub", DSV3_CT_FP8, b)
+        # (FlashInfer CUTLASS doesn't support per-channel FP8 MoE)
+        for b in ("triton", "cutlass")
+    ),
+    # MXFP4
+    *(
+        _backend("mxfp4", "hub", "openai/gpt-oss-20b", b)
+        for b in ("triton", "flashinfer_trtllm", "marlin")
+    ),
+    # NVFP4 (ModelOpt and compressed-tensors)
+    *(
+        _backend(name, "hub", src, b)
+        for name, src in (("nvfp4-modelopt", NVFP4_MODELOPT), ("nvfp4-ct", NVFP4_CT))
+        for b in (
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_cutedsl",
+            "cutlass",
+            "marlin",
+        )
+    ),
+    # online MXFP8 (BF16 checkpoint, quantized at load)
+    *(
+        _backend("online-mxfp8", "hub", OLMOE, b, quantization="mxfp8")
+        # (TRITON_MXFP8 doesn't run on SM100)
+        for b in ("flashinfer_trtllm", "deep_gemm", "marlin")
+    ),
     # FP8 KV cache: attention q/k/v scales are recreated and landed on reload
     _backend("fp8-kv", "hub", "nm-testing/Llama-3.2-1B-Instruct-FP8-KV", None),
 ]

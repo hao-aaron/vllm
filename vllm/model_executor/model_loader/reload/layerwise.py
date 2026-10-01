@@ -274,9 +274,9 @@ def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
 
 # MoE methods that don't declare `reload_safe` rebuild their kernel on reload.
 # Captured CUDA graphs keep reading the old kernel's weight-derived state, so
-# under graphs reload warns for them (before any live write).
-# VLLM_RELOAD_ALLOW_UNSAFE_MOE=0 makes this an error (fail closed).
-ALLOW_UNSAFE_MOE = os.getenv("VLLM_RELOAD_ALLOW_UNSAFE_MOE", "1") == "1"
+# under graphs reload fails closed for them (before any live write).
+# VLLM_RELOAD_ALLOW_UNSAFE_MOE=1 downgrades this to a warning.
+ALLOW_UNSAFE_MOE = os.getenv("VLLM_RELOAD_ALLOW_UNSAFE_MOE", "0") == "1"
 
 
 def _check_moe_methods_reload_safe(model: torch.nn.Module) -> None:

@@ -37,6 +37,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import (
+    is_reloading,
     is_weights_pre_processed,
     replace_parameter,
     set_weight_attrs,
@@ -44,6 +45,49 @@ from vllm.model_executor.utils import (
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+# Backends whose kernels are built once and whose weight-derived state is
+# declared (modulewise reload).
+_RELOAD_SAFE_MXFP4_BACKENDS = (
+    Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+    Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+    Mxfp4MoeBackend.TRITON,
+    # weights and packed scales are registered; the experts keep no
+    # weight-derived state (verified bitwise on tiny Kimi K3)
+    Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+    Mxfp4MoeBackend.MARLIN,
+)
+
+
+def _refill_tensors(live: object, new: object, seen: set[int] | None = None) -> None:
+    """Copy every tensor reachable from `new` (a triton_kernels wrapped tensor
+    or PrecisionConfig) into the same-path tensor of `live`, in place: the
+    kernel and captured graphs keep reading the live objects' storage."""
+    seen = set() if seen is None else seen
+    if id(live) in seen or live is new:
+        return
+    seen.add(id(live))
+    if isinstance(live, torch.Tensor):
+        assert isinstance(new, torch.Tensor)
+        assert (live.shape, live.stride(), live.dtype) == (
+            new.shape,
+            new.stride(),
+            new.dtype,
+        ), "reload changed the MXFP4 Triton layout"
+        live.copy_(new)
+        return
+    if isinstance(live, (list, tuple)):
+        assert isinstance(new, (list, tuple)) and len(live) == len(new)
+        for a, b in zip(live, new):
+            _refill_tensors(a, b, seen)
+        return
+    fields = getattr(live, "__dict__", None)
+    if fields is None:
+        return
+    for name, value in fields.items():
+        if isinstance(value, (torch.Tensor, list, tuple)) or hasattr(value, "__dict__"):
+            _refill_tensors(value, getattr(new, name), seen)
 
 
 def _declare_unpadded_load_numel(layer: torch.nn.Module, moe) -> None:
@@ -174,6 +218,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.weight_dtype = "gpt_oss_mxfp4"
         self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(moe)
+        self.reload_safe = self.mxfp4_backend in _RELOAD_SAFE_MXFP4_BACKENDS
 
         self.max_capture_size = moe.max_capture_size
 
@@ -386,6 +431,17 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_weight_scale", w13_scale)
             replace_parameter(layer, "w2_weight_scale", w2_scale)
         else:
+            live = getattr(self, "_triton_live", None)
+            if is_reloading() and self.reload_safe and live is not None:
+                # Refill the wrapped weights / precision configs the kernel
+                # (and captured graphs) read, instead of replacing them. They
+                # were created as inference tensors at cold start.
+                with torch.inference_mode():
+                    for old, new in zip(live, (w13, w2, w13_scale, w2_scale)):
+                        _refill_tensors(old, new)
+                w13, w2, w13_scale, w2_scale = live
+            else:
+                self._triton_live = (w13, w2, w13_scale, w2_scale)
             layer.w13_weight = w13
             layer.w2_weight = w2
             self.w13_precision_config = w13_scale
@@ -394,6 +450,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
+
+        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+            # Build once; the reload framework lands results then refreshes.
+            return
 
         # Build quant config
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
@@ -511,6 +571,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.weight_dtype = "mxfp4"
         self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
+        self.reload_safe = self.mxfp4_backend in _RELOAD_SAFE_MXFP4_BACKENDS
 
         self.max_capture_size = moe.max_capture_size
 
@@ -785,6 +846,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_weight_scale", w13_scale)
             replace_parameter(layer, "w2_weight_scale", w2_scale)
         else:
+            live = getattr(self, "_triton_live", None)
+            if is_reloading() and self.reload_safe and live is not None:
+                # Refill the wrapped weights / precision configs the kernel
+                # (and captured graphs) read, instead of replacing them. They
+                # were created as inference tensors at cold start.
+                with torch.inference_mode():
+                    for old, new in zip(live, (w13, w2, w13_scale, w2_scale)):
+                        _refill_tensors(old, new)
+                w13, w2, w13_scale, w2_scale = live
+            else:
+                self._triton_live = (w13, w2, w13_scale, w2_scale)
             layer.w13_weight = w13
             layer.w2_weight = w2
             self.w13_precision_config = w13_scale
@@ -793,6 +865,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
+
+        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+            # Build once; the reload framework lands results then refreshes.
+            return
 
         # Build quant config
         self._build_moe_kernel(layer)
