@@ -46,6 +46,30 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def _declare_unpadded_load_numel(layer: torch.nn.Module, moe) -> None:
+    """Round-up padding is never written by loaders: declare each expert param's
+    checkpoint numel so streaming reload completes the module when every
+    checkpoint element arrived, instead of holding it until finalize."""
+    hidden = getattr(moe, "hidden_dim_unpadded", None) or moe.hidden_dim
+    inter = (
+        getattr(moe, "intermediate_size_per_partition_unpadded", None)
+        or moe.intermediate_size_per_partition
+    )
+    e, shards = layer.w13_weight.shape[0], moe.w13_num_shards
+    expected = {
+        "w13_weight": e * shards * inter * (hidden // 2),
+        "w13_weight_scale": e * shards * inter * (hidden // 32),
+        "w2_weight": e * hidden * (inter // 2),
+        "w2_weight_scale": e * hidden * (inter // 32),
+        "w13_bias": e * shards * inter,
+        "w2_bias": e * hidden,
+    }
+    for name, numel in expected.items():
+        param = getattr(layer, name, None)
+        if isinstance(param, torch.Tensor) and 0 < numel < param.numel():
+            param.weight_loader_numel = numel
+
+
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
 
@@ -284,6 +308,8 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
+
+        _declare_unpadded_load_numel(layer, self.moe)
 
     def _setup_kernel(
         self,
@@ -666,6 +692,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
             set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
+
+        _declare_unpadded_load_numel(layer, self.moe)
 
     def _setup_kernel(
         self,

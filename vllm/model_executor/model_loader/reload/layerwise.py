@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
+import os
 from collections.abc import Callable
 from functools import wraps
 from weakref import WeakKeyDictionary, WeakSet
@@ -13,11 +14,13 @@ from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from . import meta as _meta
 from .meta import (
     SKIP_LOAD_TENSORS,
+    SKIP_MODULES,
+    SKIP_TENSORS,
     capture_layer_to_meta,
     get_numel_loaded,
-    materialize_layer,
     restore_layer_on_meta,
 )
 from .types import LayerReloadingInfo
@@ -26,7 +29,6 @@ from .utils import (
     get_layer_params_buffers,
     get_layer_size,
     get_layer_tensors,
-    has_device_tensors,
 )
 
 logger = init_logger(__name__)
@@ -37,6 +39,7 @@ __all__ = [
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
+    "scratch_bytes_in_flight",
 ]
 
 
@@ -51,6 +54,13 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
+
+# Warn once when checkpoint-format scratch held by incomplete modules exceeds
+# this budget (0 disables).
+RELOAD_SCRATCH_BUDGET_BYTES = int(
+    float(os.getenv("VLLM_RELOAD_SCRATCH_BUDGET_MB", "0")) * 1e6
+)
+_SCRATCH_BUDGET_WARNED = False
 
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
@@ -76,6 +86,37 @@ def record_metadata_for_reloading(model: torch.nn.Module):
         info = get_layerwise_info(layer)
         info.restore_metadata = capture_layer_to_meta(layer)
         info.restore_device = torch.get_default_device()
+        info.init_values = _capture_init_values(layer, info)
+
+
+# Small scale tensors keep their create-time value as the reload initial value:
+# scales are created with deliberate values (ones, or FP8_SCALE_SENTINEL, which
+# process_weights_after_loading uses to detect shards the checkpoint lacks).
+# So do small tensors that set `reload_keep_init_value`: padding a loader never
+# writes whose create-time value matters (e.g. -inf attention sinks).
+# Everything else is zero-filled (weights are often created with torch.empty).
+INIT_VALUE_MAX_NUMEL = 4096
+
+
+def _capture_init_values(
+    layer: torch.nn.Module, info: LayerReloadingInfo
+) -> dict[str, torch.Tensor]:
+    values = {}
+    params, buffers = info.restore_metadata
+    for name in (*params, *buffers):
+        t = getattr(layer, name, None)
+        if (
+            ("scale" in name or getattr(t, "reload_keep_init_value", False))
+            and isinstance(t, torch.Tensor)
+            and not t.is_meta
+            and 0 < t.numel() <= INIT_VALUE_MAX_NUMEL
+            and not isinstance(t, torch.nn.parameter.UninitializedParameter)
+        ):
+            try:
+                values[name] = t.detach().clone()
+            except (RuntimeError, NotImplementedError):
+                continue
+    return values
 
 
 @torch.no_grad()
@@ -180,9 +221,23 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         bound_args = loader_signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
 
-        # Buffer loaded weights, track loading progress
-        info.loaded_weights.append((param_name, bound_args))
-        num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        info.loaded_names.add(param_name)
+        if _should_buffer(layer, bound_args):
+            # CPU/mmap incoming (cold-start online quant, file reload) or a
+            # deferred attention layer: buffer the call as before and count
+            # it with a dry run on the meta param.
+            info.loaded_weights.append((param_name, bound_args))
+            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        else:
+            # First touch: materialize this param's rank-local
+            # checkpoint-format target now and run the loader on it, so the
+            # incoming tensor (including non-local experts, which the loader
+            # declines) is not retained.
+            target = ensure_param_materialized(layer, info, param_name)
+            if info.loaded_weights:
+                _replay_buffered(layer, info)
+            bound_args.arguments["param"] = target
+            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
         info.load_numel += num_loaded
 
         logger.debug(
@@ -197,25 +252,15 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             return ret
 
         # Log warnings allocating excessive buffers on device
-        if has_device_tensors(bound_args) and layer not in LOADING_LAYERS:
+        if (
+            _has_device_incoming(bound_args) or info.scratch_bytes > 0
+        ) and layer not in LOADING_LAYERS:
             LOADING_LAYERS.add(layer)
-            if len(LOADING_LAYERS) == 2:
-                names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
-                mem_used = sum(
-                    get_info_size(LAYERWISE_INFO[layer]) for layer in LOADING_LAYERS
-                )
-                logger.warning_once(
-                    "Allocating %.1f MB of device memory to buffers to load %s layers. "
-                    "This extra memory usage can be avoided by ordering weights "
-                    "by their parent layer when reloading.",
-                    mem_used / 1e6,
-                    str(list(names)),
-                )
+            _warn_layers_in_flight(list(LOADING_LAYERS))
 
         # Process and copy when all weights are loaded
         if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
-            _layerwise_process(layer, info)
-            LOADING_LAYERS.discard(layer)
+            complete_module(layer, info)
 
         return ret
 
@@ -255,7 +300,7 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         if info.load_numel <= 0:
             # first load: checkpoint did not contain weights for this layer
             if info.kernel_tensors is None:
-                _layerwise_process(layer, info)
+                complete_module(layer, info)
                 continue
 
             # reloading: place kernel tensors back as a fallback. Always place, even
@@ -271,7 +316,7 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         # see Limitations(4)
         elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
             logger.debug("%s: Delayed processing", layer.__class__.__name__)
-            _layerwise_process(layer, info)
+            complete_module(layer, info)
 
         info.reset()
 
@@ -292,7 +337,7 @@ def _finalize_attention_layer(
 ) -> None:
     if info.kernel_tensors is None:
         if info.load_numel > 0:
-            _layerwise_process(layer, info)
+            complete_module(layer, info)
     elif info.load_numel > 0:
         # Reload with new scale weights from checkpoint
         _place_kernel_tensors(layer, info)
@@ -340,17 +385,130 @@ def _reload_attention_scales(
     _copy_and_restore_kernel_tensors(layer, info)
 
 
-def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
-    """Finalize layer loading after all weights have been buffered.
+def _should_buffer(layer: torch.nn.Module, bound_args: inspect.BoundArguments) -> bool:
+    """Buffer-or-run policy. Deferred attention layers and CPU/mmap incoming
+    tensors keep today's buffering: buffering CPU tensors costs no device memory,
+    while first-touch there would allocate device scratch for every module a
+    checkpoint shard touches. Device incoming tensors (NCCL/IPC reload) run
+    the loader immediately."""
+    if is_deferred_attention_layer(layer):
+        return True
+    return not _has_device_incoming(bound_args)
 
-    This function:
-    1. Materializes the layer onto the target device
-    2. Loads all buffered weights
-    3. Runs quantization processing if applicable
-    4. Copies processed values back to original tensor storage
+
+def _has_device_incoming(bound_args: inspect.BoundArguments) -> bool:
+    """Like `has_device_tensors`, but ignores the destination `param`, which is
+    a device tensor once materialized even if the incoming data is on CPU."""
+    return any(
+        isinstance(value, torch.Tensor) and value.device.type not in ("meta", "cpu")
+        for name, value in bound_args.arguments.items()
+        if name != "param"
+    )
+
+
+def ensure_param_materialized(
+    layer: torch.nn.Module, info: LayerReloadingInfo, name: str
+) -> torch.Tensor:
+    """Return the load target for one tensor of `layer`, materializing it
+    (zero-filled) on first touch. Per tensor, not per module: some params are
+    registered after a module's first loader call (e.g. `bias`)."""
+    tensor = getattr(layer, name)
+    if not tensor.is_meta or name in SKIP_TENSORS:
+        return tensor
+    live = None
+    if info.kernel_tensors is not None:
+        params, buffers = info.kernel_tensors
+        live = params.get(name, buffers.get(name))
+        if live is not None and live.is_meta:
+            # never materialized (e.g. a disabled vision tower): loads are a
+            # no-op on meta, and landing skips it
+            return tensor
+    # The checkpoint-format copy lives where the live tensor does (e.g. a
+    # CPU-resident engram table), so landing never crosses devices
+    device = live.device if live is not None else info.restore_device
+    with device:
+        target = _meta.materialize_meta_tensor(tensor)
+    info.scratch_bytes += target.nbytes
+    # Zero-filled: loaders don't write padding, and a slice no loader writes
+    # must not read as plausible old kernel-format bytes. Small tensors start
+    # from their create-time value instead (scale sentinels).
+    init = info.init_values.get(name)
+    if init is not None and init.shape == target.shape and init.dtype == target.dtype:
+        target.data.copy_(init)
+    else:
+        target.data.zero_()
+    setattr(layer, name, target)
+    info.materialized.add(name)
+    return target
+
+
+def _materialize_all(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
+    if layer.__class__.__name__ in SKIP_MODULES:
+        return
+    for name, tensor in get_layer_tensors(layer).items():
+        if name not in SKIP_TENSORS and tensor.is_meta:
+            ensure_param_materialized(layer, info, name)
+
+
+def _replay_buffered(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
+    """Replay buffered loader calls into materialized targets (already counted).
+    Only needed when a module saw buffered calls (CPU incoming) before
+    running ones, or at completion of a buffering module."""
+    _materialize_all(layer, info)
+    for name, args in info.loaded_weights:
+        param = getattr(layer, name)
+        args.arguments["param"] = param
+        _get_original_loader(param)(*args.args, **args.kwargs)
+    info.loaded_weights.clear()
+
+
+def _warn_layers_in_flight(in_flight: list[torch.nn.Module]) -> None:
+    if len(in_flight) < 2:
+        return
+    buffered = sum(get_info_size(LAYERWISE_INFO[layer]) for layer in in_flight)
+    scratch = sum(LAYERWISE_INFO[layer].scratch_bytes for layer in in_flight)
+    if len(in_flight) == 2:
+        names = sorted(layer.__class__.__name__ for layer in in_flight)
+        logger.warning_once(
+            "Allocating %.1f MB of device memory to buffers and %.1f MB to "
+            "checkpoint-format scratch to load %s layers. This extra memory usage "
+            "can be avoided by ordering weights by their parent layer when "
+            "reloading.",
+            buffered / 1e6,
+            scratch / 1e6,
+            str(list(names)),
+        )
+    if RELOAD_SCRATCH_BUDGET_BYTES and scratch > RELOAD_SCRATCH_BUDGET_BYTES:
+        global _SCRATCH_BUDGET_WARNED
+        if not _SCRATCH_BUDGET_WARNED:
+            _SCRATCH_BUDGET_WARNED = True
+            logger.warning(
+                "Reload scratch in flight (%.1f MB across %d incomplete modules) "
+                "exceeds VLLM_RELOAD_SCRATCH_BUDGET_MB. Incomplete modules: %s",
+                scratch / 1e6,
+                len(in_flight),
+                sorted({layer.__class__.__name__ for layer in in_flight}),
+            )
+
+
+def scratch_bytes_in_flight() -> int:
+    """Checkpoint-format scratch currently held by incomplete modules."""
+    return sum(LAYERWISE_INFO[layer].scratch_bytes for layer in list(LOADING_LAYERS))
+
+
+def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = None):
+    """Finish one module: PWAL on its checkpoint-format tensors, copy the
+    results into the live tensors, restore the original tensor objects, reset.
+
+    Called by the wrapped loader when a module's count reaches its total, and
+    by finalize for modules that never reached it.
     """
-    # Materialize layer tensors onto device
-    materialize_layer(layer, info)
+    if info is None:
+        info = get_layerwise_info(layer)
+
+    # Materialize anything not yet touched (zero-filled) and replay buffered
+    # calls, if this module took the buffering path
+    _replay_buffered(layer, info)
 
     # Reset online quantization flag so process_weights_after_loading
     # will run again during reload
@@ -360,12 +518,6 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     # Unwrap layerwise loading wrappers
     for param in get_layer_tensors(layer).values():
         param.weight_loader = _get_original_loader(param)
-
-    # Load all buffered weights into materialized layer (using original loaders)
-    for name, args in info.loaded_weights:
-        param = getattr(layer, name)
-        args.arguments["param"] = param
-        param.weight_loader(*args.args, **args.kwargs)
 
     # Process weights (quantization, repacking, etc.)
     quant_method = getattr(layer, "quant_method", None)
@@ -383,6 +535,7 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         _copy_and_restore_kernel_tensors(layer, info)
 
     info.reset()
+    LOADING_LAYERS.discard(layer)
     logger.debug("%s: Processed", layer.__class__.__name__)
 
 
@@ -401,15 +554,21 @@ def _get_weight_loader(tensor: torch.Tensor):
 
 def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
     """Copy processed values into original kernel tensor storage and restore
-    kernel tensor references on the layer. Preserves cudagraph references."""
+    kernel tensor references on the layer. Preserves cudagraph references.
+
+    Live tensors that were never materialized (meta, e.g. a disabled vision
+    tower) are skipped, as are buffers that are no longer registered and
+    non-persistent buffers no loader wrote (#44371)."""
     assert info.kernel_tensors is not None
     parameters, buffers = info.kernel_tensors
     non_persistent = info.kernel_non_persistent_buffers
-    loaded_tensor_names = {name for name, _ in info.loaded_weights}
+    loaded_tensor_names = info.loaded_names | {name for name, _ in info.loaded_weights}
     for name, param in parameters.items():
+        if param.is_meta:
+            continue
         param.data.copy_(getattr(layer, name))
     for name, buffer in buffers.items():
-        if name not in layer._buffers:
+        if buffer.is_meta or name not in layer._buffers:
             continue
         if name in non_persistent and name not in loaded_tensor_names:
             continue

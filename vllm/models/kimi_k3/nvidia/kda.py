@@ -576,6 +576,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         if self.in_proj_padding:
             self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+            # Weight reload: the padding rows are never loaded
+            weight = self.in_proj_qkvgfab.weight
+            rows = weight.shape[0]
+            weight.weight_loader_numel = (
+                weight.numel() // rows * (rows - self.in_proj_padding)
+            )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -630,6 +636,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.register_buffer(
             "decode_conv1d_weight", decode_conv1d_weight, persistent=False
         )
+        if decode_conv1d_weight is not None:
+            # Weight reload: filled by conv1d's loader, not loaded itself
+            decode_conv1d_weight.weight_loader_numel = 0
         delattr(self.conv1d.weight, "weight_loader")
         set_weight_attrs(
             self.conv1d.weight,
@@ -706,6 +715,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 device=self.o_norm.weight.device,
             )
         self.register_buffer("decode_norm_weight", decode_norm_weight, persistent=False)
+        if decode_norm_weight is not None:
+            # Weight reload: filled by o_norm's loader, not loaded itself
+            decode_norm_weight.weight_loader_numel = 0
         if decode_norm_weight is not None:
             # Upcast once while loading; direct BF16 norm weights slow the
             # fully fused decode kernel.

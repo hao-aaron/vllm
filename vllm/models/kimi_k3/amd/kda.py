@@ -127,6 +127,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         if self.in_proj_padding:
             self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+            # Weight reload: the padding rows are never loaded
+            weight = self.in_proj_qkvgfab.weight
+            rows = weight.shape[0]
+            weight.weight_loader_numel = (
+                weight.numel() // rows * (rows - self.in_proj_padding)
+            )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -175,6 +181,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.register_buffer(
             "decode_conv1d_weight", decode_conv1d_weight, persistent=False
         )
+        if decode_conv1d_weight is not None:
+            # Weight reload: filled by conv1d's loader, not loaded itself
+            decode_conv1d_weight.weight_loader_numel = 0
         if decode_conv1d_weight is None:
             conv1d_weight_loader = _make_fused_conv1d_weight_loader(
                 [self.projection_size] * 3,
@@ -244,6 +253,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 {"weight_loader": make_decode_norm_weight_loader(decode_norm_weight)},
             )
         self.register_buffer("decode_norm_weight", decode_norm_weight, persistent=False)
+        if decode_norm_weight is not None:
+            # Weight reload: filled by o_norm's loader, not loaded itself
+            decode_norm_weight.weight_loader_numel = 0
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,

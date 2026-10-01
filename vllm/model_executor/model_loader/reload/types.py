@@ -19,6 +19,10 @@ class LayerReloadingInfo:
     # device to materialize layers with, recorded by `record_metadata_for_reloading`
     restore_device: torch.device
 
+    # create-time values of small tensors (e.g. FP8 scale sentinels), used to
+    # initialize reload targets instead of zeros, recorded with the metadata
+    init_values: dict[str, torch.Tensor] = field(default_factory=dict)
+
     # track how many elements are ready for loading, used by `online_process_loader`
     load_numel: int = 0
     load_numel_total: int | None = None
@@ -33,9 +37,18 @@ class LayerReloadingInfo:
     # persistence survives `_non_persistent_buffers_set` being mutated during reload
     kernel_non_persistent_buffers: set[str] = field(default_factory=set)
 
+    # names of tensors materialized (first touch) this round, and their bytes
+    materialized: set[str] = field(default_factory=set)
+    scratch_bytes: int = 0
+
+    # names of tensors that received at least one loader call this round
+    loaded_names: set[str] = field(default_factory=set)
+
     def reset(self):
         self.__init__(  # type: ignore[misc]
-            restore_metadata=self.restore_metadata, restore_device=self.restore_device
+            restore_metadata=self.restore_metadata,
+            restore_device=self.restore_device,
+            init_values=self.init_values,
         )
 
     def can_load(self) -> bool:

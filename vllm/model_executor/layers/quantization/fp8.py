@@ -650,6 +650,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
+            # The checkpoint has one input scale per w1 and w3 shard, both loaded
+            # into the same expert slot: declare it so streaming reload counts
+            # the module complete only after every shard arrived.
+            w13_input_scale.weight_loader_numel = num_experts * self.moe.w13_num_shards
 
             w2_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False

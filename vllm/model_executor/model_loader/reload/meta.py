@@ -46,9 +46,14 @@ def to_meta_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return meta_tensor
 
 
-def materialize_meta_tensor(meta_tensor: torch.Tensor) -> torch.Tensor:
+def materialize_meta_tensor(
+    meta_tensor: torch.Tensor, zero: bool = False
+) -> torch.Tensor:
     """Materialize a meta tensor into an actual tensor on the current device.
     Should be called within the torch device context for the given rank.
+
+    ``zero=True`` zero-fills the new tensor. Reload uses it: loaders don't write
+    padding, and some process_weights_after_loading depend on zeroed padding.
     """
     tensor = torch.empty_strided(
         size=tuple(meta_tensor.size()),
@@ -56,6 +61,8 @@ def materialize_meta_tensor(meta_tensor: torch.Tensor) -> torch.Tensor:
         dtype=meta_tensor.dtype,
         requires_grad=False,
     )
+    if zero:
+        tensor.zero_()
     tensor.__class__ = meta_tensor.__class__
     tensor.__dict__ = meta_tensor.__dict__.copy()
     return tensor
@@ -142,7 +149,9 @@ def restore_layer_on_meta(layer: torch.nn.Module, info: LayerReloadingInfo):
             layer.register_buffer(name, buffer, persistent=name not in non_persistent)
 
 
-def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
+def materialize_layer(
+    layer: torch.nn.Module, info: LayerReloadingInfo, zero: bool = False
+):
     """Materialize all meta tensors in a layer to actual tensors."""
     if layer.__class__.__name__ in SKIP_MODULES:
         return
@@ -150,7 +159,7 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
     with info.restore_device:
         for name, tensor in get_layer_tensors(layer).items():
             if name not in SKIP_TENSORS and tensor.is_meta:
-                setattr(layer, name, materialize_meta_tensor(tensor))
+                setattr(layer, name, materialize_meta_tensor(tensor, zero=zero))
 
 
 class CopyCounter(TorchDispatchMode):
@@ -159,12 +168,23 @@ class CopyCounter(TorchDispatchMode):
     Useful for keeping track of weight loading where underlying weights can be
     arbitrarily transformed (such as with `narrow`) before calling copy.
 
+    With `target`, only copies into `target`'s storage count: a loader may also
+    write side buffers (e.g. KDA's decode copy of conv1d), which must not make
+    the target look loaded. Meta targets have no storage to compare, so every
+    copy counts.
+
     Note: Assumes that copy kwargs are not used.
     """
 
-    def __init__(self):
+    def __init__(self, target: torch.Tensor | None = None):
         super().__init__()
         self.copied_numel = 0
+        self._target_ptr = None
+        if isinstance(target, torch.Tensor) and not target.is_meta:
+            try:
+                self._target_ptr = target.untyped_storage().data_ptr()
+            except (RuntimeError, NotImplementedError):  # e.g. tensor subclasses
+                self._target_ptr = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
@@ -172,9 +192,18 @@ class CopyCounter(TorchDispatchMode):
 
         if func is torch.ops.aten.copy_.default:
             assert args[0].numel() == args[1].numel()
-            self.copied_numel += args[0].numel()
+            if self._counts(args[0]):
+                self.copied_numel += args[0].numel()
 
         return func(*args, **kwargs)
+
+    def _counts(self, dst: torch.Tensor) -> bool:
+        if self._target_ptr is None or dst.is_meta:
+            return True
+        try:
+            return dst.untyped_storage().data_ptr() == self._target_ptr
+        except (RuntimeError, NotImplementedError):
+            return True
 
 
 def get_numel_loaded(
@@ -191,7 +220,7 @@ def get_numel_loaded(
         weight loader
 
     """
-    with CopyCounter() as counter:
+    with CopyCounter(args.arguments.get("param", None)) as counter:
         return_value = weight_loader(*args.args, **args.kwargs)
 
     # A weight loader fills a single destination parameter, so the number of
