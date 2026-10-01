@@ -1530,6 +1530,151 @@ def test_bake_offsets_relative_to_target():
     assert base[:8].sum() == 0 and base[12:].sum() == 4 * 0 + 0
 
 
+def test_strict_landing_flags_broadcast(monkeypatch):
+    dst = torch.zeros(3)
+    src = torch.tensor(2.0)  # 0-dim: copy_ would silently broadcast
+    assert reload_layerwise.check_exact_landing(dst, src) is not None
+    assert reload_layerwise.check_exact_landing(dst, torch.ones(3)) is None
+    # size-1 dims carry no layout, [1] vs [1] with different strides is exact
+    assert (
+        reload_layerwise.check_exact_landing(torch.zeros(4, 1), torch.zeros(1, 4).t())
+        is None
+    )
+    assert "stride" in reload_layerwise.check_exact_landing(
+        torch.zeros(4, 3), torch.zeros(3, 4).t()
+    )
+    layer = torch.nn.Module()
+    monkeypatch.setattr(reload_layerwise, "STRICT_LANDING_RAISE", True)
+    with pytest.raises(reload_layerwise.LandingMismatchError):
+        reload_layerwise._land(layer, "w", dst, src)
+    monkeypatch.setattr(reload_layerwise, "STRICT_LANDING_RAISE", False)
+    reload_layerwise._land(layer, "w", dst, src)  # log-only: copies as before
+    assert torch.equal(dst, torch.full((3,), 2.0))
+
+
+class _ModeRecorder(_ProcessRecorder):
+    def __init__(self):
+        super().__init__()
+        self.modes: list[bool] = []
+
+    def process_weights_after_loading(self, layer):
+        from vllm.model_executor.utils import is_reloading
+
+        self.modes.append(is_reloading())
+        super().process_weights_after_loading(layer)
+
+
+def test_reload_mode_only_during_reload():
+    from vllm.model_executor.utils import is_reloading, reload_mode, replace_parameter
+
+    layer = _ExpertLayer(device="cpu")
+    layer.quant_method = _ModeRecorder()
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    for e in (2, 5):
+        layer.w.weight_loader(layer.w, torch.ones(4, 6), expert_id=e)
+    finalize_layerwise_reload(model, model_config=None)
+    assert layer.quant_method.modes == [True]
+    assert not is_reloading()
+    # replace_parameter(prefer_copy=True) still copies in place in reload
+    # mode: MLA keeps W_UK_T / W_UV addresses this way during attention PWAL
+    holder = torch.nn.Module()
+    holder.p = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    old = holder.p
+    with reload_mode():
+        replace_parameter(holder, "p", torch.ones(2), prefer_copy=True)
+    assert holder.p is old and torch.equal(old, torch.ones(2))
+
+
+class _HookModel(torch.nn.Sequential):
+    def __init__(self, *mods, reload_safe=False):
+        super().__init__(*mods)
+        self.reload_safe = reload_safe
+        self.hook_calls = 0
+        self.register_buffer("derived", torch.zeros(4, 6), persistent=False)
+        self.refresh_calls = 0
+
+    def process_weights_after_loading(self):
+        self.hook_calls += 1
+
+    def refresh(self):
+        # kind A: derived from live params, allocated once, written in place
+        self.refresh_calls += 1
+        self.derived.copy_(self[0].w[0] * 2)
+
+
+def test_model_hook_fail_closed_and_model_phase_refresh(monkeypatch):
+    layer = _ExpertLayer(device="cpu")
+    unsafe = _HookModel(layer)
+    record_metadata_for_reloading(unsafe)
+    warnings = []
+    monkeypatch.setattr(
+        reload_layerwise.logger, "warning", lambda *a: warnings.append(a[1])
+    )
+    initialize_layerwise_reload(unsafe)  # warns loudly by default
+    assert warnings and "_HookModel" in warnings[0]
+    reload_layerwise.abort_reload(unsafe)
+    monkeypatch.setattr(reload_layerwise, "STRICT_MODEL_HOOK", True)
+    with pytest.raises(reload_layerwise.ReloadUnsafeModelError):
+        initialize_layerwise_reload(unsafe)
+    monkeypatch.setattr(reload_layerwise, "STRICT_MODEL_HOOK", False)
+
+    layer = _ExpertLayer(device="cpu")
+    model = _HookModel(layer, reload_safe=True)
+    record_metadata_for_reloading(model)
+    derived_ptr = model.derived.data_ptr()
+    initialize_layerwise_reload(model)
+    for e in (2, 5):
+        layer.w.weight_loader(layer.w, torch.full((4, 6), float(e)), expert_id=e)
+    finalize_layerwise_reload(model, model_config=None)
+    assert model.hook_calls == 0  # the free-form hook is cold-start only
+    assert model.refresh_calls == 1
+    assert model.derived.data_ptr() == derived_ptr
+    assert torch.equal(model.derived, torch.full((4, 6), 4.0))
+
+
+@requires_cuda
+def test_fp8_flashinfer_cutlass_quant_config_refresh():
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        Fp8MoeBackend,
+        make_fp8_moe_quant_config,
+    )
+
+    layer = torch.nn.Module()
+    E = 4
+    w1s = torch.rand(E, device="cuda") + 0.5
+    w2s = torch.rand(E, device="cuda") + 0.5
+    a1s = torch.tensor(0.25, device="cuda")
+    a2s = torch.tensor(0.5, device="cuda")
+    qc = make_fp8_moe_quant_config(
+        fp8_backend=Fp8MoeBackend.FLASHINFER_CUTLASS,
+        w1_scale=w1s,
+        w2_scale=w2s,
+        a1_scale=a1s,
+        a2_scale=a2s,
+        layer=layer,
+    )
+    ptrs = (qc.g1_alphas.data_ptr(), qc.a1_gscale.data_ptr(), qc.a2_gscale.data_ptr())
+    # a reload lands new values into the same tensors ...
+    w1s.mul_(3.0)
+    a1s.fill_(0.125)
+    a2s.fill_(2.0)
+    qc.refresh()
+    # ... and refresh() updates derived state in place
+    assert torch.allclose(qc.g1_alphas, w1s * a1s)
+    assert torch.allclose(qc.a1_gscale, torch.tensor(8.0, device="cuda"))
+    assert torch.allclose(qc.a2_gscale, torch.tensor(0.5, device="cuda"))
+    assert ptrs == (
+        qc.g1_alphas.data_ptr(),
+        qc.a1_gscale.data_ptr(),
+        qc.a2_gscale.data_ptr(),
+    )
+    assert qc.g1_alphas is layer.g1_alphas or qc.g1_alphas.data_ptr() == (
+        layer.g1_alphas.data_ptr()
+    )
+
+
 def _two_expert_layers():
     layers = [_ExpertLayer(device="cpu") for _ in range(2)]
     model = torch.nn.Sequential(*layers)
@@ -1633,6 +1778,29 @@ def test_unloaded_scale_keeps_create_time_sentinel():
     seen = layer.quant_method.calls[0]["weight_scale"]
     assert seen[0] == 0.5
     assert (seen[1:] == FP8_SCALE_SENTINEL).all()
+
+
+@requires_cuda
+def test_fused_router_gate_refresh_in_place():
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    runner = object.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.gate = torch.nn.Linear(8, 4, bias=False, device="cuda")
+    runner.shared_expert_gate = torch.nn.Linear(8, 1, bias=False, device="cuda")
+    runner._combined_gate_weight = None
+    runner.refresh()  # not built yet: nothing to do
+    assert runner._combined_gate_weight is None
+    runner._maybe_fuse_gate_weights()
+    fused = runner._combined_gate_weight
+    assert fused is not None
+    ptr = fused.data_ptr()
+    with torch.no_grad():
+        runner.gate.weight.fill_(3.0)  # a reload lands new gate weights
+    runner.refresh()
+    assert runner._combined_gate_weight is fused and fused.data_ptr() == ptr
+    assert torch.equal(fused[:4], torch.full((4, 8), 3.0, device="cuda"))
+    assert torch.equal(fused[4:], runner.shared_expert_gate.weight)
 
 
 @requires_cuda
@@ -1763,6 +1931,65 @@ def test_reload_attention_scales_use_model_dtype(monkeypatch, dtype):
     assert seen["dtype"] == dtype
 
 
+def test_refresh_derived_state_runs_declared_refreshes():
+    """Kernel-format writes (sparse patches, is_checkpoint_format=False) have
+    no reload session: refresh_derived_state recomputes derived state via the
+    declared quant-method and model-local refresh() hooks only."""
+    from vllm.model_executor.model_loader.reload import refresh_derived_state
+
+    calls: list[str] = []
+
+    class _Method(QuantizeMethodBase):
+        def __init__(self, safe: bool):
+            self.reload_safe = safe
+
+        def create_weights(self, layer, *a, **k):
+            pass
+
+        def apply(self, layer, *a, **k):
+            raise NotImplementedError
+
+        def refresh(self, layer):
+            calls.append(f"quant:{self.reload_safe}")
+
+    class _Local(torch.nn.Module):
+        def refresh(self):
+            calls.append("local")
+
+    model = torch.nn.Module()
+    model.safe = torch.nn.Module()
+    model.safe.quant_method = _Method(True)
+    model.unsafe = torch.nn.Module()
+    model.unsafe.quant_method = _Method(False)  # rebuilds; no declared refresh
+    model.local = _Local()
+    refresh_derived_state(model)
+    assert sorted(calls) == ["local", "quant:True"]
+
+
+def _stub_moe_method(reload_safe: bool):
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+
+    class _StubMoEMethod(FusedMoEMethodBase):
+        def create_weights(self, layer, *a, **k):
+            pass
+
+        def get_fused_moe_quant_config(self, layer):
+            return None
+
+        def apply(self, layer, *a, **k):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            pass
+
+    method = _StubMoEMethod.__new__(_StubMoEMethod)
+    method.moe_kernel = object()  # a kernel was built at cold start
+    method.reload_safe = reload_safe
+    return method
+
+
 def _one_weight_model(quant_method=None):
     layer = torch.nn.Module()
     if quant_method is not None:
@@ -1773,6 +2000,32 @@ def _one_weight_model(quant_method=None):
     model = torch.nn.Sequential(layer)
     record_metadata_for_reloading(model)
     return model, layer
+
+
+@pytest.mark.parametrize(
+    "graphs,reload_safe,allow,raises",
+    [
+        (True, False, False, True),
+        (True, True, False, False),  # declared
+        (False, False, False, False),  # eager: a rebuilt kernel is fine
+        (True, False, True, False),  # VLLM_RELOAD_ALLOW_UNSAFE_MOE=1
+    ],
+)
+def test_undeclared_moe_method_fails_closed_under_graphs(
+    monkeypatch, graphs, reload_safe, allow, raises
+):
+    from vllm.model_executor.model_loader.reload import abort_reload, is_model_dirty
+
+    monkeypatch.setattr(reload_layerwise, "_cudagraphs_captured", lambda: graphs)
+    monkeypatch.setattr(reload_layerwise, "ALLOW_UNSAFE_MOE", allow)
+    model, _ = _one_weight_model(_stub_moe_method(reload_safe))
+    if raises:
+        with pytest.raises(reload_layerwise.ReloadUnsafeModelError, match="_StubMoE"):
+            initialize_layerwise_reload(model)
+        assert not is_model_dirty(model)  # refused before any live write
+    else:
+        initialize_layerwise_reload(model)
+        abort_reload(model)
 
 
 @pytest.mark.parametrize("graphs", [True, False])

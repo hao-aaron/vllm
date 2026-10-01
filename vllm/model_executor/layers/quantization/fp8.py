@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -26,6 +27,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -74,6 +76,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import (
+    is_reloading,
     is_weights_pre_processed,
     replace_parameter,
     set_weight_attrs,
@@ -461,6 +464,108 @@ class Fp8LinearMethod(LinearMethodBase):
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 
+@dataclass(frozen=True)
+class Fp8MoEWeights:
+    """The six tensors of an FP8 MoE layer, in checkpoint or kernel format."""
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    w13_input_scale: torch.Tensor | None
+    w2_input_scale: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class Fp8MoEProcessingPlan:
+    """Processing plan of `Fp8MoEMethod`: the reference implementation of the
+    processing-plan convention (see `reload/layerwise.py`).
+
+    Structural decisions only, made once in the first cold PWAL before anything
+    changes the layer, so a reload converts its checkpoint-format tensors
+    exactly as the cold load did (e.g. `shard_size` is the checkpoint's, not a
+    size a backend padded to)."""
+
+    fp8_backend: Fp8MoeBackend
+    fnuz: bool
+    static_input_scales: bool
+    enable_eplb: bool
+    # per-tensor weights: w1 and w3 are requantized to one scale per expert
+    per_tensor_weights: bool
+    shard_size: int
+    local_num_experts: int
+    is_act_and_mul: bool
+
+    @classmethod
+    def create(
+        cls, method: "Fp8MoEMethod", layer: RoutedExperts
+    ) -> "Fp8MoEProcessingPlan":
+        return cls(
+            fp8_backend=method.fp8_backend,
+            fnuz=current_platform.is_fp8_fnuz(),
+            static_input_scales=method.quant_config.activation_scheme == "static",
+            enable_eplb=layer.moe_config.moe_parallel_config.enable_eplb,
+            per_tensor_weights=not method.block_quant,
+            shard_size=layer.intermediate_size_per_partition,
+            local_num_experts=layer.local_num_experts,
+            is_act_and_mul=method.moe.is_act_and_mul,
+        )
+
+    def process(self, layer: RoutedExperts, w: Fp8MoEWeights) -> Fp8MoEWeights:
+        """Map checkpoint-format tensors to kernel-format tensors.
+
+        Reads the layer's static attributes (block size, activation) but writes
+        neither the layer nor its config. (The Marlin and Humming conversions
+        still write the layer; Marlin's writes are verified reload-safe by the
+        refit matrix, Humming isn't declared.)"""
+        w13, w2 = w.w13, w.w2
+        w13_scale, w2_scale = w.w13_scale, w.w2_scale
+        w13_input_scale, w2_input_scale = w.w13_input_scale, w.w2_input_scale
+
+        # MI300x and MI325x use FNUZ format for FP8. Convert if needed.
+        if self.fnuz:
+            w13, w13_scale, w13_input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                w13, w13_scale, w13_input_scale
+            )
+            w2, w2_scale, w2_input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                w2, w2_scale, w2_input_scale
+            )
+
+        # Per tensor kernels require single activation scale. Use the max.
+        if self.static_input_scales:
+            assert self.per_tensor_weights
+            assert w13_input_scale is not None and w2_input_scale is not None
+            w13_input_scale, w2_input_scale = process_fp8_input_tensor_strategy_moe(
+                w13_input_scale, w2_input_scale, self.enable_eplb
+            )
+
+        # Per tensor kernels require single weight scale for w13 per expert, but
+        # on disk there is a scale for w1 and w3. Use the max to requantize.
+        if self.per_tensor_weights:
+            w13, w13_scale = process_fp8_weight_tensor_strategy_moe(
+                w13,
+                w13_scale,
+                self.shard_size,
+                self.local_num_experts,
+                is_act_and_mul=self.is_act_and_mul,
+            )
+
+        # Shuffle weights to runtime format.
+        w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
+            fp8_backend=self.fp8_backend,
+            layer=layer,
+            w13=w13,
+            w2=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            w13_input_scale=w13_input_scale,
+            w2_input_scale=w2_input_scale,
+        )
+        return Fp8MoEWeights(
+            w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
+        )
+
+
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -521,6 +626,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             activation_key=activation_key,
             allow_vllm_cutlass=False,
         )
+        # Backends whose weight-derived state is declared and refreshable.
+        self.reload_safe = self.fp8_backend in (
+            Fp8MoeBackend.FLASHINFER_CUTLASS,
+            Fp8MoeBackend.FLASHINFER_TRTLLM,
+            Fp8MoeBackend.TRITON,
+            Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.MARLIN,
+        )
+        # Created in the first cold PWAL (processing-plan convention)
+        self.processing_plan: Fp8MoEProcessingPlan | None = None
 
     def create_weights(
         self,
@@ -665,37 +780,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
-    def _setup_kernel(
-        self,
-        layer: RoutedExperts,
-        w13: torch.Tensor,
-        w2: torch.Tensor,
-        w13_scale: torch.Tensor,
-        w2_scale: torch.Tensor,
-        w13_input_scale: torch.Tensor | None,
-        w2_input_scale: torch.Tensor | None,
-    ) -> None:
-        # Shuffle weights to runtime format.
-        w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
-            fp8_backend=self.fp8_backend,
-            layer=layer,
-            w13=w13,
-            w2=w2,
-            w13_scale=w13_scale,
-            w2_scale=w2_scale,
-            w13_input_scale=w13_input_scale,
-            w2_input_scale=w2_input_scale,
-        )
-
-        # Replace parameters with updated versions. Note that this helper
-        # function ensures the replacement is compatible with RL weight reloads.
-        replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w2_weight", w2)
-        replace_parameter(layer, f"w13_{self.weight_scale_name}", w13_scale)
-        replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
-
-        self._init_moe_kernel(layer)
-
     def _init_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the MoE kernel from the layer's current (converted) weights."""
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
@@ -715,55 +799,39 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._init_moe_kernel(layer)
             return
 
-        # Allow for accessing weights and scales in standard way.
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
-        w13_scale = getattr(layer, f"w13_{self.weight_scale_name}")
-        w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
-        w13_input_scale = layer.w13_input_scale
-        w2_input_scale = layer.w2_input_scale
+        # The plan is made once, before anything below changes the layer
+        if self.processing_plan is None:
+            self.processing_plan = Fp8MoEProcessingPlan.create(self, layer)
 
-        # MI300x and MI325x use FNUZ format for FP8. Convert if needed.
-        if current_platform.is_fp8_fnuz():
-            w13, w13_scale, w13_input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                w13,
-                w13_scale,
-                w13_input_scale,
-            )
-            w2, w2_scale, w2_input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                w2,
-                w2_scale,
-                w2_input_scale,
-            )
-
-        # Per tensor kernels require single activation scale. Use the max.
-        if self.quant_config.activation_scheme == "static":
-            assert not self.block_quant
-            assert w13_input_scale is not None and w2_input_scale is not None
-            w13_input_scale, w2_input_scale = process_fp8_input_tensor_strategy_moe(
-                w13_input_scale,
-                w2_input_scale,
-                layer.moe_config.moe_parallel_config.enable_eplb,
-            )
-            replace_parameter(layer, "w13_input_scale", w13_input_scale)
-            replace_parameter(layer, "w2_input_scale", w2_input_scale)
-
-        # Per tensor kernels require single weight scale for w13 per expert, but
-        # on disk there is a scale for w1 and w3. Use the max to requantize.
-        if not self.block_quant:
-            shard_size = layer.intermediate_size_per_partition
-            w13, w13_scale = process_fp8_weight_tensor_strategy_moe(
-                w13,
-                w13_scale,
-                shard_size,
-                layer.local_num_experts,
-                is_act_and_mul=self.moe.is_act_and_mul,
-            )
-
-        # Shuffle weights to runtime format and setup kernel.
-        self._setup_kernel(
-            layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
+        # Conversion: checkpoint-format tensors in, kernel-format tensors out
+        weights = self.processing_plan.process(
+            layer,
+            Fp8MoEWeights(
+                w13=layer.w13_weight,
+                w2=layer.w2_weight,
+                w13_scale=getattr(layer, f"w13_{self.weight_scale_name}"),
+                w2_scale=getattr(layer, f"w2_{self.weight_scale_name}"),
+                w13_input_scale=layer.w13_input_scale,
+                w2_input_scale=layer.w2_input_scale,
+            ),
         )
+
+        # Install. Under reload, `replace_parameter` only rebinds; the reload
+        # framework lands the results in the live tensors.
+        if self.processing_plan.static_input_scales:
+            replace_parameter(layer, "w13_input_scale", weights.w13_input_scale)
+            replace_parameter(layer, "w2_input_scale", weights.w2_input_scale)
+        replace_parameter(layer, "w13_weight", weights.w13)
+        replace_parameter(layer, "w2_weight", weights.w2)
+        replace_parameter(layer, f"w13_{self.weight_scale_name}", weights.w13_scale)
+        replace_parameter(layer, f"w2_{self.weight_scale_name}", weights.w2_scale)
+
+        # Other side effects are cold-only. Build once: the kernel (captured by
+        # CUDA graphs) keeps referencing the live tensors; the reload framework
+        # lands the new values and then calls refresh() for derived state.
+        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+            return
+        self._init_moe_kernel(layer)
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         w1_scale = getattr(layer, f"w13_{self.weight_scale_name}")

@@ -165,8 +165,23 @@ def _backend(name, recipe, source, moe_backend, **kwargs):
     )
 
 
-# Cases are added by the PRs that declare each backend reload-safe.
-BACKEND_CASES: list = []
+BACKEND_CASES = [
+    # Fp8MoEMethod, block FP8
+    *(
+        _backend("fp8-block", "hub", QWEN3_MOE_FP8, b)
+        # (FlashInfer CUTLASS doesn't support block FP8 MoE on SM100)
+        for b in ("triton", "deep_gemm", "flashinfer_trtllm", "marlin")
+    ),
+    # Fp8MoEMethod, per-tensor FP8 with static activation scales
+    *(
+        _backend("fp8-tensor-static", "fp8_static", OLMOE, b)
+        for b in ("triton", "flashinfer_cutlass", "marlin")
+    ),
+    # (TRT-LLM's per-tensor FP8 MoE kernel doesn't support OLMoE's routing)
+    _backend("fp8-tensor-static", "fp8_static", QWEN3_MOE, "flashinfer_trtllm"),
+    # FP8 KV cache: attention q/k/v scales are recreated and landed on reload
+    _backend("fp8-kv", "hub", "nm-testing/Llama-3.2-1B-Instruct-FP8-KV", None),
+]
 
 
 @pytest.fixture(scope="session")

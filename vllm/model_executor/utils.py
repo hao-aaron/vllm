@@ -3,6 +3,7 @@
 """Utils for model executor."""
 
 import copy
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -66,6 +67,31 @@ def set_weight_attrs(
         if current_platform.use_sync_weight_loader() and key == "weight_loader":
             value = current_platform.make_synced_weight_loader(value)
         setattr(weight, key, value)
+
+
+_RELOADING: ContextVar[bool] = ContextVar("vllm_weight_reloading", default=False)
+
+
+@contextmanager
+def reload_mode() -> Iterator[None]:
+    """Set around process_weights_after_loading during a weight reload.
+
+    In reload mode, PWAL must not rebuild kernel objects that already exist
+    (they are captured by CUDA graphs); the reload framework calls their
+    `refresh()` after the results land in the live tensors. `replace_parameter`
+    only rebinds: nothing is written into existing storage while later PWAL
+    steps may still read it.
+    """
+    token = _RELOADING.set(True)
+    try:
+        yield
+    finally:
+        _RELOADING.reset(token)
+
+
+def is_reloading() -> bool:
+    """True inside `reload_mode()`."""
+    return _RELOADING.get()
 
 
 def replace_parameter(

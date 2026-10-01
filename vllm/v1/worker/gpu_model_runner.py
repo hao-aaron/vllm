@@ -5575,6 +5575,13 @@ class GPUModelRunner(
                 param = _get_parameter_for_reload(model, name)  # TODO: buffers?
                 param.copy_(loaded_weight)
                 loaded_weights.add(name)
+            # kernel-format tensors were written in place: recompute the state
+            # derived from them (MoE alphas / gscales, model-local buffers)
+            from vllm.model_executor.model_loader.reload import (
+                refresh_derived_state,
+            )
+
+            refresh_derived_state(model)
 
         self.reset_lora_state()
 

@@ -26,6 +26,23 @@ logger = init_logger(__name__)
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+    # Modulewise reload: an instance that builds its kernel once (skipping the
+    # rebuild under `reload_mode()`) and keeps all weight-derived state in
+    # declared, refreshable tensors sets this; so does one with no derived
+    # state. Undeclared instances that built a kernel make reload fail closed
+    # under CUDA graphs (VLLM_RELOAD_ALLOW_UNSAFE_MOE=1: rebuild and warn).
+    # Reference: `Fp8MoEMethod` / `Fp8MoEProcessingPlan`.
+    reload_safe: bool = False
+
+    def refresh(self, layer: torch.nn.Module) -> None:
+        """Recompute weight-derived state in place after reload landing."""
+        moe_kernel = getattr(self, "moe_kernel", None)
+        moe_quant_config = getattr(self, "moe_quant_config", None)
+        if moe_kernel is not None:
+            moe_kernel.refresh()
+        elif moe_quant_config is not None:
+            moe_quant_config.refresh()
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
         self.moe: FusedMoEConfig = moe

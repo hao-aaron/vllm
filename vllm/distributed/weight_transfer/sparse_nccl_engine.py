@@ -145,8 +145,11 @@ class SparseNCCLWeightTransferEngine(
         pass
 
     def finish_weight_update(self) -> None:
-        """No-op: sparse patches are applied in place, no layerwise reload."""
-        pass
+        """Sparse patches are applied in place (no layerwise reload); recompute
+        the state derived from the patched kernel-format tensors."""
+        from vllm.model_executor.model_loader.reload import refresh_derived_state
+
+        refresh_derived_state(self.model)
 
     def receive_weights(self, update_info: SparseNCCLWeightTransferUpdateInfo) -> None:
         """Receive sparse flat-index patches from the trainer and apply them."""

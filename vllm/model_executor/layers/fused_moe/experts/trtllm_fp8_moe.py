@@ -344,6 +344,11 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
+    # derived buffers (register_derived), per-tensor quantization only
+    _g1_alphas: torch.Tensor
+    _g2_alphas: torch.Tensor
+    _g1_scale_c: torch.Tensor
+
     """Fp8 TRTLLM-Gen MoE kernels. Supports monolithic interface."""
 
     def supports_routing_replay_capture(self) -> bool:
@@ -356,7 +361,8 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
     ):
         super().__init__(moe_config, quant_config)
 
-        # Make additional scales for per-tensor interface.
+        # Make additional scales for per-tensor interface. They derive from the
+        # live scales, so they are declared once and filled by refresh().
         if self.quant_config.is_per_tensor:
             w1_scale = self.quant_config.w1_scale
             assert w1_scale is not None
@@ -367,13 +373,29 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             a2_scale = self.quant_config.a2_scale
             assert a2_scale is not None
 
-            self._g1_alphas = (w1_scale * a1_scale).squeeze()
-            self._g2_alphas = (w2_scale * a2_scale).squeeze()
-            self._g1_scale_c = (
-                self._g1_alphas / self.quant_config.a2_scale
-                if moe_config.is_act_and_mul
-                else torch.ones_like(self._g1_alphas) / self.quant_config.a2_scale
-            )
+            g1_shape = torch.broadcast_shapes(w1_scale.shape, a1_scale.shape)
+            g1_shape = tuple(d for d in g1_shape if d != 1) or ()
+            g2_shape = torch.broadcast_shapes(w2_scale.shape, a2_scale.shape)
+            g2_shape = tuple(d for d in g2_shape if d != 1) or ()
+            dev = w1_scale.device
+            self.register_derived("_g1_alphas", g1_shape, torch.float32, dev)
+            self.register_derived("_g2_alphas", g2_shape, torch.float32, dev)
+            self.register_derived("_g1_scale_c", g1_shape, torch.float32, dev)
+            self.refresh()
+
+    @torch.no_grad()
+    def refresh(self) -> None:
+        if not self.quant_config.is_per_tensor:
+            return
+        qc = self.quant_config  # references the live scale params
+        assert qc.w1_scale is not None and qc.a1_scale is not None
+        assert qc.w2_scale is not None and qc.a2_scale is not None
+        self._g1_alphas.copy_((qc.w1_scale * qc.a1_scale).squeeze())
+        self._g2_alphas.copy_((qc.w2_scale * qc.a2_scale).squeeze())
+        if self.moe_config.is_act_and_mul:
+            torch.div(self._g1_alphas, qc.a2_scale, out=self._g1_scale_c)
+        else:
+            self._g1_scale_c.fill_(1.0).div_(qc.a2_scale)
 
     @staticmethod
     def _supports_quant_scheme(

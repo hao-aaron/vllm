@@ -47,6 +47,9 @@ logger = init_logger(__name__)
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
+    # Builds its kernel once (see `is_weight_update` below).
+    reload_safe = True
+
     # --8<-- [end:unquantized_fused_moe]
 
     def __init__(self, moe: FusedMoEConfig):

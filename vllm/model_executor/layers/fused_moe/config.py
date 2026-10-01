@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Union
@@ -259,10 +260,27 @@ class FusedMoEQuantConfig:
 
     mx_alignment: int = 0
 
+    # Refresh functions for weight-derived tensors held by this config (e.g.
+    # a1_gscale = 1 / a1_scale). Each writes a tensor allocated once, in place.
+    _refresh_fns: list[Callable[[], None]] = field(
+        default_factory=list, repr=False, compare=False
+    )
+
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
             "illegal quantization"
         )
+
+    def add_refresh(self, fn: Callable[[], None]) -> None:
+        """Declare an in-place refresh of derived state; runs once now."""
+        self._refresh_fns.append(fn)
+        fn()
+
+    @torch.no_grad()
+    def refresh(self) -> None:
+        """Recompute weight-derived tensors in place (idempotent)."""
+        for fn in self._refresh_fns:
+            fn()
 
     #
     # Convenience accessors for various properties.

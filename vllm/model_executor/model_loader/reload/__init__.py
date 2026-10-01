@@ -30,6 +30,7 @@ __all__ = [
     "is_model_dirty",
     "is_reload_active",
     "mark_dirty",
+    "refresh_derived_state",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -54,6 +55,7 @@ from .layerwise import (
     is_reload_active,
     mark_dirty,
     record_metadata_for_reloading,
+    refresh_derived_state,
     start_reload,
     trace_loads,
 )

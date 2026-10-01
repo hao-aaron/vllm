@@ -352,6 +352,18 @@ class MoERunner(MoERunnerInterface):
                 dim=0,
             )
 
+    @torch.no_grad()
+    def refresh(self) -> None:
+        """Recompute the fused router gate in place from the live gate weights
+        (reload, model phase). Before the first forward it is not built yet."""
+        if self._combined_gate_weight is not None:
+            assert self.gate is not None and self.shared_expert_gate is not None
+            torch.cat(
+                [self.gate.weight, self.shared_expert_gate.weight],
+                dim=0,
+                out=self._combined_gate_weight,
+            )
+
     @property
     def _quant_method(self) -> FusedMoEMethodBase:
         return self.routed_experts.quant_method
