@@ -1942,6 +1942,72 @@ def test_full_vs_partial_update(partial, send_proj):
     assert torch.equal(model.proj.weight, torch.full((2, 2), expected))
 
 
+@requires_cuda
+@pytest.mark.parametrize("keep", [True, False])
+def test_dots3_vision_moe_fused_fp8_refresh(monkeypatch, keep):
+    """dots3 vision MoE (kind C by default: fused FP8 buffers built from the
+    experts, which are then deleted). With weight updates configured the
+    experts are kept, so the fused buffers are derived state that refresh()
+    recomputes in place; otherwise the block is not reload-safe."""
+    import vllm.models.dots3_note.nvidia.vision as vision
+
+    monkeypatch.setattr(vision, "_keep_experts_for_reload", lambda: keep)
+    config = SimpleNamespace(
+        embed_dim=128,
+        pyramid_num_routed=[2],
+        capacity_factor=1,
+        router_scoring_func="sigmoid",
+        router_scale=1.0,
+        moe_intermediate_size=128,
+        use_bias=False,
+    )
+    with torch.device("cuda"):
+        mlp = vision.MoESwiGLUFFNFP8(config, layer_number=0)
+    mlp.process_weights_after_loading()
+    assert mlp.reload_safe is keep
+    if not keep:
+        assert not hasattr(mlp, "experts")
+        return
+    live = {
+        n: (getattr(mlp, n), getattr(mlp, n).data_ptr())
+        for n in vision._FUSED_FP8_BUFFERS
+    }
+    with torch.no_grad():
+        for p in mlp.experts.parameters():
+            p.mul_(2.0)  # a reload lands new expert weights
+    expected = mlp._fused_fp8()
+    mlp.refresh()
+    for (name, (t, ptr)), exp in zip(live.items(), expected):
+        now = getattr(mlp, name)
+        assert now is t and now.data_ptr() == ptr
+        assert torch.equal(now, exp)
+
+
+@pytest.mark.parametrize(
+    "module,cls_name",
+    [
+        ("vllm.models.kimi_k3.nvidia.model", "KimiK3ForConditionalGeneration"),
+        (
+            "vllm.models.deepseek_v4.common.vl_model",
+            "DeepseekV4ForConditionalGeneration",
+        ),
+        ("vllm.models.deepseek_v41.nvidia.vl_model", "DeepseekV41ForCausalLM"),
+    ],
+)
+@pytest.mark.parametrize("inner_safe", [True, False, None])
+def test_wrapper_models_delegate_reload_safe(module, cls_name, inner_safe):
+    """Wrapper models whose hook only runs the language model's hook are as
+    reload-safe as that language model (undeclared: not safe)."""
+    cls = getattr(importlib.import_module(module), cls_name)
+    model = object.__new__(cls)
+    torch.nn.Module.__init__(model)
+    inner = torch.nn.Module()
+    if inner_safe is not None:
+        inner.reload_safe = inner_safe
+    model.language_model = inner
+    assert model.reload_safe is bool(inner_safe)
+
+
 def test_nvfp4_quant_config_gscales_refresh_in_place():
     """NVFP4 MoE: a1/a2_gscale (= 1 / activation scale) are copies the quant
     config derives; refresh() recomputes them in place from the (landed)
@@ -1997,6 +2063,97 @@ def test_reload_attention_scales_use_model_dtype(monkeypatch, dtype):
     )
     reload_layerwise._reload_attention_scales(layer, info, SimpleNamespace(dtype=dtype))
     assert seen["dtype"] == dtype
+
+
+def _stub_attn(**tensors):
+    attn = torch.nn.Module()
+    for name, value in tensors.items():
+        if isinstance(value, torch.nn.Module):
+            attn.add_module(name, value)
+        else:
+            setattr(attn, name, value)
+    return attn
+
+
+def _stub_linear(rows, cols, bias=False):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    linear = torch.nn.Linear(cols, rows, bias=bias)
+    linear.quant_method = object.__new__(UnquantizedLinearMethod)
+    return linear
+
+
+@pytest.mark.parametrize("model", ["qwen3_dflash", "gemma4_dspark"])
+def test_dflash_fused_context_kv_buffers_refresh_in_place(model):
+    """DFlash/DSpark drafters stack per-layer KV weights and K-norms into
+    fused buffers (kind A). refresh() refills them in place from the live
+    per-layer params after a reload landed them."""
+    if model == "qwen3_dflash":
+        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model as cls
+    else:
+        from vllm.model_executor.models.gemma4_dspark import Gemma4DSparkModel as cls
+
+    m = object.__new__(cls)
+    torch.nn.Module.__init__(m)
+    m.hidden_norm = torch.nn.LayerNorm(8)
+    attns = []
+    for _ in range(2):
+        attns.append(
+            _stub_attn(
+                qkv_proj=_stub_linear(12, 8, bias=True),
+                k_proj=_stub_linear(4, 8, bias=True),
+                k_norm=torch.nn.LayerNorm(4),
+                q_size=4,
+                head_dim=4,
+            )
+        )
+    m.layers = torch.nn.ModuleList([_stub_attn(self_attn=a) for a in attns])
+    m._build_context_kv_buffers(attns, True)
+    fused_name = "_fused_kv_weight" if model == "qwen3_dflash" else "_fused_k_weight"
+    fused, norms = getattr(m, fused_name), m._k_norm_weights
+    ptrs = (fused.data_ptr(), norms.data_ptr())
+    with torch.no_grad():
+        for a in attns:  # a reload lands new per-layer weights
+            for p in a.parameters():
+                p.add_(1.0)
+    m.refresh()
+    assert (getattr(m, fused_name).data_ptr(), m._k_norm_weights.data_ptr()) == ptrs
+    rebuilt = object.__new__(cls)
+    torch.nn.Module.__init__(rebuilt)
+    rebuilt.hidden_norm = m.hidden_norm
+    rebuilt._build_context_kv_buffers(attns, True)
+    assert torch.equal(fused, getattr(rebuilt, fused_name))
+    assert torch.equal(norms, rebuilt._k_norm_weights)
+
+
+def test_k3_dspark_context_kv_norms_refresh_in_place():
+    from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkModel
+
+    m = object.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(m)
+    layers = []
+    for _ in range(3):
+        norm = torch.nn.LayerNorm(16)
+        norm.variance_epsilon = 1e-6
+        attn = _stub_attn(
+            kv_a_layernorm=norm,
+            q_lora_rank=32,
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            kv_cache_dtype="auto",
+        )
+        layers.append(_stub_attn(self_attn=attn))
+    m.layers = torch.nn.ModuleList(layers)
+    m._build_fused_context_kv_metadata()
+    norms = m._context_kv_norm_weights
+    ptr = norms.data_ptr()
+    with torch.no_grad():
+        for layer in layers:
+            layer.self_attn.kv_a_layernorm.weight.mul_(3.0)
+    m.refresh()
+    assert m._context_kv_norm_weights is norms and norms.data_ptr() == ptr
+    expected = torch.stack([la.self_attn.kv_a_layernorm.weight for la in layers])
+    assert torch.equal(norms, expected)
 
 
 def test_refresh_derived_state_runs_declared_refreshes():

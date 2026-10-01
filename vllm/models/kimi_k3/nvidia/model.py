@@ -2147,5 +2147,10 @@ class KimiK3ForConditionalGeneration(
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
+    @property
+    def reload_safe(self) -> bool:
+        # Modulewise reload: the hook only runs the language model's hook.
+        return bool(getattr(self.language_model, "reload_safe", False))
+
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()

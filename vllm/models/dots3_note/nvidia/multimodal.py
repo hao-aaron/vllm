@@ -318,6 +318,18 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             mapper=self.hf_to_vllm_mapper,
         )
 
+    @property
+    def reload_safe(self) -> bool:
+        """Modulewise reload: the model hook's work (the vision MoE's fused
+        FP8 buffers) is redone by the blocks' refresh() when they kept their
+        source experts (weight transfer configured); otherwise fail closed.
+        The hook's torch.compile of the vision blocks is cold-start only."""
+        if self.visual is None:
+            return True
+        return all(
+            getattr(block.mlp, "reload_safe", True) for block in self.visual.blocks
+        )
+
     def process_weights_after_loading(self) -> None:
         if self.visual is not None:
             self.visual.process_weights_after_loading()

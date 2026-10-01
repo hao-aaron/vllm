@@ -23,7 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 
 from .gemma4_mtp import Gemma4MTPAttention, Gemma4MTPDecoderLayer
-from .qwen3_dflash import DFlashQwen3Model, _dflash_layer_causal
+from .qwen3_dflash import DFlashQwen3Model, _dflash_layer_causal, reload_active
 from .qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -224,6 +224,19 @@ class Gemma4DSparkModel(DFlashQwen3Model):
         self._rms_norm_eps = attn0.q_norm.variance_epsilon
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    @torch.no_grad()
+    def _refresh_context_kv_buffers(self, layers_attn: list[nn.Module]) -> None:
+        torch.cat(
+            [a.k_proj.weight for a in layers_attn], dim=0, out=self._fused_k_weight
+        )
+        if self._fused_k_bias is not None:
+            torch.cat(
+                [a.k_proj.bias for a in layers_attn], dim=0, out=self._fused_k_bias
+            )
+        torch.stack(
+            [a.k_norm.weight.data for a in layers_attn], dim=0, out=self._k_norm_weights
+        )
+
     def _build_context_kv_buffers(
         self, layers_attn: list[nn.Module], has_bias: bool
     ) -> None:
@@ -327,6 +340,10 @@ class Gemma4DSparkForCausalLM(Qwen3DSparkForCausalLM):
                     loaded.add(name)
                     if "confidence_head" in name:
                         includes_confidence_head = True
+        # A streamed reload calls load_weights per batch with modules still on
+        # meta: keep the confidence head and refill the buffers in refresh().
+        if reload_active(self):
+            return loaded
         if not includes_confidence_head:
             self.model.confidence_head = None
         self.model._build_fused_kv_buffers()

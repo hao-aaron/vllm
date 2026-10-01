@@ -179,6 +179,13 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+def reload_active(model: nn.Module) -> bool:
+    """Whether a streamed weight reload (modulewise reload) is in progress."""
+    from vllm.model_executor.model_loader.reload import is_reload_active
+
+    return is_reload_active(model)
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -533,6 +540,32 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+
+    @torch.no_grad()
+    def _refresh_context_kv_buffers(self, layers_attn: list[nn.Module]) -> None:
+        if self._fused_kv_weight is not None:
+            torch.cat(
+                [a.qkv_proj.weight[a.q_size :] for a in layers_attn],
+                dim=0,
+                out=self._fused_kv_weight,
+            )
+            if self._fused_kv_bias is not None:
+                torch.cat(
+                    [a.qkv_proj.bias[a.q_size :] for a in layers_attn],
+                    dim=0,
+                    out=self._fused_kv_bias,
+                )
+        torch.stack(
+            [a.k_norm.weight.data for a in layers_attn], dim=0, out=self._k_norm_weights
+        )
+
+    def refresh(self) -> None:
+        """Modulewise reload, kind A: the fused context-KV buffers are derived
+        from the live per-layer weights; refill them in place after landing
+        (captured graphs keep reading the same tensors)."""
+        if getattr(self, "_k_norm_weights", None) is None:
+            return
+        self._refresh_context_kv_buffers([layer.self_attn for layer in self.layers])
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -905,7 +938,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
-        self.model._build_fused_kv_buffers()
+        # A streamed reload calls load_weights per batch with modules still on
+        # meta; the buffers are refilled by the model's refresh() instead.
+        if not reload_active(self):
+            self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

@@ -335,6 +335,11 @@ class DeepseekV4ForConditionalGeneration(
         self._weights_finalized = child_finalizes
         return loaded_params
 
+    @property
+    def reload_safe(self) -> bool:
+        # Modulewise reload: the hook only runs the language model's hook.
+        return bool(getattr(self.language_model, "reload_safe", False))
+
     def process_weights_after_loading(self) -> None:
         # Backbones such as the ROCm implementation require this to run only
         # after the loader's generic per-layer quantization finalization.
