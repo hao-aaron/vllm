@@ -168,6 +168,46 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
 
         return w_quant, w_scales
 
+    # ---- per-expert completion (modulewise reload): each expert is
+    # quantized on its own, so an expert can be quantized as soon as it
+    # arrived; the kernel-format step stays per module (finish_experts).
+
+    def per_expert_needs_collective(self) -> bool:
+        return False
+
+    def expert_staging_spec(
+        self, layer: Module
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        fp8 = current_platform.fp8_dtype()
+        spec = {}
+        for key, name in (("w13", "w13_weight"), ("w2", "w2_weight")):
+            shape = tuple(getattr(layer, name).shape)
+            spec[key] = (shape, fp8)
+            spec[f"{key}_scale"] = (
+                (*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE),
+                torch.uint8,
+            )
+        return spec
+
+    def quantize_expert(self, layer, name, expert, src, staging, amax=None):
+        key = "w13" if name == "w13_weight" else "w2"
+        staging[key][expert], staging[f"{key}_scale"][expert] = mxfp8_e4m3_quantize(
+            src, is_sf_swizzled_layout=False
+        )
+
+    def finish_experts(self, layer: Module, staging: dict[str, torch.Tensor]) -> None:
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        self._setup_kernel(
+            layer,
+            staging["w13"],
+            staging["w2"],
+            staging["w13_scale"],
+            staging["w2_scale"],
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
+
     def _setup_kernel(
         self,
         layer: "RoutedExperts",

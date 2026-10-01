@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import Counter
 from dataclasses import dataclass, field
 from inspect import BoundArguments
+from typing import Any
 
 import torch
 
@@ -22,6 +24,9 @@ class ReloadSession:
     incomplete: list[str] = field(default_factory=list)
     # between start and finish/abort: params are on meta / hold checkpoint bytes
     active: bool = True
+    # routed experts: id(module) -> arrivals per (param, shard, local expert);
+    # expert "*" is a stacked [E, ...] load covering every local expert
+    expert_units: dict[int, Counter] = field(default_factory=dict)
     # True: a partial update (modules may receive nothing). False: a full
     # update (every module with checkpoint tensors must receive weights).
     # None: unspecified (modules that received nothing are reported)
@@ -68,6 +73,11 @@ class LayerReloadingInfo:
 
     # direct loading: tensors hosted in live storage -> (storage ptr, nbytes)
     hosted: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+    # per-expert completion (online-quantized MoE): decided at the first expert
+    # weight call; `expert_slots` is a `per_expert.ExpertSlots`
+    per_expert: bool | None = None
+    expert_slots: Any = None
 
     def reset(self):
         self.__init__(  # type: ignore[misc]

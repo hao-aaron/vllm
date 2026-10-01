@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
@@ -34,6 +36,23 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+# Load-target indirection for RoutedExperts.weight_loader (see
+# `_expert_load_target`); installed only around wrapped reload loader calls.
+_EXPERT_TARGET_PROVIDER: ContextVar[
+    Callable[[torch.Tensor, int], torch.Tensor | None] | None
+] = ContextVar("expert_target_provider", default=None)
+
+
+@contextmanager
+def expert_target_provider(
+    provider: Callable[[torch.Tensor, int], torch.Tensor | None],
+) -> Iterator[None]:
+    token = _EXPERT_TARGET_PROVIDER.set(provider)
+    try:
+        yield
+    finally:
+        _EXPERT_TARGET_PROVIDER.reset(token)
 
 
 def _index_expert_mapping(
@@ -608,6 +627,19 @@ class RoutedExperts(PluggableLayer):
             return
         expert_data.copy_(loaded_weight)
 
+    @staticmethod
+    def _expert_load_target(param: torch.Tensor, expert_id: int) -> torch.Tensor:
+        """Where one local expert's slice of `param` is written. The reload
+        framework may install a provider (per-expert completion) that returns
+        a per-expert slot instead; TP narrowing, shard offsets and padding are
+        applied by the caller either way."""
+        provider = _EXPERT_TARGET_PROVIDER.get()
+        if provider is not None:
+            target = provider(param, expert_id)
+            if target is not None:
+                return target
+        return param.data[expert_id]
+
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
@@ -711,7 +743,9 @@ class RoutedExperts(PluggableLayer):
         if full_load:
             shard_dim += 1
 
-        expert_data = param.data if full_load else param.data[expert_id]
+        expert_data = (
+            param.data if full_load else self._expert_load_target(param, expert_id)
+        )
 
         if "bias" in weight_name:
             self._loaded_expert_biases.add(weight_name.rsplit(".", 1)[-1])

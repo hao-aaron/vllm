@@ -88,16 +88,25 @@ def _diff_checksums(got: dict, expected: dict) -> dict[str, list[str]]:
 
 
 @pytest.mark.parametrize("direct_load", [False, True], ids=["stage", "direct"])
+@pytest.mark.parametrize("per_expert", [False, True], ids=["module", "per_expert"])
 @pytest.mark.parametrize("model_a,model_b,kwargs", CASES)
-def test_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs, direct_load):
+def test_refit_equals_fresh(
+    vllm_runner, model_a, model_b, kwargs, direct_load, per_expert
+):
     if not current_platform.is_cuda():
         pytest.skip("CUDA graphs and device-tensor streaming")
+    if per_expert and "quantization" not in kwargs:
+        pytest.skip("per-expert completion applies to online-quantized MoE")
     if "FP8" in model_a and _fp8_reload_unsupported():
         pytest.skip("Requires FP8 support")
-    _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs, direct_load)
+    _check_refit_equals_fresh(
+        vllm_runner, model_a, model_b, kwargs, direct_load, per_expert
+    )
 
 
-def _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs, direct_load=True):
+def _check_refit_equals_fresh(
+    vllm_runner, model_a, model_b, kwargs, direct_load=True, per_expert=False
+):
     kwargs = dict(kwargs)
     common = dict(
         enable_prefix_caching=False,
@@ -120,7 +129,9 @@ def _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs, direct_load
         for _ in range(2):  # the second reload runs against built-once kernels
             stats = llm.collective_rpc(
                 "mw_reload",
-                kwargs=dict(path=model_b, direct_load=direct_load),
+                kwargs=dict(
+                    path=model_b, direct_load=direct_load, per_expert=per_expert
+                ),
             )
         after = llm.collective_rpc("mw_ptr_snapshot")
         got = llm.collective_rpc("mw_checksums")

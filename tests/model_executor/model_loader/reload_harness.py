@@ -244,11 +244,12 @@ class ReloadHarnessExtension:
         use_public_api: bool = True,
         force_rebuild: bool = False,
         direct_load: bool | None = None,
+        per_expert: bool | None = None,
     ) -> dict:
         """Stream ``path`` into the live model. Returns memory/retention stats.
 
-        ``direct_load`` overrides VLLM_RELOAD_DIRECT_LOAD for this call (read
-        at import time otherwise)."""
+        ``direct_load`` / ``per_expert`` override VLLM_RELOAD_DIRECT_LOAD /
+        VLLM_RELOAD_PER_EXPERT for this call (read at import time otherwise)."""
         args = (
             path,
             order,
@@ -261,15 +262,23 @@ class ReloadHarnessExtension:
             use_public_api,
             force_rebuild,
         )
-        from vllm.model_executor.model_loader.reload import direct as reload_direct
+        try:
+            from vllm.model_executor.model_loader.reload import direct as reload_direct
+            from vllm.model_executor.model_loader.reload import (
+                per_expert as reload_per_expert,
+            )
+        except ImportError:  # a baseline without modulewise reload (main)
+            return self._mw_reload(*args)
 
-        saved_flag = reload_direct.DIRECT_LOAD
+        saved_flags = (reload_direct.DIRECT_LOAD, reload_per_expert.PER_EXPERT)
         if direct_load is not None:
             reload_direct.DIRECT_LOAD = direct_load
+        if per_expert is not None:
+            reload_per_expert.PER_EXPERT = per_expert
         try:
             return self._mw_reload(*args)
         finally:
-            reload_direct.DIRECT_LOAD = saved_flag
+            reload_direct.DIRECT_LOAD, reload_per_expert.PER_EXPERT = saved_flags
 
     def _mw_reload(
         self,
@@ -373,6 +382,13 @@ class ReloadHarnessExtension:
             "order": order,
             "seconds": dt,
         }
+        try:
+            from vllm.model_executor.model_loader.reload import per_expert
+
+            stats["slots_in_flight"] = dict(per_expert.SLOTS_IN_FLIGHT)
+            per_expert.SLOTS_IN_FLIGHT.clear()
+        except ImportError:
+            pass
         get_outcomes = getattr(reload_api, "landing_outcomes", None)
         if get_outcomes is not None:
             stats["landing"] = get_outcomes(model)
