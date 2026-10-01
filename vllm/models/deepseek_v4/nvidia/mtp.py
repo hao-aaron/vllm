@@ -339,6 +339,8 @@ class DeepSeekV4MTP(nn.Module):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm.models.deepseek_v4.nvidia.model import is_dropped_mega_weight
+
         # Weight name remapping for checkpoint compatibility.
         # Maps checkpoint weight paths to model parameter paths.
         WEIGHT_NAME_REMAPPING: dict[str, str] = {
@@ -466,6 +468,10 @@ class DeepSeekV4MTP(nn.Module):
                         if weight_name not in name:
                             continue
                         name_mapped = name.replace(weight_name, param_name)
+                        if name_mapped not in params_dict and is_dropped_mega_weight(
+                            self, name_mapped
+                        ):
+                            continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -525,13 +531,26 @@ class DeepSeekV4MTP(nn.Module):
                     f"Use a checkpoint that includes MTP layer weights, "
                     f"or disable speculative decoding."
                 )
-        self.process_weights_after_loading()
+        # A streamed reload calls load_weights per batch; MegaMoE's reload
+        # transform runs per module instead.
+        from vllm.model_executor.model_loader.reload import is_reload_active
+
+        if not is_reload_active(self):
+            self.process_weights_after_loading()
         logger.info_once("MTP draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
     def finalize_mega_moe_weights(self) -> None:
         for layer in self.model.layers.values():
             layer.mtp_block.ffn.finalize_mega_moe_weights()
+
+    @property
+    def reload_safe(self) -> bool:
+        # Modulewise reload: the hook's only work (the MegaMoE transform) is
+        # redone per module on reload.
+        from vllm.models.deepseek_v4.nvidia.model import mega_moe_reload_safe
+
+        return mega_moe_reload_safe(self)
 
     def process_weights_after_loading(self) -> None:
         self.finalize_mega_moe_weights()

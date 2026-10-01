@@ -69,7 +69,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     spec_decode_needs_target_embed,
 )
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import is_reloading, set_weight_attrs
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -293,6 +293,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+        # The transformed MegaMoE weights, registered so a weight reload can
+        # land new values into them (see `reload_outputs`).
+        self.register_buffer("_mega_l1_packed", None, persistent=False)
+        self.register_buffer("_mega_l1_scale", None, persistent=False)
+        self.register_buffer("_mega_l2_packed", None, persistent=False)
+        self.register_buffer("_mega_l2_scale", None, persistent=False)
         self._transformed_shared_l1_weights: (
             tuple[torch.Tensor, torch.Tensor] | None
         ) = None
@@ -486,6 +492,74 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             transformed_l1[1],
         )
         self._transformed_shared_l2_weights = transformed_l2
+        self._attach_shared_expert_reload(deep_gemm, shared_experts)
+
+    # Modulewise reload of the fused shared expert. The fusion runs at cold
+    # start from the model hook on the shared expert's checkpoint-format
+    # tensors, before its own PWAL. On reload each shared-expert linear redoes
+    # its half at the same point (a checkpoint-stage processing plan) and
+    # refills the tensors the MegaMoE kernel reads, in place.
+    def _attach_shared_expert_reload(self, deep_gemm, shared_experts) -> None:
+        mega = getattr(deep_gemm, "mega", None)
+        if not (
+            hasattr(mega, "_interleave_weights")
+            and hasattr(mega, "_transpose_sf_for_utccp")
+        ):
+            return  # reload stays fail-closed (mega_moe_reload_safe)
+        from vllm.model_executor.model_loader.reload import attach_processing_plan
+
+        attach_processing_plan(shared_experts.gate_up_proj, self._refill_shared_l1)
+        attach_processing_plan(shared_experts.down_proj, self._refill_shared_l2)
+        self._shared_expert_reload_attached = True
+
+    def _shared_scale_1x32(self, deep_gemm, linear: nn.Module) -> torch.Tensor:
+        scale = (
+            linear.weight_scale
+            if hasattr(linear, "weight_scale")
+            else linear.weight_scale_inv
+        ).data
+        if scale.dtype not in (torch.float8_e8m0fnu, torch.uint8):
+            return scale
+        weight = linear.weight.data
+        out = self._prepare_shared_expert_scale(
+            deep_gemm, linear, scale, weight.shape[0], weight.shape[1]
+        )
+        assert out is not None
+        return out
+
+    def _refill_shared_l1(self, gate_up: nn.Module) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        mega = deep_gemm.mega
+        weight = gate_up.weight.data
+        l1_w = mega._interleave_weights(weight).contiguous()
+        l1_sf = mega._transpose_sf_for_utccp(
+            mega._interleave_weights(self._shared_scale_1x32(deep_gemm, gate_up))
+        )
+        # As at cold start, the loader param holds the interleaved copy and its
+        # own PWAL runs on it (the serial shared MLP is never called)
+        weight.copy_(l1_w)
+        assert self._transformed_shared_l1_weights is not None
+        live_w, live_sf = self._transformed_shared_l1_weights
+        if live_w.data_ptr() != weight.data_ptr():
+            live_w.copy_(l1_w)
+        live_sf.copy_(l1_sf)
+
+    def _refill_shared_l2(self, down: nn.Module) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        weight = down.weight.data
+        assert self._transformed_shared_l2_weights is not None
+        live_w, live_sf = self._transformed_shared_l2_weights
+        if live_w.data_ptr() != weight.data_ptr():
+            live_w.copy_(weight)
+        live_sf.copy_(
+            deep_gemm.mega._transpose_sf_for_utccp(
+                self._shared_scale_1x32(deep_gemm, down)
+            )
+        )
 
     def _prepare_shared_expert_scale(
         self,
@@ -546,37 +620,20 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         if self._transformed_l1_weights is None:
             self._check_runtime_supported()
-            w13_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
-                2 * self.intermediate_size,
-                self.hidden_size,
-                (1, 32),
-                self.num_local_experts,
-            )
-            w2_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
-                self.hidden_size,
-                self.intermediate_size,
-                (1, 32),
-                self.num_local_experts,
-            )
             self._transformed_l1_weights, self._transformed_l2_weights = (
-                deep_gemm.transform_weights_for_mega_moe(
-                    (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                    (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-                )
+                self._mega_transform()
             )
             # Drop the original loader-side parameters: the MegaMoE kernels only
-            # consume the transformed views above. transform_weights_for_mega_moe
-            # allocates a fresh tensor for the L1 weight (see
-            # _interleave_l1_weights) and fresh SF tensors for L1/L2; the L2
-            # weight is the only tensor that aliases the original storage, and
-            # _transformed_l2_weights still holds it, so the storage stays live
-            # after we drop the Parameter.
-            self.w13_weight = None
-            self.w13_weight_scale = None
-            self.w2_weight = None
-            self.w2_weight_scale = None
+            # consume the transformed tensors (registered as `_mega_*`).
+            # transform_weights_for_mega_moe allocates a fresh tensor for the L1
+            # weight (see _interleave_l1_weights) and fresh SF tensors for
+            # L1/L2; the L2 weight is the only tensor that aliases the original
+            # storage, and _transformed_l2_weights still holds it, so the
+            # storage stays live after we drop the Parameter.
+            self._register_mega_outputs(
+                self._transformed_l1_weights, self._transformed_l2_weights
+            )
+            self._drop_raw_mega_weights()
 
         if shared_experts is None or self.num_shared_experts == 0:
             return
@@ -595,6 +652,70 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     @property
     def has_fused_shared_experts(self) -> bool:
         return self._transformed_shared_l1_weights is not None
+
+    # Modulewise reload: the MegaMoE transform is this module's own
+    # post-load step. On reload it runs per module on the freshly loaded raw
+    # params; its declared outputs are landed into the live `_mega_*` buffers,
+    # which `_transformed_*` keep pointing at.
+    reload_outputs: tuple[str, ...] = (
+        "_mega_l1_packed",
+        "_mega_l1_scale",
+        "_mega_l2_packed",
+        "_mega_l2_scale",
+    )
+
+    def _mega_transform_kwargs(self) -> dict:
+        return {}
+
+    def _mega_transform(self):
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        w13_scale = deep_gemm.transform_sf_into_required_layout(
+            self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
+            2 * self.intermediate_size,
+            self.hidden_size,
+            (1, 32),
+            self.num_local_experts,
+        )
+        w2_scale = deep_gemm.transform_sf_into_required_layout(
+            self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
+            self.hidden_size,
+            self.intermediate_size,
+            (1, 32),
+            self.num_local_experts,
+        )
+        return deep_gemm.transform_weights_for_mega_moe(
+            (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
+            (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
+            **self._mega_transform_kwargs(),
+        )
+
+    def _register_mega_outputs(self, l1, l2) -> None:
+        self.register_buffer("_mega_l1_packed", l1[0], persistent=False)
+        self.register_buffer("_mega_l1_scale", l1[1], persistent=False)
+        self.register_buffer("_mega_l2_packed", l2[0], persistent=False)
+        self.register_buffer("_mega_l2_scale", l2[1], persistent=False)
+
+    def process_weights_after_loading(self) -> None:
+        """Reload-only transform (cold start keeps finalize_weights from the
+        model hook, after the whole stream)."""
+        assert is_reloading(), "cold start finalizes from the model hook"
+        assert self._transformed_l1_weights is not None
+        assert not self.has_fused_shared_experts or getattr(
+            self, "_shared_expert_reload_attached", False
+        ), "MegaMoE shared-expert fusion without its reload steps"
+        l1, l2 = self._mega_transform()
+        # Results become landing targets; the live buffers keep their storage
+        # and `_transformed_*` keep referencing them.
+        self._register_mega_outputs(l1, l2)
+        self._drop_raw_mega_weights()
+
+    def _drop_raw_mega_weights(self) -> None:
+        self.w13_weight = None
+        self.w13_weight_scale = None
+        self.w2_weight = None
+        self.w2_weight_scale = None
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -1141,6 +1262,43 @@ class DeepseekV4MoE(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
             self.experts.finalize_weights(self.shared_experts)
+
+
+_RAW_MEGA_WEIGHTS = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+
+
+def is_dropped_mega_weight(model: nn.Module, name: str) -> bool:
+    """Whether `name` is a MegaMoE raw weight already dropped after its
+    transform. On reload a rank's experts module completes once its local
+    experts arrived, so later (non-local) experts find nothing to load."""
+    module_name, _, attr = name.rpartition(".")
+    try:
+        module = model.get_submodule(module_name)
+    except AttributeError:
+        return False
+    return (
+        isinstance(module, DeepseekV4MegaMoEExperts)
+        and attr in _RAW_MEGA_WEIGHTS
+        and getattr(module, attr, None) is None
+    )
+
+
+def mega_moe_reload_safe(model: nn.Module) -> bool:
+    """Whether every MegaMoE experts module of `model` redoes its transform
+    per module on reload. Shared-expert fusion is redone by processing plans
+    attached to the shared expert's linears; it fails closed only if those
+    could not be attached (an older DeepGEMM). The FlashInfer MoE-EP experts
+    (weights held in a FlashInfer object) fail closed."""
+    for module in model.modules():
+        if isinstance(module, DeepseekV4MegaMoEExperts) and (
+            (
+                module.has_fused_shared_experts
+                and not getattr(module, "_shared_expert_reload_attached", False)
+            )
+            or not module.reload_outputs
+        ):
+            return False
+    return True
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
@@ -1727,6 +1885,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
+                        if name_mapped not in params_dict and is_dropped_mega_weight(
+                            self, name_mapped
+                        ):
+                            continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -1817,6 +1979,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
+
+    def refresh(self) -> None:
+        """Modulewise reload, kind A: the mHC broadcast is derived from live
+        `hc_attn_fn`; once built it is recomputed in place after landing."""
+        if get_pp_group().is_first_rank and self.start_layer < self.end_layer:
+            layer = self.layers[self.start_layer]
+            if getattr(layer, "hc_attn_fn_broadcast", None) is not None:
+                self.finalize_mhc_broadcast_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -2023,8 +2193,21 @@ class DeepseekV4ForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.process_weights_after_loading()
+        # A streamed reload calls load_weights per batch while modules are
+        # still on meta; its post-load work runs per module (mega-MoE
+        # reload_outputs) and in the model refresh() (mHC broadcast) instead.
+        from vllm.model_executor.model_loader.reload import is_reload_active
+
+        if not is_reload_active(self):
+            self.process_weights_after_loading()
         return loaded_params
+
+    @property
+    def reload_safe(self) -> bool:
+        """Modulewise reload: the model hook's work is redone per module
+        (MegaMoE reload_outputs) and by `refresh()` (mHC broadcast); see
+        `mega_moe_reload_safe` for what fails closed."""
+        return mega_moe_reload_safe(self)
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()

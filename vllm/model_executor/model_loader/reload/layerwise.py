@@ -1071,6 +1071,16 @@ def _run_attached_plans(
                 process(layer)
 
 
+def _has_module_pwal(layer: torch.nn.Module) -> bool:
+    """A plain module with its own zero-argument transform (not attention,
+    whose PWAL takes the activation dtype and is deferred to finalize)."""
+    return (
+        not is_deferred_attention_layer(layer)
+        and callable(getattr(layer, "process_weights_after_loading", None))
+        and bool(getattr(layer, "reload_outputs", ()))
+    )
+
+
 def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = None):
     """Finish one module: PWAL on its checkpoint-format tensors, copy the
     results into the live tensors, restore the original tensor objects, reset.
@@ -1109,6 +1119,12 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         # otherwise break replicated (disable_tp) weights on a subsequent reload.
         if hasattr(layer, "update_param_tp_status"):
             layer.update_param_tp_status()
+    elif reloading and _has_module_pwal(layer):
+        # Module-level PWAL for modules without a quant method (model-local
+        # transforms, e.g. mega-MoE): runs per module, on the fresh
+        # checkpoint-format tensors, writing its declared `reload_outputs`.
+        with reload_mode():
+            layer.process_weights_after_loading()
 
     # Kernel-stage attached plans run on the PWAL results before landing, so
     # the live tensors receive the final layout exactly once.
@@ -1226,7 +1242,8 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
 
     Live tensors that were never materialized (meta, e.g. a disabled vision
     tower) are skipped, as are buffers that are no longer registered and
-    non-persistent buffers no loader wrote (#44371)."""
+    non-persistent buffers no loader wrote (#44371), unless a module-level
+    PWAL declares them as outputs."""
     assert info.kernel_tensors is not None
     _mark_dirty(info)
     parameters, buffers = info.kernel_tensors
@@ -1241,12 +1258,22 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
             # produces keep their storage and are rewritten by refresh()
             continue
         _land(layer, name, param, result)
+    declared_outputs = getattr(layer, "reload_outputs", ())
     for name, buffer in buffers.items():
-        if buffer.is_meta or layer._buffers.get(name) is None:
+        if buffer.is_meta:
             continue
-        if name in non_persistent and name not in loaded_tensor_names:
+        declared = name in declared_outputs
+        result = layer._buffers.get(name)
+        if result is None:
+            if declared:
+                raise RuntimeError(
+                    f"{type(layer).__name__}: declared reload output {name!r} was "
+                    "not produced by its process_weights_after_loading()"
+                )
             continue
-        _land(layer, name, buffer, layer._buffers[name])
+        if name in non_persistent and name not in loaded_tensor_names and not declared:
+            continue
+        _land(layer, name, buffer, result)
 
     _place_kernel_tensors(layer, info)
 

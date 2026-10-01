@@ -97,6 +97,7 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MegaMoEExperts,
     DeepseekV4MLP,
+    is_dropped_mega_weight,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
@@ -336,10 +337,6 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         self.activation = activation
         self.activation_beta = activation_beta
         self.activation_linear_beta = activation_linear_beta
-        self.register_buffer("_mega_l1_packed", None, persistent=False)
-        self.register_buffer("_mega_l1_scale", None, persistent=False)
-        self.register_buffer("_mega_l2_packed", None, persistent=False)
-        self.register_buffer("_mega_l2_scale", None, persistent=False)
 
     def synchronize_first_launch(self) -> None:
         ep_group = get_ep_group()
@@ -364,43 +361,16 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
             return
 
         self._check_runtime_supported()
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
-        w13_scale = deep_gemm.transform_sf_into_required_layout(
-            self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
-            2 * self.intermediate_size,
-            self.hidden_size,
-            (1, 32),
-            self.num_local_experts,
-        )
-        w2_scale = deep_gemm.transform_sf_into_required_layout(
-            self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
-            self.hidden_size,
-            self.intermediate_size,
-            (1, 32),
-            self.num_local_experts,
-        )
         self._transformed_l1_weights, self._transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(
-                (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-                activation=self.activation,
-            )
+            self._mega_transform()
         )
-        l1_packed, l1_scale = self._transformed_l1_weights
-        l2_packed, l2_scale = self._transformed_l2_weights
-        self.register_buffer("_mega_l1_packed", l1_packed, persistent=False)
-        self.register_buffer("_mega_l1_scale", l1_scale, persistent=False)
-        self.register_buffer("_mega_l2_packed", l2_packed, persistent=False)
-        self.register_buffer("_mega_l2_scale", l2_scale, persistent=False)
+        self._register_mega_outputs(
+            self._transformed_l1_weights, self._transformed_l2_weights
+        )
         self._drop_raw_mega_weights()
 
-    def _drop_raw_mega_weights(self) -> None:
-        self.w13_weight = None
-        self.w13_weight_scale = None
-        self.w2_weight = None
-        self.w2_weight_scale = None
+    def _mega_transform_kwargs(self) -> dict:
+        return {"activation": self.activation}
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -1530,6 +1500,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     name = name.replace(expert_weight_name, expert_param_name)
                     if is_pp_missing_parameter(name, self):
                         continue
+                    if name not in params_dict and is_dropped_mega_weight(self, name):
+                        break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1690,6 +1662,11 @@ class KimiLinearForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    # Modulewise reload: the model hook's only work (the mega-MoE transform)
+    # runs per module on reload (KimiK3MegaMoEExperts reload_outputs), so the
+    # cold-start-only hook is safe to skip on reload.
+    reload_safe = True
 
     def process_weights_after_loading(self) -> None:
         # A parent AutoWeightsLoader may invoke load_weights repeatedly for
