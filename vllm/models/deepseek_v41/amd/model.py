@@ -873,6 +873,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def finalize_mega_moe_weights(self) -> None:
         return
 
+    def refresh(self) -> None:
+        """Modulewise reload, kind A: the mHC broadcast is derived from live
+        `hc_attn_fn`; once built it is recomputed in place after landing."""
+        if get_pp_group().is_first_rank and self.start_layer < self.end_layer:
+            layer = self.layers[self.start_layer]
+            if getattr(layer, "hc_attn_fn_broadcast", None) is not None:
+                self.finalize_mhc_broadcast_weights()
+
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
             return
@@ -1131,8 +1139,17 @@ class DeepseekV41LLMForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.process_weights_after_loading()
+        # A streamed reload calls load_weights per batch while modules are
+        # still on meta; the mHC broadcast is redone by the model refresh().
+        from vllm.model_executor.model_loader.reload import is_reload_active
+
+        if not is_reload_active(self):
+            self.process_weights_after_loading()
         return loaded_params
+
+    # Modulewise reload: the hook's only weight-derived work (the mHC
+    # broadcast) is redone by `refresh()`; MegaMoE is off on ROCm.
+    reload_safe = True
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()

@@ -8,6 +8,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
+from typing import Literal
 from weakref import WeakKeyDictionary, WeakSet
 
 import torch
@@ -56,6 +57,7 @@ __all__ = [
     "ensure_materialized",
     "LoadTarget",
     "LoadTrace",
+    "attach_processing_plan",
     "get_reload_session",
     "is_model_dirty",
     "is_reload_active",
@@ -1006,22 +1008,6 @@ def scratch_bytes_in_flight() -> int:
     return sum(LAYERWISE_INFO[layer].scratch_bytes for layer in in_flight)
 
 
-# Processing-plan convention (optional; the framework never requires one).
-# A PWAL that follows it:
-#
-# 1. creates its plan once, before anything changes the layer (at init or in
-#    the first cold PWAL); the plan holds structural decisions only;
-# 2. keeps the conversion in `plan.process(...)`, which maps checkpoint-format
-#    tensors to kernel-format tensors and writes nothing else (not the layer's
-#    attributes, not its config);
-# 3. puts every other side effect (config writes, "already done" flags, the
-#    kernel build) behind `if not is_reloading()`;
-# 4. keeps weight-derived values in `refresh()`.
-#
-# A quant method's PWAL re-runs on reload, so its plan needs nothing more. See
-# `Fp8MoEProcessingPlan`.
-
-
 @torch.no_grad()
 def refresh_derived_state(model: torch.nn.Module) -> None:
     """Recompute weight-derived state in place after weights were written
@@ -1039,6 +1025,50 @@ def refresh_derived_state(model: torch.nn.Module) -> None:
 def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:
     if getattr(quant_method, "reload_safe", False) and hasattr(quant_method, "refresh"):
         quant_method.refresh(layer)
+
+
+def attach_processing_plan(
+    module: torch.nn.Module,
+    process: Callable[[torch.nn.Module], None],
+    stage: Literal["checkpoint", "kernel"] = "checkpoint",
+) -> None:
+    """Attach another module's processing step to `module`.
+
+    Processing-plan convention (optional; the framework never requires one).
+    A PWAL that follows it:
+
+    1. creates its plan once, before anything changes the layer (at init or in
+       the first cold PWAL); the plan holds structural decisions only;
+    2. keeps the conversion in `plan.process(...)`, which maps checkpoint-format
+       tensors to kernel-format tensors and writes nothing else (not the layer's
+       attributes, not its config);
+    3. puts every other side effect (config writes, "already done" flags, the
+       kernel build) behind `if not is_reloading()`;
+    4. keeps weight-derived values in `refresh()`.
+
+    A quant method's PWAL re-runs on reload, so its plan needs nothing more.
+    A step that a parent applies to a child's tensors from a model-level hook
+    (which reload does not call) is attached here: at cold start the owner
+    calls `process(module)` itself; on reload the framework calls it on the
+    same tensors the cold path sees. `stage` says which: "checkpoint" runs on
+    `module`'s freshly loaded checkpoint-format tensors, before its PWAL (the
+    owner's cold step runs from `load_weights`, before the quant PWAL);
+    "kernel" runs on its PWAL results, before they land (the cold step runs
+    after PWAL). See `MegaAttnLayoutPlan` (DeepSeek-V4.1) and
+    `Fp8MoEProcessingPlan`."""
+    plans = module.__dict__.setdefault("_attached_processing_plans", [])
+    plans.append((stage, process))
+
+
+def _run_attached_plans(
+    layer: torch.nn.Module, info: LayerReloadingInfo, stage: str
+) -> None:
+    for plan_stage, process in getattr(layer, "_attached_processing_plans", ()):
+        if plan_stage == stage:
+            # a plan may refill live tensors its owner's kernel reads
+            _mark_dirty(info)
+            with reload_mode(), torch.no_grad():
+                process(layer)
 
 
 def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = None):
@@ -1068,6 +1098,8 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     # Process weights (quantization, repacking, etc.). On reload this runs in
     # reload mode: kernel objects are built once, `replace_parameter` rebinds.
     reloading = info.kernel_tensors is not None
+    if reloading:
+        _run_attached_plans(layer, info, "checkpoint")
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
         with reload_mode() if reloading else nullcontext():
@@ -1077,6 +1109,11 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         # otherwise break replicated (disable_tp) weights on a subsequent reload.
         if hasattr(layer, "update_param_tp_status"):
             layer.update_param_tp_status()
+
+    # Kernel-stage attached plans run on the PWAL results before landing, so
+    # the live tensors receive the final layout exactly once.
+    if reloading:
+        _run_attached_plans(layer, info, "kernel")
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)

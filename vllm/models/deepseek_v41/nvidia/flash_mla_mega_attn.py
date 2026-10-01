@@ -15,7 +15,7 @@ and decode segments write disjoint token ranges of one output buffer pair, so
 a single ``wo_a`` einsum covers the whole step.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -25,6 +25,7 @@ from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.utils import is_reloading
 from vllm.models.deepseek_v41.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
@@ -140,6 +141,25 @@ def _token_slice(out: QuantizedActivation, start: int, end: int) -> QuantizedAct
     return replace(out, data=data, scale=out.scale[start:end], orig_shape=data.shape)
 
 
+@dataclass(frozen=True)
+class MegaAttnLayoutPlan:
+    """Processing plan for mega attention's layouts of its child linears.
+
+    Holds structural decisions only. `process_*` rewrite the given module's
+    processed tensors in place and touch nothing else, so the same step runs
+    at cold start (from `finalize_loaded_weights`) and on reload (attached to
+    the child with `attach_processing_plan`)."""
+
+    n_local_heads: int
+    heads_per_group: int
+
+    def process_wq_b(self, wq_b: torch.nn.Module) -> None:
+        permute_wq_b_(wq_b.weight.data, wq_b.weight_scale.data, self.n_local_heads)
+
+    def process_wo_a(self, wo_a: torch.nn.Module) -> None:
+        permute_wo_a_(wo_a.weight.data, wo_a.weight_scale.data, self.heads_per_group)
+
+
 class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
     """FlashMLA mega-attention layer for DeepSeek V4.1 (SM100)."""
 
@@ -182,7 +202,19 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
                 "wo_a group."
             )
         self.n_wv_group = self.padded_heads // WV_GROUP_SIZE
+        # Processing plan (see `attach_processing_plan`): the permutes of the
+        # child linears' weights. Structural, so it is fixed here.
+        self._layout_plan = MegaAttnLayoutPlan(
+            n_local_heads=self.n_local_heads,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+        )
         self._fused_layouts_ready = False
+        # On reload, the framework runs the permutes on wq_b / wo_a's PWAL
+        # results before they land (the model hook is cold-start only).
+        from vllm.model_executor.model_loader.reload import attach_processing_plan
+
+        attach_processing_plan(self.wq_b, self._layout_plan.process_wq_b)
+        attach_processing_plan(self.wo_a, self._layout_plan.process_wo_a)
 
     # ---- interface contract ------------------------------------------------
 
@@ -236,15 +268,10 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
         """
         if self._fused_layouts_ready:
             return
-        permute_wq_b_(
-            self.wq_b.weight.data, self.wq_b.weight_scale.data, self.n_local_heads
-        )
-        permute_wo_a_(
-            self.wo_a.weight.data,
-            self.wo_a.weight_scale.data,
-            self.n_local_heads // self.n_local_groups,
-        )
-        self._fused_layouts_ready = True
+        self._layout_plan.process_wq_b(self.wq_b)
+        self._layout_plan.process_wo_a(self.wo_a)
+        if not is_reloading():
+            self._fused_layouts_ready = True
 
     # ---- forward -----------------------------------------------------------
 

@@ -491,6 +491,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        # A streamed reload calls load_weights per batch: a batch without the
+        # confidence head says nothing about the checkpoint.
+        from vllm.model_executor.model_loader.reload import is_reload_active
+
+        if is_reload_active(self):
+            return loaded_params
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))

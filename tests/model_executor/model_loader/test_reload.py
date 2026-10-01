@@ -1675,6 +1675,91 @@ def test_fp8_flashinfer_cutlass_quant_config_refresh():
     )
 
 
+class _WqB(torch.nn.Module):
+    """Stands in for DeepSeek-V4.1's MXFP8 `wq_b` linear (bytes + row scales)."""
+
+    def __init__(self, rows, cols):
+        super().__init__()
+        self.quant_method = _ProcessRecorder()  # PWAL: identity layout
+        for name, shape in (("weight", (rows, cols)), ("weight_scale", (rows, 2))):
+            p = torch.nn.Parameter(
+                torch.zeros(shape, dtype=torch.uint8), requires_grad=False
+            )
+            p.weight_loader = default_weight_loader
+            self.register_parameter(name, p)
+
+
+class _MegaAttnLike(torch.nn.Module):
+    """Parent that permutes its child's rows in place once, behind a guard,
+    exactly like `DeepseekV4MegaAttnAttention.finalize_loaded_weights`."""
+
+    def __init__(self, register_transform):
+        super().__init__()
+        from vllm.model_executor.model_loader.reload import attach_processing_plan
+
+        self.heads = 2
+        self.wq_b = _WqB(self.heads * 32, 8)
+        self._fused_layouts_ready = False
+        if register_transform:
+            attach_processing_plan(self.wq_b, self._permute)
+
+    def _permute(self, wq_b):
+        from vllm.models.deepseek_v41.common.ops.fused_layout import permute_wq_b_
+
+        permute_wq_b_(wq_b.weight.data, wq_b.weight_scale.data, self.heads)
+
+    def finalize_loaded_weights(self):
+        from vllm.model_executor.utils import is_reloading
+
+        if self._fused_layouts_ready:
+            return
+        self._permute(self.wq_b)
+        if not is_reloading():
+            self._fused_layouts_ready = True
+
+
+@pytest.mark.parametrize("register_transform", [False, True])
+def test_attached_processing_plan_permutes_before_landing(register_transform):
+    from vllm.models.deepseek_v41.common.ops.fused_layout import q_fused_permutation
+
+    parent = _MegaAttnLike(register_transform)
+    model = torch.nn.Sequential(parent)
+    record_metadata_for_reloading(model)
+    g = torch.Generator().manual_seed(0)
+    A = {
+        n: torch.randint(0, 255, p.shape, generator=g, dtype=torch.uint8)
+        for n, p in parent.wq_b.named_parameters()
+    }
+    B = {
+        n: torch.randint(0, 255, p.shape, generator=g, dtype=torch.uint8)
+        for n, p in parent.wq_b.named_parameters()
+    }
+    for n, v in A.items():
+        getattr(parent.wq_b, n).data.copy_(v)
+    parent.finalize_loaded_weights()  # cold start: model hook
+    ptr = parent.wq_b.weight.data_ptr()
+    perm = q_fused_permutation(parent.heads, 32)
+    assert torch.equal(parent.wq_b.weight, A["weight"][perm])
+
+    initialize_layerwise_reload(model)
+    for n, v in B.items():
+        p = getattr(parent.wq_b, n)
+        p.weight_loader(p, v)
+    finalize_layerwise_reload(model, model_config=None)
+    parent.finalize_loaded_weights()  # even if something re-ran it: guarded
+
+    assert parent.wq_b.weight.data_ptr() == ptr
+    if register_transform:
+        # final (permuted) layout landed exactly once
+        assert torch.equal(parent.wq_b.weight, B["weight"][perm])
+        assert torch.equal(parent.wq_b.weight_scale, B["weight_scale"][perm])
+    else:
+        # today's behavior: the checkpoint layout lands and the guard blocks
+        # the permute, so the kernel would read a mismatched layout
+        assert torch.equal(parent.wq_b.weight, B["weight"])
+        assert not torch.equal(parent.wq_b.weight, B["weight"][perm])
+
+
 def _two_expert_layers():
     layers = [_ExpertLayer(device="cpu") for _ in range(2)]
     model = torch.nn.Sequential(*layers)
@@ -2339,3 +2424,49 @@ def test_side_buffer_copies_do_not_count_toward_completion():
     finalize_layerwise_reload(model, model_config=None)
     assert len(layer.quant_method.calls) == 1
     assert torch.equal(layer.weight, torch.tensor([[1.0] * 4, [2.0] * 4]))
+
+
+class _TransposePWAL(QuantizeMethodBase):
+    """PWAL that changes the layout (like DeepGEMM's MXFP8 BMM repack)."""
+
+    def create_weights(self, layer, *a, **k):
+        pass
+
+    def apply(self, layer, *a, **k):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        from vllm.model_executor.utils import replace_parameter
+
+        replace_parameter(layer, "weight", layer.weight.t().contiguous())
+
+
+def test_attached_plan_runs_on_checkpoint_format_before_pwal():
+    """A parent step that cold start runs from `load_weights` (before the
+    child's PWAL) must see checkpoint-format tensors on reload too."""
+    from vllm.model_executor.model_loader.reload import attach_processing_plan
+
+    perm = torch.tensor([2, 0, 3, 1])
+    child = torch.nn.Module()
+    child.quant_method = _TransposePWAL()
+    w = torch.nn.Parameter(torch.zeros(4, 3), requires_grad=False)
+    w.weight_loader = default_weight_loader
+    child.register_parameter("weight", w)
+
+    def permute_rows(m):  # checkpoint layout: rows are output channels
+        m.weight.data.copy_(m.weight.data[perm])
+
+    attach_processing_plan(child, permute_rows)
+    model = torch.nn.Sequential(child)
+    record_metadata_for_reloading(model)
+    a = torch.arange(12.0).view(4, 3)
+    child.weight.data.copy_(a)
+    permute_rows(child)  # cold start: the owner's hook, before PWAL
+    child.quant_method.process_weights_after_loading(child)
+    assert torch.equal(child.weight, a[perm].t())
+
+    b = torch.arange(12.0, 24.0).view(4, 3)
+    initialize_layerwise_reload(model)
+    child.weight.weight_loader(child.weight, b)
+    finalize_layerwise_reload(model, model_config=None)
+    assert torch.equal(child.weight, b[perm].t())

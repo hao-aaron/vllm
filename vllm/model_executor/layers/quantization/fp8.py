@@ -479,7 +479,7 @@ class Fp8MoEWeights:
 @dataclass(frozen=True)
 class Fp8MoEProcessingPlan:
     """Processing plan of `Fp8MoEMethod`: the reference implementation of the
-    processing-plan convention (see `reload/layerwise.py`).
+    processing-plan convention (see `attach_processing_plan`).
 
     Structural decisions only, made once in the first cold PWAL before anything
     changes the layer, so a reload converts its checkpoint-format tensors
