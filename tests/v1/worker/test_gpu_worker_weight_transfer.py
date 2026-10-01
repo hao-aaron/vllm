@@ -20,6 +20,8 @@ from vllm.v1.worker.gpu_worker import Worker
 class _RecordingEngine:
     """Minimal stand-in for a weight transfer engine."""
 
+    model: nn.Module  # set by tests that drive a reload session
+
     def __init__(self, raise_on_update: bool = False):
         self.raise_on_update = raise_on_update
         self.started = False
@@ -68,6 +70,7 @@ def _make_worker(engine: _RecordingEngine | None) -> Worker:
     worker.weight_transfer_engine = engine
     worker._weight_update_active = False
     worker._weight_update_is_draft = False
+    worker._weight_update_failed = False
     worker.model_runner = _RecordingModelRunner()
     return worker
 
@@ -216,3 +219,108 @@ def test_missing_engine_raises():
     worker = _make_worker(None)
     with pytest.raises(RuntimeError, match="Weight transfer not configured"):
         Worker.start_weight_update(worker)
+
+
+def test_failed_finish_ends_session_and_aborts_reload():
+    """A failed finish used to leave `_weight_update_active` set, so the next
+    start raised "already active"; it now aborts the reload and ends the
+    session."""
+    from vllm.model_executor.model_loader.reload import (
+        record_metadata_for_reloading,
+    )
+
+    class _FailingFinishEngine(_RecordingEngine):
+        def start_weight_update(self) -> None:
+            super().start_weight_update()
+            from vllm.model_executor.model_loader.reload import start_reload
+
+            start_reload(self.model)
+
+        def finish_weight_update(self) -> None:
+            raise RuntimeError("finish failed")
+
+    engine = _FailingFinishEngine()
+    engine.model = nn.Sequential(nn.Linear(2, 2, bias=False))
+    live = engine.model[0].weight
+    record_metadata_for_reloading(engine.model)
+    worker = _make_worker(engine)
+    Worker.start_weight_update(worker)
+    assert engine.model[0].weight.is_meta
+    with pytest.raises(RuntimeError, match="finish failed"):
+        Worker.finish_weight_update(worker)
+    assert worker._weight_update_active is False
+    assert engine.model[0].weight is live  # abort_reload restored the tensors
+    Worker.start_weight_update(worker)  # no "already active"
+
+
+class _ReloadingEngine(_RecordingEngine):
+    def __init__(self, raise_on_update: bool = False):
+        super().__init__(raise_on_update)
+        self.model = nn.Sequential(nn.Linear(2, 2, bias=False))
+
+    def start_weight_update(self) -> None:
+        super().start_weight_update()
+        from vllm.model_executor.model_loader.reload import start_reload
+
+        start_reload(self.model)
+
+    def finish_weight_update(self) -> None:
+        super().finish_weight_update()
+        from vllm.model_executor.model_loader.reload import finish_reload
+
+        finish_reload(self.model, None)
+
+
+def test_finish_fails_when_another_rank_failed(monkeypatch):
+    """A finish that succeeded here but failed on a peer rank leaves this rank
+    dirty too: the ranks run every forward together."""
+    from vllm.model_executor.model_loader.reload import (
+        is_model_dirty,
+        record_metadata_for_reloading,
+    )
+
+    engine = _ReloadingEngine()
+    record_metadata_for_reloading(engine.model)
+    worker = _make_worker(engine)
+    votes: list[bool] = []
+
+    def peer_failed(ok: bool) -> bool:
+        votes.append(ok)
+        return False
+
+    monkeypatch.setattr(worker, "_weight_update_ok_on_all_ranks", peer_failed)
+    Worker.start_weight_update(worker)
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        Worker.finish_weight_update(worker)
+    assert votes == [True]
+    assert is_model_dirty(engine.model)
+    assert worker._weight_update_active is False
+    Worker.start_weight_update(worker)  # a new full update can start
+
+
+def test_finish_after_failed_update_joins_agreement(monkeypatch):
+    """A rank whose update_weights failed still takes part in finish's
+    agreement (voting failure), so its peers don't wait on it forever."""
+    from vllm.model_executor.model_loader.reload import (
+        record_metadata_for_reloading,
+    )
+
+    engine = _ReloadingEngine(raise_on_update=True)
+    record_metadata_for_reloading(engine.model)
+    worker = _make_worker(engine)
+    votes: list[bool] = []
+
+    def vote(ok: bool) -> bool:
+        votes.append(ok)
+        return ok
+
+    monkeypatch.setattr(worker, "_weight_update_ok_on_all_ranks", vote)
+    Worker.start_weight_update(worker)
+    with pytest.raises(ValueError, match="boom"):
+        Worker.update_weights(worker, {"x": 1})
+    with pytest.raises(RuntimeError, match="already failed on this rank"):
+        Worker.finish_weight_update(worker)
+    assert votes == [False]
+    assert not engine.finished  # the engine's finish is not run after an abort
+    with pytest.raises(RuntimeError, match="without a matching start"):
+        Worker.finish_weight_update(worker)  # a second finish is a misuse

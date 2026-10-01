@@ -1476,6 +1476,9 @@ def test_abort_reload_after_partial_update(dist_init):
         assert before[k][0] == after[k][0], k
         # values intact: nothing was written to live storage yet
         assert torch.equal(before[k][1], after[k][1]), k
+    from vllm.model_executor.model_loader.reload import is_model_dirty
+
+    assert not is_model_dirty(model)
     assert reload_layerwise.scratch_bytes_in_flight() == 0
     # the model can be reloaded again afterwards
     start_reload(model)
@@ -1525,6 +1528,80 @@ def test_bake_offsets_relative_to_target():
     t.as_strided(sc.shape, sc.stride, t.storage_offset() + sc.offset).fill_(1.0)
     assert torch.equal(layer.weight[1], torch.ones(4, device="cuda"))
     assert base[:8].sum() == 0 and base[12:].sum() == 4 * 0 + 0
+
+
+def _two_expert_layers():
+    layers = [_ExpertLayer(device="cpu") for _ in range(2)]
+    model = torch.nn.Sequential(*layers)
+    record_metadata_for_reloading(model)
+    return model, layers
+
+
+def _load_layer(layer, value):
+    for e in (2, 5):
+        layer.w.weight_loader(layer.w, torch.full((4, 6), value), expert_id=e)
+
+
+def test_failure_after_live_write_leaves_model_dirty():
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        finish_reload,
+        is_model_dirty,
+        start_reload,
+    )
+
+    model, (a, b) = _two_expert_layers()
+    start_reload(model)
+    _load_layer(a, 1.0)  # completes and lands: live storage written
+    b.w.weight_loader(b.w, torch.ones(4, 6), expert_id=2)  # partial
+    abort_reload(model)  # e.g. the transport failed here
+    assert is_model_dirty(model)
+    # a new update starts dirty and only a full success clears it
+    start_reload(model)
+    _load_layer(a, 2.0)
+    _load_layer(b, 2.0)
+    finish_reload(model, model_config=None)
+    assert not is_model_dirty(model)
+
+
+def test_failure_before_any_live_write_is_clean():
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        is_model_dirty,
+        start_reload,
+    )
+
+    model, (a, b) = _two_expert_layers()
+    before = a.w.detach().clone()
+    start_reload(model)
+    a.w.weight_loader(a.w, torch.ones(4, 6), expert_id=2)  # partial, scratch only
+    abort_reload(model)
+    assert not is_model_dirty(model)
+    assert torch.equal(a.w, before)
+
+
+def test_incomplete_module_reported_or_raised(monkeypatch):
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        finish_reload,
+        get_reload_session,
+        start_reload,
+    )
+
+    model, (a, b) = _two_expert_layers()
+    start_reload(model)
+    _load_layer(a, 1.0)
+    b.w.weight_loader(b.w, torch.ones(4, 6), expert_id=2)  # expert 5 never sent
+    finish_reload(model, model_config=None)
+    assert len(get_reload_session(model).incomplete) == 1
+
+    monkeypatch.setattr(reload_layerwise, "REQUIRE_COMPLETE", True)
+    start_reload(model)
+    _load_layer(a, 1.0)
+    b.w.weight_loader(b.w, torch.ones(4, 6), expert_id=2)
+    with pytest.raises(reload_layerwise.ReloadIncompleteError):
+        finish_reload(model, model_config=None)
+    abort_reload(model)
 
 
 def test_unloaded_scale_keeps_create_time_sentinel():
@@ -1629,6 +1706,47 @@ def test_reload_attention_scales_use_model_dtype(monkeypatch, dtype):
     )
     reload_layerwise._reload_attention_scales(layer, info, SimpleNamespace(dtype=dtype))
     assert seen["dtype"] == dtype
+
+
+def _one_weight_model(quant_method=None):
+    layer = torch.nn.Module()
+    if quant_method is not None:
+        layer.quant_method = quant_method
+    w = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    w.weight_loader = default_weight_loader
+    layer.register_parameter("weight", w)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    return model, layer
+
+
+@pytest.mark.parametrize("graphs", [True, False])
+def test_live_tensor_replaced_between_updates_is_caught(monkeypatch, graphs):
+    from vllm.model_executor.model_loader.reload import abort_reload, is_model_dirty
+
+    monkeypatch.setattr(reload_layerwise, "_cudagraphs_captured", lambda: graphs)
+    model, layer = _one_weight_model(_ProcessRecorder())
+
+    def update(value):
+        initialize_layerwise_reload(model)
+        layer.weight.weight_loader(layer.weight, torch.full((4, 4), value))
+        finalize_layerwise_reload(model, model_config=None)
+
+    update(1.0)
+    layer.weight.data.copy_(torch.full((4, 4), 2.0))  # in place: fine
+    update(3.0)
+    assert torch.equal(layer.weight, torch.full((4, 4), 3.0))
+
+    # replaced outside reload: graphs and built-once kernels hold the old one
+    layer.weight = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    layer.weight.weight_loader = default_weight_loader
+    if graphs:
+        with pytest.raises(reload_layerwise.ReloadUnsupportedError, match=r"0\.weight"):
+            initialize_layerwise_reload(model)
+        assert not is_model_dirty(model)
+    else:
+        initialize_layerwise_reload(model)  # eager: warns
+        abort_reload(model)
 
 
 def test_attn_sink_padding_keeps_neg_inf_on_reload():

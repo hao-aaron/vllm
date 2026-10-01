@@ -56,7 +56,9 @@ __all__ = [
     "LoadTarget",
     "LoadTrace",
     "get_reload_session",
+    "is_model_dirty",
     "is_reload_active",
+    "mark_dirty",
 ]
 
 
@@ -193,7 +195,11 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
-    session = ReloadSession()
+    _check_live_tensors_unchanged(model)
+
+    # A failed update leaves the model dirty until a full update succeeds
+    previous = get_reload_session(model)
+    session = ReloadSession(dirty=previous is not None and previous.dirty)
     model._reload_session = session
 
     # disable torchao reloading to avoid infinite recursion
@@ -219,6 +225,151 @@ def initialize_layerwise_reload(model: torch.nn.Module):
 
         # Wrap weight loaders to buffer loading
         initialize_online_processing(layer)
+
+
+class ReloadUnsupportedError(RuntimeError):
+    """An update this configuration cannot apply correctly (the model is left
+    dirty: the engine refuses to serve until a supported full update)."""
+
+
+# Live tensors as the last successful update left them, per module. Captured
+# CUDA graphs and built-once kernels hold these objects, so a tensor replaced
+# (or moved) between updates is one the next update would not write where they
+# read. Checked at the start of each update, before any live write.
+_LIVE_SIGNATURES: WeakKeyDictionary[torch.nn.Module, dict[str, tuple]] = (
+    WeakKeyDictionary()
+)
+
+
+def _live_signature(t: torch.Tensor) -> tuple:
+    try:
+        ptr = t.data_ptr()
+    except (RuntimeError, NotImplementedError):  # e.g. tensor subclasses
+        ptr = None
+    return (id(t), ptr, tuple(t.shape), t.stride(), t.dtype)
+
+
+def _record_live_signatures(model: torch.nn.Module) -> None:
+    for layer in model.modules():
+        _LIVE_SIGNATURES[layer] = {
+            name: _live_signature(t) for name, t in get_layer_tensors(layer).items()
+        }
+
+
+def _check_live_tensors_unchanged(model: torch.nn.Module) -> None:
+    changed = []
+    for module_name, layer in model.named_modules():
+        expected = _LIVE_SIGNATURES.get(layer)
+        if expected is None:
+            continue
+        current = get_layer_tensors(layer)
+        for name, signature in expected.items():
+            t = current.get(name)
+            if t is None:
+                changed.append(f"{module_name}.{name} (removed)")
+            elif _live_signature(t) != signature:
+                changed.append(f"{module_name}.{name}")
+    if not changed:
+        return
+    shown = ", ".join(changed[:5]) + (
+        f" and {len(changed) - 5} more" if len(changed) > 5 else ""
+    )
+    msg = (
+        f"Live tensors changed since the last weight update: {shown}. Something "
+        "outside reload replaced, resized or moved them. Reload writes the "
+        "tensors on the module now, so captured CUDA graphs and built-once "
+        "kernels would keep reading the old ones. Update tensors in place "
+        "(copy_ into the existing tensor) instead of replacing them."
+    )
+    if _cudagraphs_captured():
+        raise ReloadUnsupportedError(msg)
+    logger.warning_once(msg)
+
+
+# Integrity. A module left partially loaded at finish would keep zeros where
+# data is missing. VLLM_RELOAD_REQUIRE_COMPLETE=1 raises; otherwise it is
+# reported and logged.
+REQUIRE_COMPLETE = os.getenv("VLLM_RELOAD_REQUIRE_COMPLETE", "0") == "1"
+
+
+class ReloadIncompleteError(RuntimeError):
+    pass
+
+
+def get_reload_session(model: torch.nn.Module) -> ReloadSession | None:
+    return getattr(model, "_reload_session", None)
+
+
+def is_reload_active(module: torch.nn.Module) -> bool:
+    """True between start and finish/abort of a streamed reload that covers
+    `module`. Works on any submodule (e.g. a VL wrapper's language model,
+    whose parent holds the session)."""
+    info = LAYERWISE_INFO.get(module)
+    session = info.session if info is not None else None
+    if session is None:
+        session = get_reload_session(module)
+    return session is not None and session.active
+
+
+def is_model_dirty(model: torch.nn.Module) -> bool:
+    """True after a failed update wrote live weights (until one succeeds)."""
+    session = get_reload_session(model)
+    return session is not None and session.dirty
+
+
+def mark_dirty(model: torch.nn.Module) -> None:
+    """Mark the model's weights unusable until a full update succeeds (e.g. an
+    update that succeeded here but failed on another rank)."""
+    session = get_reload_session(model)
+    if session is None:
+        session = ReloadSession(active=False)
+        model._reload_session = session
+    session.dirty = True
+
+
+def _mark_dirty(info: LayerReloadingInfo) -> None:
+    if info.session is not None:
+        info.session.dirty = True
+
+
+def _check_complete(model: torch.nn.Module) -> None:
+    incomplete: list[str] = []
+    for name, layer in model.named_modules():
+        info = LAYERWISE_INFO.get(layer)
+        if info is None or not info.can_load() or info.kernel_tensors is None:
+            continue
+        if is_deferred_attention_layer(layer):
+            continue
+        if 0 < info.load_numel < info.load_numel_total:  # type: ignore[operator]
+            # Required keys, by name: every loadable tensor must have received
+            # a loader call. Counts alone can't tell a missing shard from
+            # padding a loader never writes.
+            restore_params, restore_buffers = info.restore_metadata
+            never_loaded = sorted(
+                t
+                for t in (*restore_params, *restore_buffers)
+                if t not in SKIP_LOAD_TENSORS
+                and t not in info.kernel_non_persistent_buffers
+                and t not in info.loaded_names
+            )
+            incomplete.append(
+                f"{name or type(layer).__name__} "
+                f"({info.load_numel}/{info.load_numel_total}"
+                + (f", never loaded: {never_loaded}" if never_loaded else "")
+                + ")"
+            )
+    session = get_reload_session(model)
+    if session is not None:
+        session.incomplete = incomplete
+    if not incomplete:
+        return
+    msg = (
+        f"{len(incomplete)} module(s) were only partially loaded by this update "
+        f"(missing or miscounted names): {incomplete[:8]}"
+    )
+    if REQUIRE_COMPLETE:
+        raise ReloadIncompleteError(msg)
+    logger.warning(msg)
 
 
 def initialize_online_processing(layer: torch.nn.Module):
@@ -311,6 +462,10 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                 # incoming tensor (including non-local experts, which the loader
                 # declines) is not retained.
                 target = ensure_param_materialized(layer, info, param_name)
+                if info.kernel_tensors is not None and param_name not in (
+                    info.materialized
+                ):
+                    _mark_dirty(info)  # writes live storage (e.g. `bias`)
                 if info.loaded_weights:
                     _replay_buffered(layer, info)
                 bound_args.arguments["param"] = target
@@ -364,13 +519,17 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
+    _check_complete(model)
+
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
+    reloading = False
 
     for layer in model.modules():
         info = get_layerwise_info(layer)
         if not info.can_load():
             info.reset()
             continue
+        reloading = reloading or info.kernel_tensors is not None
 
         # Deferred attention-like layers are processed after all other layers
         if is_deferred_attention_layer(layer):
@@ -403,14 +562,19 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
     # Process attention layers after all other layers are done
     for layer, info in deferred_attn:
+        reloading = reloading or info.kernel_tensors is not None
         _finalize_attention_layer(layer, info, model_config)
         info.reset()
 
     LOADING_LAYERS.clear()
 
+    # The update finished: the model may serve again
     session = get_reload_session(model)
     if session is not None:
+        session.dirty = False
         session.active = False
+    if reloading:
+        _record_live_signatures(model)
 
 
 def finalize_layerwise_reload(*args, **kwargs):
@@ -430,6 +594,16 @@ def _finalize_attention_layer(
     else:
         _place_kernel_tensors(layer, info)
     layer.process_weights_after_loading(model_config.dtype)
+
+
+def _cudagraphs_captured() -> bool:
+    try:
+        from vllm.config import CUDAGraphMode, get_current_vllm_config
+
+        mode = get_current_vllm_config().compilation_config.cudagraph_mode
+        return mode is not None and mode != CUDAGraphMode.NONE
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _reload_attention_scales(
@@ -583,21 +757,6 @@ def scratch_bytes_in_flight() -> int:
     return sum(LAYERWISE_INFO[layer].scratch_bytes for layer in in_flight)
 
 
-def get_reload_session(model: torch.nn.Module) -> ReloadSession | None:
-    return getattr(model, "_reload_session", None)
-
-
-def is_reload_active(module: torch.nn.Module) -> bool:
-    """True between start and finish/abort of a streamed reload that covers
-    `module`. Works on any submodule (e.g. a VL wrapper's language model,
-    whose parent holds the session)."""
-    info = LAYERWISE_INFO.get(module)
-    session = info.session if info is not None else None
-    if session is None:
-        session = get_reload_session(module)
-    return session is not None and session.active
-
-
 def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = None):
     """Finish one module: PWAL on its checkpoint-format tensors, copy the
     results into the live tensors, restore the original tensor objects, reset.
@@ -661,7 +820,8 @@ def finish_reload(model: torch.nn.Module, model_config: ModelConfig) -> None:
 def abort_reload(model: torch.nn.Module) -> None:
     """Put the original tensors back, reset reload state and unwrap loaders.
 
-    Values are intact only for modules that were not completed yet.
+    Values are intact only for modules that were not completed yet; see the
+    dirty flag for the failure contract.
     """
     for layer in model.modules():
         info = LAYERWISE_INFO.get(layer)
@@ -733,6 +893,7 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     tower) are skipped, as are buffers that are no longer registered and
     non-persistent buffers no loader wrote (#44371)."""
     assert info.kernel_tensors is not None
+    _mark_dirty(info)
     parameters, buffers = info.kernel_tensors
     non_persistent = info.kernel_non_persistent_buffers
     loaded_tensor_names = info.loaded_names | {name for name, _ in info.loaded_weights}
