@@ -58,6 +58,7 @@ __all__ = [
     "get_reload_session",
     "is_model_dirty",
     "is_reload_active",
+    "check_can_serve",
     "mark_dirty",
 ]
 
@@ -181,7 +182,10 @@ def _capture_init_values(
 
 
 @torch.no_grad()
-def initialize_layerwise_reload(model: torch.nn.Module):
+def initialize_layerwise_reload(
+    model: torch.nn.Module,
+    partial: bool | None = None,
+):
     """Set up layerwise weight loading with deferred processing.
 
     Must be called after `record_metadata_for_reloading`. This function:
@@ -199,7 +203,11 @@ def initialize_layerwise_reload(model: torch.nn.Module):
 
     # A failed update leaves the model dirty until a full update succeeds
     previous = get_reload_session(model)
-    session = ReloadSession(dirty=previous is not None and previous.dirty)
+    session = ReloadSession(
+        dirty=previous is not None and previous.dirty,
+        partial=partial,
+        required_modules=_required_modules(model),
+    )
     model._reload_session = session
 
     # disable torchao reloading to avoid infinite recursion
@@ -317,6 +325,68 @@ def is_model_dirty(model: torch.nn.Module) -> bool:
     return session is not None and session.dirty
 
 
+def _required_modules(model: torch.nn.Module) -> dict[int, str]:
+    """Modules a full update must send weights to: those that first own (in
+    module order) a parameter or persistent buffer. A tensor shared by several
+    modules is required once, from its first owner (a tied `lm_head` is loaded
+    through `embed_tokens`). Deferred attention layers are exempt (their q/k/v
+    scales are optional in checkpoints). Computed on the live tensors, before
+    they are swapped for meta."""
+    seen: set[int] = set()
+    required = {}
+    for name, module in model.named_modules():
+        tensors = [
+            t
+            for n, t in module._parameters.items()
+            if t is not None and n not in SKIP_LOAD_TENSORS
+        ] + [
+            t
+            for n, t in module._buffers.items()
+            if t is not None
+            and n not in module._non_persistent_buffers_set
+            and n not in SKIP_LOAD_TENSORS
+        ]
+        first_owned = [t for t in tensors if id(t) not in seen]
+        seen.update(id(t) for t in tensors)
+        if first_owned and not is_deferred_attention_layer(module):
+            required[id(module)] = name
+    return required
+
+
+def _check_full_update(model: torch.nn.Module, session: ReloadSession) -> None:
+    """Modules that received no weights: raise for a full update, report
+    when unspecified, accept for a partial one."""
+    if session.partial:
+        return
+    untouched = [
+        name
+        for name, layer in model.named_modules()
+        if id(layer) in session.required_modules
+        and (info := LAYERWISE_INFO.get(layer)) is not None
+        and info.can_load()
+        and info.kernel_tensors is not None
+        and info.load_numel == 0
+    ]
+    if not untouched:
+        return
+    msg = (
+        f"{len(untouched)} module(s) received no weights in this update: "
+        f"{untouched[:8]}"
+    )
+    if session.partial is False:
+        session.incomplete = untouched
+        raise ReloadIncompleteError(
+            msg + " (a full update was requested; start it with partial=True "
+            "to update a subset of the model)"
+        )
+    logger.warning(
+        "%s. They keep their previous weights; start the update with "
+        "partial=True to mark this intended, or partial=False to require a "
+        "full update.",
+        msg,
+    )
+
+
 def mark_dirty(model: torch.nn.Module) -> None:
     """Mark the model's weights unusable until a full update succeeds (e.g. an
     update that succeeded here but failed on another rank)."""
@@ -327,6 +397,23 @@ def mark_dirty(model: torch.nn.Module) -> None:
     session.dirty = True
 
 
+def check_can_serve(model: torch.nn.Module) -> None:
+    """Refuse to run the model mid-update or after a failed update."""
+    session = getattr(model, "_reload_session", None)
+    if session is None:
+        return
+    if session.active:
+        raise RuntimeError(
+            "Model is mid weight update (start_weight_update without "
+            "finish_weight_update); pause generation during updates."
+        )
+    if session.dirty:
+        raise RuntimeError(
+            "A weight update failed after writing live weights; the engine "
+            "refuses to serve until a full update succeeds."
+        )
+
+
 def _mark_dirty(info: LayerReloadingInfo) -> None:
     if info.session is not None:
         info.session.dirty = True
@@ -334,6 +421,9 @@ def _mark_dirty(info: LayerReloadingInfo) -> None:
 
 def _check_complete(model: torch.nn.Module) -> None:
     incomplete: list[str] = []
+    session = get_reload_session(model)
+    if session is not None:
+        _check_full_update(model, session)
     for name, layer in model.named_modules():
         info = LAYERWISE_INFO.get(layer)
         if info is None or not info.can_load() or info.kernel_tensors is None:
@@ -546,8 +636,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
             # reloading: place kernel tensors back as a fallback. Always place, even
             # when nothing is loadable (load_numel_total == 0), so parameter-alias
             # buffers on such layers are restored rather than left deleted.
+            # (modules that own checkpoint tensors and received none are
+            # reported by `_check_full_update`)
             if info.load_numel_total > 0:  # type: ignore[operator]
-                logger.warning("%s: Failed to load weights", layer.__class__.__name__)
+                logger.debug("%s: received no weights", layer.__class__.__name__)
             _place_kernel_tensors(layer, info)
 
         # Process non-attention layers which did not load all elements. This can happen
@@ -807,9 +899,16 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
 # ---------------------------------------------------------------------------
 
 
-def start_reload(model: torch.nn.Module) -> None:
-    """Begin a streaming reload (alias of `initialize_layerwise_reload`)."""
-    initialize_layerwise_reload(model)
+def start_reload(
+    model: torch.nn.Module,
+    partial: bool | None = None,
+) -> None:
+    """Begin a streaming reload (alias of `initialize_layerwise_reload`).
+
+    `partial=False` requires every module with checkpoint tensors to receive
+    weights; `partial=True` allows updating a subset; None reports modules
+    that received nothing."""
+    initialize_layerwise_reload(model, partial=partial)
 
 
 def finish_reload(model: torch.nn.Module, model_config: ModelConfig) -> None:

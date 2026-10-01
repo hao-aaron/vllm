@@ -1549,19 +1549,25 @@ def test_failure_after_live_write_leaves_model_dirty():
         is_model_dirty,
         start_reload,
     )
+    from vllm.model_executor.model_loader.reload.layerwise import check_can_serve
 
     model, (a, b) = _two_expert_layers()
     start_reload(model)
+    with pytest.raises(RuntimeError, match="mid weight update"):
+        check_can_serve(model)
     _load_layer(a, 1.0)  # completes and lands: live storage written
     b.w.weight_loader(b.w, torch.ones(4, 6), expert_id=2)  # partial
     abort_reload(model)  # e.g. the transport failed here
     assert is_model_dirty(model)
+    with pytest.raises(RuntimeError, match="refuses to serve"):
+        check_can_serve(model)
     # a new update starts dirty and only a full success clears it
     start_reload(model)
     _load_layer(a, 2.0)
     _load_layer(b, 2.0)
     finish_reload(model, model_config=None)
     assert not is_model_dirty(model)
+    check_can_serve(model)
 
 
 def test_failure_before_any_live_write_is_clean():
@@ -1680,6 +1686,55 @@ def test_flashinfer_bmm_scales_refresh_in_place():
     # output-quant fusion folds the o-scale into bmm2: host floats (flagged)
     assert impl._trtllm_decode_bmm_scales(torch.ones(1)) == (None, impl.bmm2_scale)
     assert impl.float_scales_in_decode
+
+
+class _WeightOnly(torch.nn.Module):
+    def __init__(self, weight: torch.nn.Parameter | None = None):
+        super().__init__()
+        self.weight = (
+            weight if weight is not None else torch.nn.Parameter(torch.zeros(2, 2))
+        )
+        self.weight.weight_loader = default_weight_loader
+
+
+def _full_partial_model():
+    """Embed / lm_head (tied) / proj / a rotary-like module with only a
+    non-persistent buffer."""
+    model = torch.nn.Module()
+    model.embed = _WeightOnly()
+    model.lm_head = _WeightOnly(model.embed.weight)  # tied
+    model.proj = _WeightOnly()
+    model.rotary = torch.nn.Module()
+    model.rotary.register_buffer("cos_sin_cache", torch.ones(2), persistent=False)
+    record_metadata_for_reloading(model)
+    return model
+
+
+@pytest.mark.parametrize("partial", [None, False, True])
+@pytest.mark.parametrize("send_proj", [True, False])
+def test_full_vs_partial_update(partial, send_proj):
+    """A full update (partial=False) must send every module that owns a
+    checkpoint tensor; a tied lm_head and a module with only non-persistent
+    buffers never need their own weights. Unspecified reports, partial
+    accepts."""
+    model = _full_partial_model()
+    initialize_layerwise_reload(model, partial=partial)
+    session = reload_layerwise.get_reload_session(model)
+    assert session is not None
+    assert set(session.required_modules.values()) == {"embed", "proj"}
+    sends = [model.embed] + ([model.proj] if send_proj else [])
+    for module in sends:
+        module.weight.weight_loader(module.weight, torch.full((2, 2), 3.0))
+    if not send_proj and partial is False:
+        with pytest.raises(reload_layerwise.ReloadIncompleteError, match="proj"):
+            finalize_layerwise_reload(model, model_config=None)
+        reload_layerwise.abort_reload(model)
+        return
+    finalize_layerwise_reload(model, model_config=None)
+    assert torch.equal(model.embed.weight, torch.full((2, 2), 3.0))
+    assert model.lm_head.weight is model.embed.weight
+    expected = 3.0 if send_proj else 0.0  # untouched modules keep old weights
+    assert torch.equal(model.proj.weight, torch.full((2, 2), expected))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

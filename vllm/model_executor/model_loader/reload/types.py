@@ -22,6 +22,12 @@ class ReloadSession:
     incomplete: list[str] = field(default_factory=list)
     # between start and finish/abort: params are on meta / hold checkpoint bytes
     active: bool = True
+    # True: a partial update (modules may receive nothing). False: a full
+    # update (every module with checkpoint tensors must receive weights).
+    # None: unspecified (modules that received nothing are reported)
+    partial: bool | None = None
+    # id(module) -> name, for modules a full update must touch
+    required_modules: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
