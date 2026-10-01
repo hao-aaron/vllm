@@ -86,6 +86,25 @@ def _get_weight_loader(param: torch.Tensor) -> Callable[..., object]:
     return weight_loader
 
 
+def _load_presliced_expert(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    name: str,
+    expert_id: int | None,
+) -> None:
+    """Copy a pre-sliced expert tensor into `param[expert_id]` (the whole stack
+    when None) through the param's loader: a direct `param.data` copy writes a
+    meta placeholder during a reload."""
+    weight_loader = typing.cast(Callable[..., object], param.weight_loader)
+    weight_loader(
+        param,
+        loaded_weight,
+        weight_name=name,
+        shard_id="gpt_oss_presliced",
+        expert_id=expert_id,
+    )
+
+
 class OAIAttention(nn.Module):
     # Override to switch RoPE convention. gpt-oss uses NeoX (chunk halves);
     # privacy-filter and similar derivatives use GPT-J (interleaved pairs).
@@ -311,6 +330,12 @@ class GptOssRoutedExperts(RoutedExperts):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        if shard_id == "gpt_oss_presliced":
+            # Already sliced by the model's loader; `expert_id` indexes the
+            # local stack as is, and None means the whole stack.
+            data = param.data if expert_id is None else param.data[expert_id]
+            self._copy_to_expert(data, loaded_weight)
+            return True if return_success else None
         if shard_id not in ("gpt_oss_w13", "gpt_oss_w2"):
             if return_success:
                 return super().weight_loader(
@@ -721,7 +746,8 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, narrow_weight)
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -860,8 +886,9 @@ class GptOssModel(nn.Module, EagleModelMixin):
             ):
                 assert loaded_weight.numel() == 1
                 assert fused_name is not None
-                expert_data = params_dict[fused_name].data[expert_id]
-                expert_data.copy_(loaded_weight)
+                _load_presliced_expert(
+                    params_dict[fused_name], loaded_weight, fused_name, expert_id
+                )
                 loaded_params.add(fused_name)
                 continue
 
@@ -942,11 +969,9 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # weight loaders without added complexity, so just do the
                 # direct load here.
                 assert fused_name is not None
-                param = params_dict[fused_name]
-                expert_data = param.data[expert_id]
-                dim1 = sliced_weight.shape[0]
-                dim2 = sliced_weight.shape[1]
-                expert_data.data[:dim1, :dim2].copy_(sliced_weight)
+                _load_presliced_expert(
+                    params_dict[fused_name], sliced_weight, fused_name, expert_id
+                )
                 loaded_params.add(fused_name)
                 continue
 
@@ -966,10 +991,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 assert fused_name is not None
                 param = params_dict[fused_name]
 
-                if expert_id is None:
-                    param.data.copy_(narrow_weight)
-                else:
-                    param.data[expert_id].copy_(narrow_weight)
+                _load_presliced_expert(param, narrow_weight, fused_name, expert_id)
 
                 loaded_params.add(fused_name)
                 continue
@@ -989,10 +1011,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 else:
                     narrow_weight = loaded_weight
 
-                if expert_id is None:
-                    param.data.copy_(narrow_weight)
-                else:
-                    param.data[expert_id].copy_(narrow_weight)
+                _load_presliced_expert(param, narrow_weight, fused_name, expert_id)
 
                 loaded_params.add(fused_name)
                 continue
@@ -1001,10 +1020,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 assert fused_name is not None
                 param = params_dict[fused_name]
 
-                if expert_id is None:
-                    param.data.copy_(loaded_weight)
-                else:
-                    param.data[expert_id].copy_(loaded_weight)
+                _load_presliced_expert(param, loaded_weight, fused_name, expert_id)
 
                 loaded_params.add(fused_name)
                 continue
@@ -1021,10 +1037,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 assert fused_name is not None
                 param = params_dict[fused_name]
 
-                if expert_id is None:
-                    param.data.copy_(narrow_weight)
-                else:
-                    param.data[expert_id].copy_(narrow_weight)
+                _load_presliced_expert(param, narrow_weight, fused_name, expert_id)
 
                 loaded_params.add(fused_name)
                 continue
@@ -1038,10 +1051,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 else:
                     narrow_weight = loaded_weight
 
-                if expert_id is None:
-                    param.data.copy_(narrow_weight)
-                else:
-                    param.data[expert_id].copy_(narrow_weight)
+                _load_presliced_expert(param, narrow_weight, fused_name, expert_id)
 
                 loaded_params.add(fused_name)
                 continue
@@ -1072,10 +1082,9 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # weight loaders without added complexity, so just do the
                 # direct load here.
                 assert fused_name is not None
-                param = params_dict[fused_name]
-                expert_data = param.data[expert_id]
-                dim1 = sliced_weight.shape[0]
-                expert_data.data[:dim1].copy_(sliced_weight)
+                _load_presliced_expert(
+                    params_dict[fused_name], sliced_weight, fused_name, expert_id
+                )
                 loaded_params.add(fused_name)
                 continue
 
@@ -1083,7 +1092,10 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                # Through the (possibly reload-wrapped) loader: a direct
+                # param.data.copy_ writes a meta placeholder during a reload.
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, narrow_weight)
                 loaded_params.add(name)
                 continue
 
@@ -1214,7 +1226,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
                 param = params_dict[name]
 
-                param.copy_(narrow_weight)
+                _load_presliced_expert(param, narrow_weight, name, None)
                 loaded_params.add(name)
                 continue
             elif ".w2_weight" in name:
@@ -1226,7 +1238,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
                 param = params_dict[name]
 
-                param.copy_(narrow_weight)
+                _load_presliced_expert(param, narrow_weight, name, None)
                 loaded_params.add(name)
                 continue
             elif ".w13_bias" in name:
@@ -1238,7 +1250,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
 
                 param = params_dict[name]
-                param.copy_(narrow_weight)
+                _load_presliced_expert(param, narrow_weight, name, None)
                 loaded_params.add(name)
                 continue
             elif ".w2_bias" in name:
@@ -1250,14 +1262,15 @@ class GptOssModel(nn.Module, EagleModelMixin):
                     if tp_rank != 0:
                         weight.zero_()
                 param = params_dict[name]
-                param.copy_(weight)
+                _load_presliced_expert(param, weight, name, None)
                 loaded_params.add(name)
                 continue
             elif "sinks" in name:
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, narrow_weight)
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
