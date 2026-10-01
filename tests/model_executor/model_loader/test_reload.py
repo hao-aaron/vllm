@@ -1318,7 +1318,7 @@ def test_first_touch_interleaved_modules_complete():
             if e == 0:
                 # open modules hold partition scratch, nothing else
                 info = reload_layerwise.get_layerwise_info(layer)
-                assert info.scratch_bytes == layer.w.nbytes
+                assert info.scratch_bytes == layer.w.nbytes or "w" in info.hosted
     assert reload_layerwise.scratch_bytes_in_flight() == 0
     finalize_layerwise_reload(model, model_config=None)
     for i, layer in enumerate(layers):
@@ -1471,14 +1471,16 @@ def test_abort_reload_after_partial_update(dist_init):
     qkv.weight.weight_loader(qkv.weight, torch.zeros(4, 4, device="cuda"), "q")
     abort_reload(model)
     after = _state(model)
+    import vllm.model_executor.model_loader.reload.direct as direct
+    from vllm.model_executor.model_loader.reload import is_model_dirty
 
     for k in before:
         assert before[k][0] == after[k][0], k
-        # values intact: nothing was written to live storage yet
-        assert torch.equal(before[k][1], after[k][1]), k
-    from vllm.model_executor.model_loader.reload import is_model_dirty
-
-    assert not is_model_dirty(model)
+        if not direct.DIRECT_LOAD:
+            # values intact: nothing was written to live storage yet
+            assert torch.equal(before[k][1], after[k][1]), k
+    # with direct loading the partial update wrote live bytes: dirty instead
+    assert is_model_dirty(model) == direct.DIRECT_LOAD
     assert reload_layerwise.scratch_bytes_in_flight() == 0
     # the model can be reloaded again afterwards
     start_reload(model)
@@ -1939,6 +1941,199 @@ def test_incomplete_module_reported_or_raised(monkeypatch):
     abort_reload(model)
 
 
+@pytest.fixture
+def direct_load(monkeypatch):
+    import vllm.model_executor.model_loader.reload.direct as direct
+
+    monkeypatch.setattr(direct, "DIRECT_LOAD", True)
+    return direct
+
+
+def test_plan_input_rules(direct_load):
+    d = direct_load
+    meta = torch.empty(4, 6, device="meta")
+    live = torch.zeros(4, 6)
+    d._STORAGE_USERS.clear()
+    d._STORAGE_USERS[live.untyped_storage().data_ptr()] = 1
+    assert d.plan_input(meta, live, torch.device("cpu")) is None
+    assert d.plan_input(meta, None, "cpu") == "deleted"
+    assert d.plan_input(meta, torch.zeros(0), "cpu") == "released"
+    small = torch.zeros(4, 5)
+    d._STORAGE_USERS[small.untyped_storage().data_ptr()] = 1
+    assert d.plan_input(meta, small, "cpu") == "too small"
+    # fp8-sized live bytes can't host a bf16 checkpoint tensor (online quant)
+    fp8 = torch.zeros(4, 6, dtype=torch.float8_e4m3fn)
+    d._STORAGE_USERS[fp8.untyped_storage().data_ptr()] = 1
+    assert d.plan_input(meta.to(torch.bfloat16), fp8, "cpu") == "too small"
+    # a live tensor smaller than its storage only offers its own footprint
+    base = torch.zeros(100)
+    d._STORAGE_USERS[base.untyped_storage().data_ptr()] = 1
+    assert d.plan_input(torch.empty(30, device="meta"), base[:20], "cpu") == (
+        "too small"
+    )
+    # misaligned start
+    assert d.plan_input(torch.empty(4, device="meta"), base[1:9], "cpu") == (
+        "alignment"
+    )
+    # shared storage (tied or aliased)
+    d._STORAGE_USERS[live.untyped_storage().data_ptr()] = 2
+    assert d.plan_input(meta, live, "cpu") == "shared storage"
+
+
+def test_checkpoint_view_never_grows_storage(direct_load):
+    live = torch.zeros(6, 4).t()  # [4, 6] view of [6, 4] bytes (per-tensor fp8)
+    meta = torch.empty(6, 4, device="meta")  # checkpoint layout
+    ptr, nbytes = live.untyped_storage().data_ptr(), live.untyped_storage().nbytes()
+    view = direct_load.checkpoint_view(live, meta)
+    view.copy_(torch.arange(24.0).view(6, 4))
+    assert (view.untyped_storage().data_ptr(), view.untyped_storage().nbytes()) == (
+        ptr,
+        nbytes,
+    )
+    # writes through the checkpoint view are the live bytes
+    assert torch.equal(live, torch.arange(24.0).view(6, 4).t())
+    # set_ with an oversize view would silently grow and move storage: the
+    # footprint check prevents ever issuing it
+    direct_load._STORAGE_USERS[ptr] = 1
+    assert direct_load.plan_input(torch.empty(7, 4, device="meta"), live, "cpu") == (
+        "too small"
+    )
+
+
+class _TransposeMethod(QuantizeMethodBase):
+    """Per-tensor-FP8-like PWAL: kernel layout is the transpose, produced with
+    `.t()` (in place for hosted inputs) or a fresh `.t().contiguous()`."""
+
+    def __init__(self, fresh: bool):
+        self.fresh = fresh
+
+    def create_weights(self, layer, *a, **k):
+        pass
+
+    def apply(self, layer, *a, **k):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        from vllm.model_executor.utils import replace_parameter
+
+        w = layer.weight.t()
+        replace_parameter(layer, "weight", w.contiguous().t().t() if self.fresh else w)
+
+
+class _TLayer(torch.nn.Module):
+    def __init__(self, fresh):
+        super().__init__()
+        self.quant_method = _TransposeMethod(fresh)
+        w = torch.nn.Parameter(torch.zeros(6, 4), requires_grad=False)
+        w.weight_loader = default_weight_loader
+        self.register_parameter("weight", w)
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_direct_load_lands_in_place_or_copies(direct_load, fresh):
+    layer = _TLayer(fresh)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)  # checkpoint layout [6, 4]
+    layer.quant_method.process_weights_after_loading(layer)  # cold start
+    live = layer.weight
+    ptr = live.untyped_storage().data_ptr()
+    initialize_layerwise_reload(model)
+    new = torch.arange(24.0).view(6, 4)
+    # device incoming takes the first-touch path; force it on CPU
+    reload_layerwise_has = reload_layerwise._has_device_incoming
+    reload_layerwise._has_device_incoming = lambda _: True
+    try:
+        layer.weight.weight_loader(layer.weight, new)
+    finally:
+        reload_layerwise._has_device_incoming = reload_layerwise_has
+    finalize_layerwise_reload(model, model_config=None)
+    assert layer.weight is live and live.untyped_storage().data_ptr() == ptr
+    assert torch.equal(live, new.t())
+    plan = direct_load.PLAN_OUTCOMES[layer]["weight"]
+    landing = direct_load.LANDING_OUTCOMES[layer]["weight"]
+    assert plan == "hosted"
+    assert landing == ("copied" if fresh else "in_place")
+
+
+class _OverlapMethod(QuantizeMethodBase):
+    """PWAL returns a *different layout aliasing the hosted input*: a plain
+    copy_ would read bytes it is overwriting."""
+
+    def create_weights(self, layer, *a, **k):
+        pass
+
+    def apply(self, layer, *a, **k):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        from vllm.model_executor.utils import replace_parameter
+
+        # the hosted [4, 6] checkpoint view itself: same bytes as the live
+        # tensor but a different layout (live is a transposed view)
+        replace_parameter(layer, "weight", layer.weight.view(4, 6))
+
+
+def test_direct_load_overlap_is_cloned(direct_load):
+    layer = torch.nn.Module()
+    layer.quant_method = _OverlapMethod()
+    w = torch.nn.Parameter(torch.zeros(4, 6), requires_grad=False)
+    w.weight_loader = default_weight_loader
+    layer.register_parameter("weight", w)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    # cold-start kernel layout: [4, 6] view of the [6, 4]-transposed bytes
+    layer.weight = torch.nn.Parameter(torch.zeros(6, 4).t(), requires_grad=False)
+    live = layer.weight
+    initialize_layerwise_reload(model)
+    new = torch.arange(24.0).view(4, 6)
+    orig = reload_layerwise._has_device_incoming
+    reload_layerwise._has_device_incoming = lambda _: True
+    try:
+        layer.weight.weight_loader(layer.weight, new)
+    finally:
+        reload_layerwise._has_device_incoming = orig
+    finalize_layerwise_reload(model, model_config=None)
+    assert direct_load.LANDING_OUTCOMES[layer]["weight"] == "overlap"
+    assert torch.equal(live, new)
+
+
+def test_direct_load_hosted_padding_reads_zero_and_failure_is_dirty(direct_load):
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        is_model_dirty,
+        start_reload,
+    )
+
+    layer = _PaddedLayer.__new__(_PaddedLayer)
+    torch.nn.Module.__init__(layer)
+    layer.quant_method = _ProcessRecorder()
+    w = torch.nn.Parameter(torch.full((4, 8), 7.0), requires_grad=False)
+    w.weight_loader = lambda param, loaded: param.data[:, :6].copy_(loaded)
+    w.weight_loader_numel = 24
+    layer.register_parameter("weight", w)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    orig = reload_layerwise._has_device_incoming
+    reload_layerwise._has_device_incoming = lambda _: True
+    try:
+        start_reload(model)
+        layer.weight.weight_loader(layer.weight, torch.ones(4, 6))
+        finalize_layerwise_reload(model, model_config=None)
+        # padding the loader never writes reads zero, not the old 7.0 bytes
+        assert torch.equal(w[:, 6:], torch.zeros(4, 2))
+        assert direct_load.PLAN_OUTCOMES[layer]["weight"] == "hosted"
+        # failure injection: hosting already wrote live bytes -> dirty
+        start_reload(model)
+        big = _ExpertLayer(device="cpu")  # unrelated; just fail mid-update
+        del big
+        layer2_input = torch.ones(4, 6)
+        layer.weight.weight_loader(layer.weight, layer2_input * 0)  # hosted
+        abort_reload(model)
+        assert is_model_dirty(model)
+    finally:
+        reload_layerwise._has_device_incoming = orig
+
+
 def test_unloaded_scale_keeps_create_time_sentinel():
     """A shard scale the checkpoint lacks must read as its create-time sentinel
     after reload (as at cold start), not as zero."""
@@ -2367,6 +2562,24 @@ def test_k3_dspark_context_kv_norms_refresh_in_place():
     assert m._context_kv_norm_weights is norms and norms.data_ptr() == ptr
     expected = torch.stack([la.self_attn.kv_a_layernorm.weight for la in layers])
     assert torch.equal(norms, expected)
+
+
+def test_plan_input_refuses_tensor_subclasses(direct_load):
+    """Tensor subclasses (e.g. torchao quantized weights) may not expose plain
+    storage for `set_`: direct loading never hosts in them (scratch)."""
+
+    class _Subclass(torch.Tensor):
+        pass
+
+    d = direct_load
+    meta = torch.empty(4, 6, device="meta")
+    plain = torch.zeros(4, 6)
+    sub = torch.zeros(4, 6).as_subclass(_Subclass)
+    d._STORAGE_USERS.clear()
+    for t in (plain, sub):
+        d._STORAGE_USERS[t.untyped_storage().data_ptr()] = 1
+    assert d.plan_input(meta, plain, "cpu") is None
+    assert d.plan_input(meta, sub, "cpu") == "tensor subclass"
 
 
 def test_refresh_derived_state_runs_declared_refreshes():

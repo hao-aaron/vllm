@@ -30,6 +30,7 @@ __all__ = [
     "get_reload_session",
     "is_model_dirty",
     "is_reload_active",
+    "landing_outcomes",
     "mark_dirty",
     "refresh_derived_state",
     "record_metadata_for_reloading",
@@ -40,6 +41,7 @@ __all__ = [
     "support_quantized_model_reload_from_hp_weights",
 ]
 
+from .direct import landing_outcomes
 from .layerwise import (
     LoadTarget,
     LoadTrace,

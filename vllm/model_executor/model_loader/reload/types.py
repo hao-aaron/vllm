@@ -66,6 +66,9 @@ class LayerReloadingInfo:
     # the update this module belongs to, set by `initialize_layerwise_reload`
     session: ReloadSession | None = None
 
+    # direct loading: tensors hosted in live storage -> (storage ptr, nbytes)
+    hosted: dict[str, tuple[int, int]] = field(default_factory=dict)
+
     def reset(self):
         self.__init__(  # type: ignore[misc]
             restore_metadata=self.restore_metadata,

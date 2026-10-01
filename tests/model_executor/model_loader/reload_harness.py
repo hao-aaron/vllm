@@ -243,9 +243,13 @@ class ReloadHarnessExtension:
         perturb: float | None = None,
         use_public_api: bool = True,
         force_rebuild: bool = False,
+        direct_load: bool | None = None,
     ) -> dict:
-        """Stream ``path`` into the live model. Returns memory/retention stats."""
-        return self._mw_reload(
+        """Stream ``path`` into the live model. Returns memory/retention stats.
+
+        ``direct_load`` overrides VLLM_RELOAD_DIRECT_LOAD for this call (read
+        at import time otherwise)."""
+        args = (
             path,
             order,
             batch_size,
@@ -257,6 +261,15 @@ class ReloadHarnessExtension:
             use_public_api,
             force_rebuild,
         )
+        from vllm.model_executor.model_loader.reload import direct as reload_direct
+
+        saved_flag = reload_direct.DIRECT_LOAD
+        if direct_load is not None:
+            reload_direct.DIRECT_LOAD = direct_load
+        try:
+            return self._mw_reload(*args)
+        finally:
+            reload_direct.DIRECT_LOAD = saved_flag
 
     def _mw_reload(
         self,
@@ -360,6 +373,9 @@ class ReloadHarnessExtension:
             "order": order,
             "seconds": dt,
         }
+        get_outcomes = getattr(reload_api, "landing_outcomes", None)
+        if get_outcomes is not None:
+            stats["landing"] = get_outcomes(model)
         return stats
 
     def mw_module_map(self, path: str) -> dict:
