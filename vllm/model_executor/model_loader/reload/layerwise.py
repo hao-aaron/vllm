@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
 import os
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import wraps
 from weakref import WeakKeyDictionary, WeakSet
 
@@ -22,8 +26,9 @@ from .meta import (
     capture_layer_to_meta,
     get_numel_loaded,
     restore_layer_on_meta,
+    to_meta_tensor,
 )
-from .types import LayerReloadingInfo
+from .types import LayerReloadingInfo, ReloadSession
 from .utils import (
     get_info_size,
     get_layer_params_buffers,
@@ -39,7 +44,19 @@ __all__ = [
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
+    "complete_module",
+    "ensure_param_materialized",
     "scratch_bytes_in_flight",
+    "start_reload",
+    "finish_reload",
+    "abort_reload",
+    "trace_loads",
+    "current_load",
+    "ensure_materialized",
+    "LoadTarget",
+    "LoadTrace",
+    "get_reload_session",
+    "is_reload_active",
 ]
 
 
@@ -54,6 +71,7 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
+_LOADING_LOCK = threading.Lock()
 
 # Warn once when checkpoint-format scratch held by incomplete modules exceeds
 # this budget (0 disables).
@@ -61,6 +79,47 @@ RELOAD_SCRATCH_BUDGET_BYTES = int(
     float(os.getenv("VLLM_RELOAD_SCRATCH_BUDGET_MB", "0")) * 1e6
 )
 _SCRATCH_BUDGET_WARNED = False
+
+
+@dataclass(frozen=True)
+class LoadTarget:
+    """The (module, tensor name) a wrapped loader is currently writing."""
+
+    module: torch.nn.Module
+    param_name: str
+    # the tensor the loader was handed (meta during a trace)
+    tensor: torch.Tensor | None = None
+
+
+# Set around every wrapped loader call, real or traced.
+_CURRENT_LOAD: ContextVar[LoadTarget | None] = ContextVar("current_load", default=None)
+
+
+def current_load() -> LoadTarget | None:
+    """(module, param_name) while a wrapped loader runs, else None."""
+    return _CURRENT_LOAD.get()
+
+
+class LoadTrace:
+    """Result of `trace_loads`: loaders ran on meta, nothing was buffered,
+    materialized or processed."""
+
+    def __init__(self):
+        self.copied_numel: dict[torch.nn.Module, int] = {}
+        self._totals: dict[torch.nn.Module, int] = {}
+
+    def _record(self, module: torch.nn.Module, numel: int, total: int) -> None:
+        self.copied_numel[module] = self.copied_numel.get(module, 0) + numel
+        self._totals[module] = total
+
+    def complete_modules(self) -> list[torch.nn.Module]:
+        """Modules whose copied numel reached their loadable size: the same rule
+        the real path uses to trigger `complete_module`."""
+        return [m for m, n in self.copied_numel.items() if n >= self._totals.get(m, 0)]
+
+
+# Active trace, if inside `trace_loads`
+_TRACE: LoadTrace | None = None
 
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
@@ -134,6 +193,9 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
+    session = ReloadSession()
+    model._reload_session = session
+
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
@@ -144,6 +206,8 @@ def initialize_layerwise_reload(model: torch.nn.Module):
         # Skip if the layer has already been initialized
         if info.can_load():
             continue
+
+        info.session = session
 
         # Save current tensors for later copying
         info.kernel_tensors = get_layer_params_buffers(layer)
@@ -220,24 +284,39 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         # Bind and normalize arguments
         bound_args = loader_signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
+        dest = bound_args.arguments.get("param")
+        if _TRACE is not None and isinstance(dest, torch.Tensor) and not dest.is_meta:
+            # Tensors kept live during reload (e.g. `bias`): trace against a meta
+            # copy so a dry run never writes live storage, and is counted
+            dest = to_meta_tensor(dest)
+            bound_args.arguments["param"] = dest
+        token = _CURRENT_LOAD.set(LoadTarget(layer, param_name, dest))
+        try:
+            if _TRACE is not None:
+                # Dry run (`trace_loads`): run on meta and count, nothing else
+                num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+                _TRACE._record(layer, num_loaded, info.load_numel_total)
+                return ret
 
-        info.loaded_names.add(param_name)
-        if _should_buffer(layer, bound_args):
-            # CPU/mmap incoming (cold-start online quant, file reload) or a
-            # deferred attention layer: buffer the call as before and count
-            # it with a dry run on the meta param.
-            info.loaded_weights.append((param_name, bound_args))
-            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
-        else:
-            # First touch: materialize this param's rank-local
-            # checkpoint-format target now and run the loader on it, so the
-            # incoming tensor (including non-local experts, which the loader
-            # declines) is not retained.
-            target = ensure_param_materialized(layer, info, param_name)
-            if info.loaded_weights:
-                _replay_buffered(layer, info)
-            bound_args.arguments["param"] = target
-            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+            info.loaded_names.add(param_name)
+            if _should_buffer(layer, bound_args):
+                # CPU/mmap incoming (cold-start online quant, file reload) or a
+                # deferred attention layer: buffer the call as before and count
+                # it with a dry run on the meta param.
+                info.loaded_weights.append((param_name, bound_args))
+                num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+            else:
+                # First touch: materialize this param's rank-local
+                # checkpoint-format target now and run the loader on it, so the
+                # incoming tensor (including non-local experts, which the loader
+                # declines) is not retained.
+                target = ensure_param_materialized(layer, info, param_name)
+                if info.loaded_weights:
+                    _replay_buffered(layer, info)
+                bound_args.arguments["param"] = target
+                num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        finally:
+            _CURRENT_LOAD.reset(token)
         info.load_numel += num_loaded
 
         logger.debug(
@@ -255,8 +334,10 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         if (
             _has_device_incoming(bound_args) or info.scratch_bytes > 0
         ) and layer not in LOADING_LAYERS:
-            LOADING_LAYERS.add(layer)
-            _warn_layers_in_flight(list(LOADING_LAYERS))
+            with _LOADING_LOCK:
+                LOADING_LAYERS.add(layer)
+                in_flight = list(LOADING_LAYERS)
+            _warn_layers_in_flight(in_flight)
 
         # Process and copy when all weights are loaded
         if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
@@ -326,6 +407,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         info.reset()
 
     LOADING_LAYERS.clear()
+
+    session = get_reload_session(model)
+    if session is not None:
+        session.active = False
 
 
 def finalize_layerwise_reload(*args, **kwargs):
@@ -493,15 +578,33 @@ def _warn_layers_in_flight(in_flight: list[torch.nn.Module]) -> None:
 
 def scratch_bytes_in_flight() -> int:
     """Checkpoint-format scratch currently held by incomplete modules."""
-    return sum(LAYERWISE_INFO[layer].scratch_bytes for layer in list(LOADING_LAYERS))
+    with _LOADING_LOCK:
+        in_flight = list(LOADING_LAYERS)
+    return sum(LAYERWISE_INFO[layer].scratch_bytes for layer in in_flight)
+
+
+def get_reload_session(model: torch.nn.Module) -> ReloadSession | None:
+    return getattr(model, "_reload_session", None)
+
+
+def is_reload_active(module: torch.nn.Module) -> bool:
+    """True between start and finish/abort of a streamed reload that covers
+    `module`. Works on any submodule (e.g. a VL wrapper's language model,
+    whose parent holds the session)."""
+    info = LAYERWISE_INFO.get(module)
+    session = info.session if info is not None else None
+    if session is None:
+        session = get_reload_session(module)
+    return session is not None and session.active
 
 
 def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = None):
     """Finish one module: PWAL on its checkpoint-format tensors, copy the
     results into the live tensors, restore the original tensor objects, reset.
 
-    Called by the wrapped loader when a module's count reaches its total, and
-    by finalize for modules that never reached it.
+    Called by the wrapped loader when a module's count reaches its total, by
+    finalize for modules that never reached it, and by engines that route
+    bytes themselves. It does not require the count to have reached its total.
     """
     if info is None:
         info = get_layerwise_info(layer)
@@ -535,8 +638,78 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         _copy_and_restore_kernel_tensors(layer, info)
 
     info.reset()
-    LOADING_LAYERS.discard(layer)
+    with _LOADING_LOCK:
+        LOADING_LAYERS.discard(layer)
     logger.debug("%s: Processed", layer.__class__.__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public per-module reload API
+# ---------------------------------------------------------------------------
+
+
+def start_reload(model: torch.nn.Module) -> None:
+    """Begin a streaming reload (alias of `initialize_layerwise_reload`)."""
+    initialize_layerwise_reload(model)
+
+
+def finish_reload(model: torch.nn.Module, model_config: ModelConfig) -> None:
+    """Finish a streaming reload (alias of `finalize_layerwise_reload`)."""
+    finalize_layerwise_reload(model, model_config)
+
+
+def abort_reload(model: torch.nn.Module) -> None:
+    """Put the original tensors back, reset reload state and unwrap loaders.
+
+    Values are intact only for modules that were not completed yet.
+    """
+    for layer in model.modules():
+        info = LAYERWISE_INFO.get(layer)
+        if info is None or not info.can_load():
+            continue
+        if info.kernel_tensors is not None:
+            _place_kernel_tensors(layer, info)
+        for tensor in get_layer_tensors(layer).values():
+            loader = getattr(tensor, "weight_loader", None)
+            if loader is not None and loader.__name__ == "online_process_loader":
+                tensor.weight_loader = _get_original_loader(tensor)
+        info.reset()
+    if hasattr(model, "_original_do_torchao_reload"):
+        model._do_torchao_reload = model._original_do_torchao_reload
+    with _LOADING_LOCK:
+        LOADING_LAYERS.clear()
+    session = get_reload_session(model)
+    if session is not None:
+        session.active = False
+
+
+@contextmanager
+def trace_loads(model: torch.nn.Module) -> Iterator[LoadTrace]:
+    """Dry run: loaders run on meta, nothing is buffered, materialized or
+    processed. `start_reload` on enter, `abort_reload` on exit."""
+    global _TRACE
+    trace = LoadTrace()
+    start_reload(model)
+    _TRACE = trace
+    try:
+        yield trace
+    finally:
+        _TRACE = None
+        abort_reload(model)
+
+
+def ensure_materialized(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """First touch for engines that route bytes themselves: materialize every
+    tensor of `module` and return its load targets by name. Touches only this
+    module's state (safe to call from a scatter thread)."""
+    info = LAYERWISE_INFO.get(module)
+    if info is None or not info.can_load():
+        raise RuntimeError(
+            f"{type(module).__name__} was not set up for reload "
+            "(start_reload / start_weight_update must run first)"
+        )
+    _materialize_all(module, info)
+    return get_layer_tensors(module)
 
 
 def _get_original_loader(tensor: torch.Tensor) -> Callable:

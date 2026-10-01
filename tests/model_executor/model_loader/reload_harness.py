@@ -361,6 +361,75 @@ class ReloadHarnessExtension:
         }
         return stats
 
+    def mw_module_map(self, path: str) -> dict:
+        """Dry-run every checkpoint tensor of ``path`` through the model's own
+        ``load_weights`` (``trace_loads``, meta tensors) and record where each
+        lands: (module, param, counted numel). Also returns each module's
+        loadable total and each param's checkpoint-format bytes on this rank.
+        Feeds an independent prediction of reload memory."""
+        from safetensors import safe_open
+
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import current_load, trace_loads
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        model = self._mw_model()
+        modname = {id(m): n for n, m in model.named_modules()}
+        files = _checkpoint_files(path)
+        names = _read_names(files)
+        dtypes = {
+            "BF16": torch.bfloat16,
+            "F16": torch.float16,
+            "F32": torch.float32,
+            "U8": torch.uint8,
+            "I8": torch.int8,
+            "I32": torch.int32,
+            "I64": torch.int64,
+            "F8_E4M3": torch.float8_e4m3fn,
+            "F8_E8M0": torch.uint8,
+        }
+        hits: dict[str, list] = {}
+        incoming: dict[str, int] = {}
+        errors: dict[str, str] = {}
+        with set_current_vllm_config(self.vllm_config), trace_loads(model) as trace:
+            record = trace._record
+
+            def _record(module, numel, total, record=record):
+                target = current_load()
+                hits.setdefault(current, []).append(
+                    (modname[id(module)], target.param_name if target else "", numel)
+                )
+                record(module, numel, total)
+
+            trace._record = _record  # type: ignore[method-assign]
+            for name, fn in names:
+                with safe_open(fn, "pt") as f:
+                    sl = f.get_slice(name)
+                    shape, dtype = sl.get_shape(), dtypes[sl.get_dtype()]
+                current = name
+                t = torch.empty(shape, dtype=dtype, device="meta")
+                incoming[name] = t.numel() * t.element_size()
+                try:
+                    _stream_load(model, [(name, t)])
+                except Exception as e:  # e.g. a loader that bypasses reload
+                    errors[name] = f"{type(e).__name__}: {e}"[:200]
+            totals = {modname[id(m)]: n for m, n in trace._totals.items()}
+            param_bytes = {}
+            for m, info in LAYERWISE_INFO.items():
+                if modname.get(id(m)) in totals:
+                    params, buffers = info.restore_metadata
+                    param_bytes[modname[id(m)]] = {
+                        n: t.numel() * t.element_size()
+                        for n, t in {**params, **buffers}.items()
+                    }
+        return {
+            "hits": hits,
+            "incoming": incoming,
+            "totals": totals,
+            "param_bytes": param_bytes,
+            "errors": errors,
+        }
+
     def mw_call(self, fn_path: str, *args, **kwargs):
         """Call ``module:function(model, *args)`` in the worker."""
         import importlib
