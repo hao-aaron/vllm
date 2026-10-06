@@ -1791,75 +1791,49 @@ class _WqB(torch.nn.Module):
             self.register_parameter(name, p)
 
 
-class _MegaAttnLike(torch.nn.Module):
-    """Parent that permutes its child's rows in place once, behind a guard,
-    exactly like `DeepseekV4MegaAttnAttention.finalize_loaded_weights`."""
+@pytest.mark.parametrize("host", [False, True])
+def test_permute_on_load_lands_permuted_layout(monkeypatch, host):
+    """DeepSeek-V4.1 mega attention permutes wq_b rows in its weight loader
+    (#60064): reload runs the same loader, so the kernel layout lands without
+    any post-load step."""
+    from vllm.models.deepseek_v41.common.ops.fused_layout import (
+        permute_on_load,
+        q_fused_permutation,
+    )
 
-    def __init__(self, register_transform):
-        super().__init__()
-        from vllm.model_executor.model_loader.reload import attach_processing_plan
+    from vllm.model_executor.model_loader.reload import direct
 
-        self.heads = 2
-        self.wq_b = _WqB(self.heads * 32, 8)
-        self._fused_layouts_ready = False
-        if register_transform:
-            attach_processing_plan(self.wq_b, self._permute)
-
-    def _permute(self, wq_b):
-        from vllm.models.deepseek_v41.common.ops.fused_layout import permute_wq_b_
-
-        permute_wq_b_(wq_b.weight.data, wq_b.weight_scale.data, self.heads)
-
-    def finalize_loaded_weights(self):
-        from vllm.model_executor.utils import is_reloading
-
-        if self._fused_layouts_ready:
-            return
-        self._permute(self.wq_b)
-        if not is_reloading():
-            self._fused_layouts_ready = True
-
-
-@pytest.mark.parametrize("register_transform", [False, True])
-def test_attached_processing_plan_permutes_before_landing(register_transform):
-    from vllm.models.deepseek_v41.common.ops.fused_layout import q_fused_permutation
-
-    parent = _MegaAttnLike(register_transform)
-    model = torch.nn.Sequential(parent)
+    monkeypatch.setattr(direct, "DIRECT_LOAD", host)
+    heads = 2
+    wq_b = _WqB(heads * 32, 8)
+    perm = q_fused_permutation(heads, 32)
+    permute_on_load(wq_b.weight, perm, dim=0)
+    permute_on_load(wq_b.weight_scale, perm, dim=0)
+    model = torch.nn.Sequential(wq_b)
     record_metadata_for_reloading(model)
     g = torch.Generator().manual_seed(0)
-    A = {
-        n: torch.randint(0, 255, p.shape, generator=g, dtype=torch.uint8)
-        for n, p in parent.wq_b.named_parameters()
-    }
-    B = {
-        n: torch.randint(0, 255, p.shape, generator=g, dtype=torch.uint8)
-        for n, p in parent.wq_b.named_parameters()
-    }
+    A, B = (
+        {
+            n: torch.randint(0, 255, p.shape, generator=g, dtype=torch.uint8)
+            for n, p in wq_b.named_parameters()
+        }
+        for _ in range(2)
+    )
     for n, v in A.items():
-        getattr(parent.wq_b, n).data.copy_(v)
-    parent.finalize_loaded_weights()  # cold start: model hook
-    ptr = parent.wq_b.weight.data_ptr()
-    perm = q_fused_permutation(parent.heads, 32)
-    assert torch.equal(parent.wq_b.weight, A["weight"][perm])
+        p = getattr(wq_b, n)
+        p.weight_loader(p, v)
+    ptr = wq_b.weight.data_ptr()
+    assert torch.equal(wq_b.weight, A["weight"][perm])
 
     initialize_layerwise_reload(model)
     for n, v in B.items():
-        p = getattr(parent.wq_b, n)
+        p = getattr(wq_b, n)
         p.weight_loader(p, v)
     finalize_layerwise_reload(model, model_config=None)
-    parent.finalize_loaded_weights()  # even if something re-ran it: guarded
 
-    assert parent.wq_b.weight.data_ptr() == ptr
-    if register_transform:
-        # final (permuted) layout landed exactly once
-        assert torch.equal(parent.wq_b.weight, B["weight"][perm])
-        assert torch.equal(parent.wq_b.weight_scale, B["weight_scale"][perm])
-    else:
-        # today's behavior: the checkpoint layout lands and the guard blocks
-        # the permute, so the kernel would read a mismatched layout
-        assert torch.equal(parent.wq_b.weight, B["weight"])
-        assert not torch.equal(parent.wq_b.weight, B["weight"][perm])
+    assert wq_b.weight.data_ptr() == ptr
+    assert torch.equal(wq_b.weight, B["weight"][perm])
+    assert torch.equal(wq_b.weight_scale, B["weight_scale"][perm])
 
 
 def _two_expert_layers():
