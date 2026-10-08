@@ -208,6 +208,8 @@ class ArrayLogprobs(Sequence[LogprobsOnePosition]):
         self._num_rows = 0
         # Positions after the array rows, once an irregular row was seen.
         self._irregular: list[LogprobsOnePosition] | None = None
+        # Their slot 0 values (a dict keeps the last value of a repeated id).
+        self._irregular_sampled: list[float] = []
         self.broken = False
 
     @property
@@ -269,6 +271,7 @@ class ArrayLogprobs(Sequence[LogprobsOnePosition]):
             self._irregular.extend(
                 _row_dict(token_ids[i], logprobs[i], ranks[i]) for i in range(n)
             )
+            self._irregular_sampled += logprobs[:, 0].tolist()
             return
         pos = 0
         while pos < n:
@@ -291,6 +294,19 @@ class ArrayLogprobs(Sequence[LogprobsOnePosition]):
         self._logprobs.append(np.empty((rows, width), dtype="<f4"))
         self._ranks.append(np.empty((rows,), dtype="<i4"))
         self._tail_fill = 0
+
+    def sampled_logprobs(self) -> list[float]:
+        """The sampled token's raw logprob (slot 0) per position."""
+        if self.broken:
+            raise ValueError("Sample logprobs are unavailable: storing them failed")
+        values: list[float] = []
+        remaining = self._num_rows
+        for block in self._logprobs:
+            values += block[:remaining, 0].tolist()
+            remaining -= len(block)
+            if remaining <= 0:
+                break
+        return values + self._irregular_sampled
 
     def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """The rows as contiguous ``(token_ids[N, S], logprobs[N, S],

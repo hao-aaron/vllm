@@ -45,7 +45,7 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import GenerationError
 from vllm.inputs import EngineInput, TokensPrompt, mm_input
 from vllm.logger import init_logger
-from vllm.logprobs import ArrayLogprobs, Logprob
+from vllm.logprobs import ArrayLogprobs, FlatLogprobs, Logprob
 from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     MultiModalKwargsItems,
@@ -58,7 +58,11 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
-from .logprobs_render import render_json_with_fragments, render_tokens_logprobs
+from .logprobs_render import (
+    append_sampled_logprobs,
+    render_json_with_fragments,
+    render_tokens_logprobs,
+)
 from .mm_features import (
     mm_kwargs_from_features,
     placeholder_ranges_from_engine_input,
@@ -306,6 +310,39 @@ class ServingTokens(GenerateBaseServing):
             raw_request.state.request_metadata = request_metadata
 
         sampling_params = request.sampling_params
+        if request.return_token_logprobs:
+            if request.output_mode != "tokens":
+                # ``sampled`` lives on the tokens-mode ``GenerateLogProbs``.
+                return self.create_error_response(
+                    "return_token_logprobs requires output_mode='tokens'"
+                )
+            if request.stream:
+                return self.create_error_response(
+                    "return_token_logprobs is not supported with stream=True"
+                )
+            if self.model_config.logprobs_mode not in (
+                "raw_logprobs",
+                "processed_logprobs",
+            ):
+                # The field is named for log-probabilities; do not hand back
+                # logits under that name.
+                return self.create_error_response(
+                    "return_token_logprobs requires --logprobs-mode raw_logprobs "
+                    "or processed_logprobs (server runs "
+                    f"{self.model_config.logprobs_mode})"
+                )
+            if sampling_params.logprobs is None:
+                sampling_params.logprobs = 0
+            if sampling_params.logprobs == 0:
+                # Only the sampled token's logprob is needed: transport one
+                # float per token from the scheduler and skip per-token
+                # Logprob entries and detokenization entirely.
+                sampling_params.sampled_logprobs_only = True
+            else:
+                # Top logprobs were also requested: keep the object path and
+                # read the sampled column from the flat representation (or
+                # from the engine rows, see _array_logprobs below).
+                sampling_params.flat_logprobs = True
         max_num_seqs = self.engine_client.vllm_config.scheduler_config.max_num_seqs
         if sampling_params.n > max_num_seqs:
             return self.create_error_response(
@@ -583,15 +620,31 @@ class ServingTokens(GenerateBaseServing):
             token_ids = output.token_ids
             out_logprobs = output.logprobs
 
-            # This is top_logprobs in completions API
+            sampled = None
+            if request.return_token_logprobs:
+                if output.sampled_logprobs is not None:
+                    sampled = [_clamp_logprob(x) for x in output.sampled_logprobs]
+                else:
+                    assert isinstance(out_logprobs, FlatLogprobs | ArrayLogprobs), (
+                        "Did not output logprobs"
+                    )
+                    sampled = self._sampled_token_logprobs(out_logprobs)
+
+            # This is top_logprobs in completions API. With
+            # return_token_logprobs the objects are only built when the
+            # caller also asked for top logprobs.
             logprobs: GenerateLogProbs | ChatCompletionLogProbs | None = None
-            if sampling_params.logprobs is not None:
+            rendered = None
+            if sampling_params.logprobs is not None and not (
+                request.return_token_logprobs and sampling_params.logprobs == 0
+            ):
                 assert out_logprobs is not None, "Did not output logprobs"
-                rendered = None
                 if isinstance(out_logprobs, ArrayLogprobs) and not text_mode:
                     rendered = render_tokens_logprobs(
                         token_ids, out_logprobs, sampling_params.logprobs
                     )
+                    if rendered is not None and sampled is not None:
+                        rendered = append_sampled_logprobs(rendered, sampled)
                     if rendered is None:
                         # Irregular rows: the per-entry path, in one pass.
                         out_logprobs = list(out_logprobs)
@@ -610,6 +663,14 @@ class ServingTokens(GenerateBaseServing):
                         top_logprobs=out_logprobs,
                         num_output_top_logprobs=sampling_params.logprobs,
                     )
+            if sampled is not None and rendered is None:
+                # Tokens mode only (checked above). With logprobs=0 no content
+                # entries were built: content stays None, only sampled is set.
+                if logprobs is None:
+                    logprobs = GenerateLogProbs(sampled=sampled)
+                else:
+                    assert isinstance(logprobs, GenerateLogProbs)
+                    logprobs.sampled = sampled
 
             routed_experts_b64 = (
                 numpy2base64(output.routed_experts)
@@ -690,8 +751,14 @@ class ServingTokens(GenerateBaseServing):
             (choice.index, choice.finish_reason) for choice in response.choices
         ]
         if fragments:
+            # As api_router dumps the response (sampled only when requested).
+            exclude = (
+                None
+                if request.return_token_logprobs
+                else {"choices": {"__all__": {"logprobs": {"sampled"}}}}
+            )
             parts = render_json_with_fragments(
-                response.model_dump(), "logprobs", fragments
+                response.model_dump(exclude=exclude), "logprobs", fragments
             )
             # Joined here, so a large body is never copied on the event loop.
             return RenderedGenerateResponse(b"".join(parts)), usage, choice_meta
@@ -882,6 +949,22 @@ class ServingTokens(GenerateBaseServing):
         if not text_mode or self.return_tokens_as_token_ids:
             return None
         return self.renderer.tokenizer
+
+    @staticmethod
+    def _sampled_token_logprobs(flat: FlatLogprobs | ArrayLogprobs) -> list[float]:
+        """Sampled-token logprob per position from the flat representation.
+
+        The sampler stores the sampled token first at every position, so its
+        logprob is the entry at each position's start index (slot 0 of the
+        engine rows for ``ArrayLogprobs``). Every position
+        carries at least that entry whenever ``logprobs`` is requested. Values
+        go through ``_clamp_logprob`` (``-inf`` and NaN become ``-9999.0``), so
+        they stay JSON-representable.
+        """
+        if isinstance(flat, ArrayLogprobs):
+            return [_clamp_logprob(v) for v in flat.sampled_logprobs()]
+        logprobs = flat.logprobs
+        return [_clamp_logprob(logprobs[start]) for start in flat.start_indices]
 
     def _create_text_logprobs(
         self,

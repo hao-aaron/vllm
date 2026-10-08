@@ -5,6 +5,7 @@ kept as engine rows (ArrayLogprobs): byte-identical to the per-entry
 pydantic path, which every other case still uses."""
 
 import asyncio
+import json
 import threading
 from unittest.mock import MagicMock
 
@@ -51,11 +52,11 @@ def _rows(n, slots, seed=0, vocab=50_000):
     return ids.astype(np.int32), lps, rng.integers(0, 100, n)
 
 
-def _stored(k, *steps, array):
+def _stored(k, *steps, array, flat=False):
     """The rows of ``steps`` as the LogprobsProcessor stores them."""
     processor = LogprobsProcessor(
         tokenizer=None,
-        logprobs=create_sample_logprobs(False, array_logprobs=array),
+        logprobs=create_sample_logprobs(flat, array_logprobs=array),
         prompt_logprobs=None,
         cumulative_logprob=0.0,
         num_logprobs=k,
@@ -80,13 +81,14 @@ def _final(outputs, finish_reason="length"):
     )
 
 
-def _body(serving, k, outputs, finish_reason="length"):
+def _body(serving, k, outputs, finish_reason="length", **fields):
     """The response body as the router sends it, and whether it was
     rendered from the rows."""
     request = GenerateRequest(
         token_ids=[1, 2, 3],
         sampling_params=SamplingParams(max_tokens=10, logprobs=k),
         model=MODEL_NAME,
+        **fields,
     )
     response = serving._build_full_response(
         request, _final(outputs, finish_reason), "r", MODEL_NAME, 1700000000
@@ -94,7 +96,12 @@ def _body(serving, k, outputs, finish_reason="length"):
     if isinstance(response, RenderedGenerateResponse):
         return response.body, True
     assert isinstance(response, GenerateResponseBase)
-    return JSONResponse(content=response.model_dump()).body, False
+    exclude = (
+        None
+        if request.return_token_logprobs
+        else {"choices": {"__all__": {"logprobs": {"sampled"}}}}
+    )
+    return JSONResponse(content=response.model_dump(exclude=exclude)).body, False
 
 
 def _outcome(serving, k, choices, finish_reason="length"):
@@ -177,6 +184,30 @@ def test_special_and_irregular_rows_match_the_per_entry_path(name, k, choices):
     serving = _build_serving_tokens(_mock_engine())
     legacy, fast = _outcome(serving, k, choices)
     assert fast == legacy
+
+
+@pytest.mark.parametrize("name,k,choices", _cases(), ids=[c[0] for c in _cases()])
+def test_return_token_logprobs_with_top_k_matches_the_flat_path(name, k, choices):
+    """With return_token_logprobs and k > 0, ``sampled`` comes from slot 0 of
+    the rows and ``content`` from the fast render: the same bytes (or error)
+    as the FlatLogprobs path of return_token_logprobs."""
+    if k <= 0:
+        return
+    serving = _build_serving_tokens(_mock_engine())
+    results = []
+    for array in (False, True):
+        outputs = [
+            (tokens, _stored(k, *steps, array=array, flat=True))
+            for tokens, steps in choices
+        ]
+        try:
+            results.append(_body(serving, k, outputs, return_token_logprobs=True)[0])
+        except ValueError as e:
+            results.append(f"{type(e).__name__}: {e}")
+    assert results[1] == results[0]
+    if isinstance(results[0], bytes):
+        logprobs = json.loads(results[0])["choices"][0]["logprobs"]
+        assert list(logprobs) == ["content", "sampled"]
 
 
 def test_aborted_choice_without_tokens():
