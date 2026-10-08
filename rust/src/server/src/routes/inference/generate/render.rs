@@ -31,7 +31,7 @@ use tracing_futures::Instrument as _;
 use vllm_engine_core_client::protocol::logprobs::{PositionLogprobs, TokenLogprob};
 
 use super::top_k::TopKLogprobs;
-use super::types::{GenerateResponse, GenerateResponseChoice};
+use super::types::{GenerateLogProbs, GenerateResponse, GenerateResponseChoice};
 use super::{top_logprob_entries, wire_rank};
 use crate::routes::openai::utils::logprobs::clamp_logprob;
 
@@ -39,12 +39,16 @@ use crate::routes::openai::utils::logprobs::clamp_logprob;
 pub(super) enum ChoiceLogprobs {
     /// `"logprobs": null`.
     None,
-    /// `{"content": [...]}` for `sampling_params.logprobs = requested`.
-    /// Positions must be non-empty.
+    /// `{"content": [...]}` for `sampling_params.logprobs = requested`, plus
+    /// `"sampled"` for `return_token_logprobs`. Positions must be non-empty.
     Generate {
         positions: Vec<PositionLogprobs>,
         requested: i32,
+        sampled: Option<Vec<f64>>,
     },
+    /// `{"content":null,"sampled":[...]}` for `return_token_logprobs` with
+    /// `logprobs = 0`.
+    Sampled(Vec<f64>),
     /// `{"content":null,"sampled":[...],"top_k":{...}}` for
     /// `return_top_k_logprobs` (`sampled` only with `return_token_logprobs`).
     TopK(TopKLogprobs),
@@ -59,16 +63,32 @@ const BODY_CHANNEL_CHUNKS: usize = 2;
 
 /// Build the HTTP response for one non-streaming generate request whose choice
 /// carries no `logprobs` (they are passed separately).
-pub(super) fn generate_response(response: GenerateResponse, logprobs: ChoiceLogprobs) -> Response {
+pub(super) fn generate_response(
+    mut response: GenerateResponse,
+    logprobs: ChoiceLogprobs,
+) -> Response {
     let body = match logprobs {
         ChoiceLogprobs::None => return Json(response).into_response(),
+        ChoiceLogprobs::Sampled(sampled) => {
+            response.choices[0].logprobs = Some(GenerateLogProbs {
+                content: None,
+                sampled: Some(sampled),
+            });
+            return Json(response).into_response();
+        }
         ChoiceLogprobs::Generate {
             positions,
             requested,
+            sampled,
         } => {
             let (mut head, choice_tail) = split_response(response);
             head.extend_from_slice(b"{\"content\":[");
-            let mut tail = b"]}".to_vec();
+            let mut tail = b"]".to_vec();
+            if let Some(sampled) = sampled {
+                tail.extend_from_slice(b",\"sampled\":");
+                json(&mut tail, &sampled);
+            }
+            tail.push(b'}');
             tail.extend_from_slice(&choice_tail);
 
             let (tx, rx) = mpsc::channel(BODY_CHANNEL_CHUNKS);
@@ -521,6 +541,7 @@ mod tests {
         ChoiceLogprobs::Generate {
             positions,
             requested: 2,
+            sampled: None,
         }
     }
 
