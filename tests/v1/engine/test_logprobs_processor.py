@@ -209,12 +209,12 @@ def test_array_logprobs_only_for_final_only_top_k(
 
 
 def test_sampled_logprobs_only_keeps_a_float_list_and_no_entries():
-    """``sampled_logprobs_only`` requests receive one float per token from
+    """``_sampled_logprobs_only`` requests receive one float per token from
     the scheduler and never build Logprob entries or detokenize."""
     from vllm.sampling_params import SamplingParams
     from vllm.v1.engine import EngineCoreRequest
 
-    params = SamplingParams(logprobs=0, sampled_logprobs_only=True)
+    params = SamplingParams(logprobs=0, _sampled_logprobs_only=True)
     request = EngineCoreRequest(
         request_id="r",
         prompt_token_ids=[1, 2, 3],
@@ -251,7 +251,7 @@ def test_sampled_logprobs_only_requires_logprobs_zero():
 
     from vllm.sampling_params import SamplingParams
 
-    with pytest.raises(ValueError, match="sampled_logprobs_only"):
-        SamplingParams(logprobs=2, sampled_logprobs_only=True)
-    with pytest.raises(ValueError, match="sampled_logprobs_only"):
-        SamplingParams(sampled_logprobs_only=True)
+    with pytest.raises(ValueError, match="_sampled_logprobs_only"):
+        SamplingParams(logprobs=2, _sampled_logprobs_only=True)
+    with pytest.raises(ValueError, match="_sampled_logprobs_only"):
+        SamplingParams(_sampled_logprobs_only=True)

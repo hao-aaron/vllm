@@ -44,7 +44,7 @@ class LogprobsProcessor:
     num_prompt_logprobs: int | None
     # [num_scored_rows, num_token_ids], set once on the final prefill chunk.
     prompt_token_id_logprobs: np.ndarray | None = None
-    # Sampled-token logprob per position for ``sampled_logprobs_only``
+    # Sampled-token logprob per position for ``_sampled_logprobs_only``
     # requests; ``logprobs`` stays None for them.
     sampled_logprobs: list[float] | None = None
 
@@ -58,7 +58,7 @@ class LogprobsProcessor:
         assert sampling_params is not None
         num_logprobs = sampling_params.num_logprobs
         num_prompt_logprobs = sampling_params.prompt_logprobs
-        sampled_only = sampling_params.sampled_logprobs_only
+        sampled_only = sampling_params._sampled_logprobs_only
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.0),
