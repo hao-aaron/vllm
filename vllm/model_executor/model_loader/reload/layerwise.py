@@ -224,6 +224,7 @@ def initialize_layerwise_reload(
         _check_model_hook_reload_safe(model)
         _check_moe_methods_reload_safe(model)
         _check_live_tensors_unchanged(model)
+        _verify.enforce(_verify.verify_reload(model, _current_vllm_config()))
 
     # A failed update leaves the model dirty until a full update succeeds
     previous = get_reload_session(model)
@@ -1191,6 +1192,12 @@ def _kv_scale_floats(layer: torch.nn.Module) -> tuple:
         getattr(layer, name, None)
         for name in ("_q_scale_float", "_k_scale_float", "_v_scale_float")
     )
+
+
+def _current_vllm_config():
+    from vllm.config import get_current_vllm_config_or_none
+
+    return get_current_vllm_config_or_none()
 
 
 def _cudagraphs_captured() -> bool:

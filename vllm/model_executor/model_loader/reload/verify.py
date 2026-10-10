@@ -25,10 +25,14 @@ Checks (numbered as in the SupportsReload RFC):
 - 6.6 after every update (`verify_post_update`): nothing left on meta, no
   module still holding checkpoint-format inputs.
 
+`enforce(report)` is the policy at the start of every update: items known to
+produce wrong weights refuse it, the rest warn.
+
 The verifier proves structure, not values: a wrong refresh formula passes.
 """
 
 import enum
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -41,7 +45,9 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 logger = init_logger(__name__)
 
 __all__ = [
+    "ReloadRefusedError",
     "checkpoint_meta_from_safetensors",
+    "enforce",
     "verify_load_coverage",
     "merge_reload_reports",
     "ReloadItem",
@@ -64,6 +70,8 @@ class ReloadItem:
     module: str
     reason: str
     status: ReloadStatus
+    # known to produce wrong weights: an update is refused (see `enforce`)
+    refuse: bool = False
 
 
 @dataclass
@@ -84,8 +92,9 @@ class ReloadReport:
         module: str,
         reason: str,
         status: ReloadStatus,
+        refuse: bool = False,
     ):
-        self.items.append(ReloadItem(check, module, reason, status))
+        self.items.append(ReloadItem(check, module, reason, status, refuse))
 
     def of(self, status: ReloadStatus) -> list[ReloadItem]:
         return [item for item in self.items if item.status == status]
@@ -414,6 +423,7 @@ def _check_load_coverage(model: torch.nn.Module, report: ReloadReport) -> None:
             "written during load_weights without its weight_loader: a reload "
             "writes a meta placeholder and keeps the old value",
             UNSAFE,
+            refuse=True,
         )
     for name in coverage.never_loaded:
         report.add(
@@ -559,6 +569,7 @@ def _check_configuration(
             "EPLB is enabled: loaders write experts into their startup slots, "
             "not where a rebalance moved them",
             UNSAFE,
+            refuse=True,
         )
     offload = getattr(vllm_config, "offload_config", None)
     uva = getattr(offload, "uva", None)
@@ -571,6 +582,7 @@ def _check_configuration(
             "",
             "weight offloading is not supported by reload",
             UNSAFE,
+            refuse=True,
         )
     if getattr(vllm_config, "lora_config", None) is not None:
         report.add(
@@ -597,7 +609,7 @@ def _check_configuration(
                 UNVERIFIED,
             )
     if backend == "sharded_rdt" and parallel.enable_eplb:
-        report.add("6.5", "", "sharded_rdt does not support EPLB", UNSAFE)
+        report.add("6.5", "", "sharded_rdt does not support EPLB", UNSAFE, refuse=True)
     if backend == "sparse_nccl":
         _check_sparse_layouts(model, report)
 
@@ -629,6 +641,7 @@ def _check_sparse_layouts(model: torch.nn.Module, report: ReloadReport) -> None:
                 f"sparse_nccl patches checkpoint coordinates, but {label} keeps "
                 "experts in a kernel layout",
                 UNSAFE,
+                refuse=True,
             )
         elif getattr(method, "uses_online_quant", False):
             report.add(
@@ -637,6 +650,7 @@ def _check_sparse_layouts(model: torch.nn.Module, report: ReloadReport) -> None:
                 "sparse_nccl patches checkpoint coordinates into online-quantized "
                 "weights",
                 UNSAFE,
+                refuse=True,
             )
 
 
@@ -681,3 +695,42 @@ def merge_reload_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
         if item["status"] != "SAFE"
     ]
     return {"status": status, "items": items}
+
+
+# VLLM_RELOAD_ALLOW_UNSAFE=1 lets updates run despite known-wrong items
+ALLOW_UNSAFE = os.getenv("VLLM_RELOAD_ALLOW_UNSAFE", "0") == "1"
+
+
+class ReloadRefusedError(RuntimeError):
+    pass
+
+
+def enforce(report: ReloadReport) -> None:
+    """Policy at the start of an update, before any write. Items known to
+    produce wrong weights refuse the update (VLLM_RELOAD_ALLOW_UNSAFE=1 runs
+    it anyway); other UNSAFE items warn, naming the rule and the fix."""
+    refusals = [i for i in report.items if i.refuse]
+    others = [i for i in report.of(UNSAFE) if not i.refuse]
+    if others:
+        logger.warning_once(
+            "Weight update proceeds with %d unverified-unsafe item(s); a CUDA "
+            "graph or kernel may keep stale state. First: %s",
+            len(others),
+            "; ".join(
+                f"[{i.check}] {i.module or '<model>'}: {i.reason}" for i in others[:3]
+            ),
+        )
+    if not refusals:
+        return
+    msg = "; ".join(
+        f"[{i.check}] {i.module or '<model>'}: {i.reason}" for i in refusals[:5]
+    )
+    if ALLOW_UNSAFE:
+        logger.warning_once("UNSAFE WEIGHT UPDATE (allowed): %s", msg)
+        return
+    raise ReloadRefusedError(
+        f"Weight update refused, it would serve wrong weights: {msg}. Fix the "
+        "configuration or model (see the reload verifier report, "
+        "LLM.check_reload_support()), or set VLLM_RELOAD_ALLOW_UNSAFE=1 to "
+        "update anyway."
+    )

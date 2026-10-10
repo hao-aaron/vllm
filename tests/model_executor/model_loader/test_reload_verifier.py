@@ -283,3 +283,44 @@ def test_ownership_flags_undeclared_device_tensors():
         ("layers.*.quant_method.kernel.alphas", UNSAFE),  # layer 0 only
         ("layers.*.quant_method.kernel.lut", UNSAFE),
     ]
+
+
+def test_enforce_refuses_only_known_wrong(monkeypatch):
+    """Policy at the start of an update: items known to produce wrong
+    weights refuse it (unless VLLM_RELOAD_ALLOW_UNSAFE=1); everything else,
+    UNSAFE included, only warns."""
+    import vllm.model_executor.model_loader.reload.verify as verify
+
+    warned = []
+    monkeypatch.setattr(verify.logger, "warning_once", lambda *a: warned.append(a))
+    report = verify.ReloadReport()
+    report.add("6.2", "x", "undeclared tensor", UNSAFE)
+    verify.enforce(report)  # warns
+    assert len(warned) == 1
+    report.add("6.5", "", "EPLB", UNSAFE, refuse=True)
+    with pytest.raises(verify.ReloadRefusedError, match="EPLB"):
+        verify.enforce(report)
+    monkeypatch.setattr(verify, "ALLOW_UNSAFE", True)
+    verify.enforce(report)
+
+
+def test_eplb_refuses_weight_update(monkeypatch):
+    """Through the reload start: an EPLB configuration refuses the update
+    before anything is written."""
+    import vllm.model_executor.model_loader.reload.layerwise as layerwise
+    from vllm.model_executor.model_loader.reload import is_model_dirty
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_eplb=True),
+        weight_transfer_config=None,
+        offload_config=None,
+        lora_config=None,
+        model_config=None,
+    )
+    monkeypatch.setattr(layerwise, "_current_vllm_config", lambda: config)
+    model = _Reloadable()
+    record_metadata_for_reloading(model)
+    with pytest.raises(Exception, match="EPLB"):
+        layerwise.initialize_layerwise_reload(model)
+    assert not is_model_dirty(model)
+    assert all(not p.is_meta for p in model.parameters())

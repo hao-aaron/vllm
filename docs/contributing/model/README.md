@@ -16,6 +16,7 @@ Read through these pages for a step-by-step guide:
 - [Unit Testing](tests.md)
 - [Multi-Modal Support](multimodal.md)
 - [Speech-to-Text Support](transcription.md)
+- [Weight Updates (SupportsReload)](reload.md)
 
 !!! tip
     If you are encountering issues while integrating your model into vLLM, feel free to open a [GitHub issue](https://github.com/vllm-project/vllm/issues)
