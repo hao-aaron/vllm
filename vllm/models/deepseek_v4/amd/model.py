@@ -81,6 +81,18 @@ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 logger = init_logger(__name__)
 
 
+def hold_in_place(held: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
+    """Keep a weight-derived tensor at one address across weight updates:
+    the first value is kept (as a plain tensor: assigning a Parameter to a
+    module attribute would register it a second time), later ones are copied
+    into it."""
+    if held is not None and (held.shape, held.dtype) == (value.shape, value.dtype):
+        if held.data_ptr() != value.data_ptr():
+            held.copy_(value)
+        return held
+    return value.detach()
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -125,23 +137,29 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
-        # gate_up_proj B-preshuffle (ColumnParallel -> no all-reduce); set at load.
+        # gate_up_proj B-preshuffle (ColumnParallel -> no all-reduce), right
+        # after the linear's own post-load processing, on every load.
         self._gateup = rocm_aiter_ops.is_enabled()
         # Block scale for the preshuffled gate_up weight; None = not preshuffled.
         self._gateup_scale: torch.Tensor | None = None
+        if self._gateup:
+            from vllm.model_executor.layers.quantization.wrap import (
+                wrap_quant_method,
+            )
 
-    def prepare_gateup_preshuffle(self) -> None:
-        # B-preshuffle the gate_up_proj weight in place (single weight).
-        if not self._gateup:
-            return
+            wrap_quant_method(self.gate_up_proj, after_pwal=self._preshuffle_gate_up)
+
+    def _preshuffle_gate_up(self, layer: nn.Module) -> None:
+        # B-preshuffle the gate_up_proj weight (single weight); its result
+        # lands in the live weight on reload.
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
             get_fp8_block_weight_scale,
         )
         from vllm.model_executor.utils import replace_parameter
 
-        w = getattr(self.gate_up_proj, "weight", None)
-        ws = get_fp8_block_weight_scale(self.gate_up_proj)
+        w = getattr(layer, "weight", None)
+        ws = get_fp8_block_weight_scale(layer)
         if w is None or ws is None or w.dim() != 2:
             return
         # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
@@ -150,11 +168,11 @@ class DeepseekV4MLP(nn.Module):
         if ws.dtype == torch.float8_e8m0fnu:
             ws = _upcast_e8m0_to_fp32(ws).contiguous()
         replace_parameter(
-            self.gate_up_proj,
+            layer,
             "weight",
             rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
         )
-        self._gateup_scale = ws
+        self._gateup_scale = hold_in_place(self._gateup_scale, ws)
 
     def forward(self, x):
         if self._gateup_scale is not None and x.dim() == 2:
@@ -1445,14 +1463,13 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
-        # After per-layer quant finalize, so we preshuffle the final fp8 weights.
+        # After per-layer quant finalize (the B-preshuffles run from the
+        # linears' wrapped post-load processing, on every load).
         fused_compressor_layers = 0
         for module in self.modules():
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
                 fused_compressor_layers += module.prepare_compressor_gemm_fusion()
                 module.prepare_attn_preshuffle()
-            elif isinstance(module, DeepseekV4MLP):
-                module.prepare_gateup_preshuffle()
         if fused_compressor_layers:
             logger.info(
                 "Fused the C4 compressor GEMMs in %d DeepSeek V4 layers",

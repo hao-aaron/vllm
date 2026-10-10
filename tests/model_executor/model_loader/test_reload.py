@@ -3410,3 +3410,50 @@ def test_attached_plan_runs_on_checkpoint_format_before_pwal():
     child.weight.weight_loader(child.weight, b)
     finalize_layerwise_reload(model, model_config=None)
     assert torch.equal(child.weight, b[perm].t())
+
+
+def test_rocm_gate_up_preshuffle_runs_on_every_load(monkeypatch):
+    """ROCm DSv4: the gate_up B-preshuffle moved from the model hook (cold
+    start only; a reload landed an unshuffled weight) to wrap_quant_method.
+    Stand-ins for AITER's shuffle and the block-scale lookup."""
+    import vllm.model_executor.layers.quantization.utils.fp8_utils as fp8_utils
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.quantization.wrap import wrap_quant_method
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+    from vllm.models.deepseek_v4.amd.model import DeepseekV4MLP
+
+    def shuffle(w, layout):
+        return w.flip(0)
+
+    monkeypatch.setattr(rocm_aiter_ops, "shuffle_weight", shuffle, raising=False)
+    monkeypatch.setattr(
+        fp8_utils, "get_fp8_block_weight_scale", lambda layer: layer.weight_scale
+    )
+
+    linear = _one_weight_model()[1]  # weight [4, 4] -> make it 16 x 128
+    linear.weight = torch.nn.Parameter(torch.zeros(16, 128), requires_grad=False)
+    linear.weight.weight_loader = default_weight_loader
+    linear.weight_scale = torch.nn.Parameter(torch.ones(1, 1), requires_grad=False)
+    linear.weight_scale.weight_loader = default_weight_loader
+    linear.quant_method = _ProcessRecorder()
+    mlp = object.__new__(DeepseekV4MLP)
+    torch.nn.Module.__init__(mlp)
+    mlp.gate_up_proj = linear
+    mlp._gateup_scale = None
+    wrap_quant_method(linear, after_pwal=mlp._preshuffle_gate_up)
+    model = torch.nn.Sequential(mlp)
+    record_metadata_for_reloading(model)
+
+    a = torch.arange(16 * 128, dtype=torch.float32).view(16, 128)
+    linear.weight.data.copy_(a)
+    linear.weight_scale.data.fill_(2.0)
+    process_weights_after_loading(model, _cold_config(), torch.device("cpu"))
+    live_w, live_s = linear.weight, mlp._gateup_scale
+    assert torch.equal(live_w, a.flip(0))
+
+    initialize_layerwise_reload(model)
+    linear.weight.weight_loader(linear.weight, a + 1)
+    linear.weight_scale.weight_loader(linear.weight_scale, torch.full((1, 1), 3.0))
+    finalize_layerwise_reload(model, model_config=None)
+    assert linear.weight is live_w and torch.equal(live_w, (a + 1).flip(0))
+    assert mlp._gateup_scale is live_s and live_s.item() == 3.0

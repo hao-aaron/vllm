@@ -674,6 +674,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+        self._wrap_attn_preshuffle()
         self._wo_a_fp8_weight: torch.Tensor | None = None
         self._wo_a_e8m0_scale: torch.Tensor | None = None
         self._wo_a_cos_cache: torch.Tensor | None = None
@@ -893,7 +894,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
-    def prepare_attn_preshuffle(self) -> None:
+    def _wrap_attn_preshuffle(self) -> None:
+        """B-preshuffle fused_wqa_wkv / wo_b right after their own post-load
+        processing, on every load (results land in the live weights on
+        reload; the scales are held in place)."""
         from vllm._aiter_ops import rocm_aiter_ops
 
         if not rocm_aiter_ops.is_enabled():
@@ -902,7 +906,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             _upcast_e8m0_to_fp32,
             get_fp8_block_weight_scale,
         )
+        from vllm.model_executor.layers.quantization.wrap import wrap_quant_method
         from vllm.model_executor.utils import replace_parameter
+        from vllm.models.deepseek_v4.amd.model import hold_in_place
 
         def _prep(linear) -> torch.Tensor | None:
             w = getattr(linear, "weight", None)
@@ -924,8 +930,22 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             )
             return ws
 
-        self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
-        self._wo_b_scale = _prep(self.wo_b)
+        def wqa_wkv(linear) -> None:
+            if (ws := _prep(linear)) is not None:
+                self._wqa_wkv_scale = hold_in_place(self._wqa_wkv_scale, ws)
+
+        def wo_b(linear) -> None:
+            if (ws := _prep(linear)) is not None:
+                self._wo_b_scale = hold_in_place(self._wo_b_scale, ws)
+
+        wrap_quant_method(self.fused_wqa_wkv, after_pwal=wqa_wkv)
+        wrap_quant_method(self.wo_b, after_pwal=wo_b)
+
+    def prepare_attn_preshuffle(self) -> None:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        if not rocm_aiter_ops.is_enabled():
+            return
         if _ON_GFX950 and envs.VLLM_ROCM_USE_AITER_FP8BMM:
             self._prepare_fp8_wo_a()
 
