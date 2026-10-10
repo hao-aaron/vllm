@@ -1911,12 +1911,11 @@ def test_permute_on_load_lands_permuted_layout(monkeypatch, host):
     """DeepSeek-V4.1 mega attention permutes wq_b rows in its weight loader
     (#60064): reload runs the same loader, so the kernel layout lands without
     any post-load step."""
+    from vllm.model_executor.model_loader.reload import direct
     from vllm.models.deepseek_v41.common.ops.fused_layout import (
         permute_on_load,
         q_fused_permutation,
     )
-
-    from vllm.model_executor.model_loader.reload import direct
 
     monkeypatch.setattr(direct, "DIRECT_LOAD", host)
     heads = 2
@@ -2008,9 +2007,10 @@ def test_failure_before_any_live_write_is_clean():
 
 
 def test_dirty_model_is_cleared_only_by_a_full_update():
-    """After a failed update wrote live weights, an empty or partial update
-    must not re-enable serving on mixed weights; one that covers every module
-    does."""
+    """After a failed update wrote live weights, an update that doesn't
+    re-load every module the failed one wrote must not re-enable serving on
+    mixed weights; modules it never wrote (e.g. a frozen tower a trainer never
+    sends) don't block clearing."""
     from vllm.model_executor.model_loader.reload import (
         abort_reload,
         finish_reload,
@@ -2023,10 +2023,10 @@ def test_dirty_model_is_cleared_only_by_a_full_update():
 
     model, (a, b) = _two_expert_layers()
     start_reload(model)
-    _load_layer(a, 1.0)
+    _load_layer(a, 1.0)  # lands: `a` holds new weights, `b` old ones
     abort_reload(model)
     assert is_model_dirty(model)
-    for partial, layers in ((None, ()), (True, (a,)), (None, (a,))):
+    for partial, layers in ((None, ()), (True, (b,))):
         start_reload(model, partial=partial)
         for layer in layers:
             _load_layer(layer, 2.0)
@@ -2034,9 +2034,24 @@ def test_dirty_model_is_cleared_only_by_a_full_update():
             finish_reload(model, model_config=None)
         abort_reload(model)
         assert is_model_dirty(model)
+    # `b` was written by the failed second attempt too: both must be re-loaded
+    start_reload(model, partial=True)
+    _load_layer(a, 3.0)
+    with pytest.raises(ReloadIncompleteError, match="dirty"):
+        finish_reload(model, model_config=None)
+    abort_reload(model)
     start_reload(model, partial=True)
     _load_layer(a, 3.0)
     _load_layer(b, 3.0)
+    finish_reload(model, model_config=None)
+    assert not is_model_dirty(model)
+
+    # a module no failed update wrote doesn't block clearing
+    start_reload(model)
+    _load_layer(a, 4.0)
+    abort_reload(model)
+    start_reload(model, partial=True)
+    _load_layer(a, 5.0)
     finish_reload(model, model_config=None)
     assert not is_model_dirty(model)
 
@@ -3457,3 +3472,21 @@ def test_rocm_gate_up_preshuffle_runs_on_every_load(monkeypatch):
     finalize_layerwise_reload(model, model_config=None)
     assert linear.weight is live_w and torch.equal(live_w, (a + 1).flip(0))
     assert mlp._gateup_scale is live_s and live_s.item() == 3.0
+
+
+@requires_cuda
+def test_zero_size_shards_are_not_required(dist_init):
+    """A cross-attention kv-only QKV (no q heads, as in Cohere ASR) only ever
+    receives k and v."""
+    from vllm.model_executor.model_loader.reload import finish_reload, start_reload
+
+    with torch.device("cuda"):
+        kv = QKVParallelLinear(4, 2, total_num_heads=0, total_num_kv_heads=2)
+        model = torch.nn.Sequential(kv)
+        record_metadata_for_reloading(model)
+    start_reload(model)
+    for shard, value in (("k", 1.0), ("v", 2.0)):
+        p = kv.weight
+        p.weight_loader(p, torch.full((4, 4), value, device="cuda"), shard)
+    finish_reload(model, model_config=None)
+    assert torch.equal(kv.weight[4:].cpu(), torch.full((4, 4), 2.0))

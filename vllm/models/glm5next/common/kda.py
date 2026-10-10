@@ -500,7 +500,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
 
-    @eager_break_during_capture
     @torch.no_grad()
     def _refresh_merged_conv_weight(self) -> None:
         def _w(m):
@@ -509,9 +508,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         parts = [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)]
         if self._merged_conv_weight is None:
             self._merged_conv_weight = torch.cat(parts, dim=0).contiguous()
+            from vllm.model_executor.model_loader.reload import declare_derived
+
+            declare_derived(self, self._merged_conv_weight)
         else:
             torch.cat(parts, dim=0, out=self._merged_conv_weight)
 
+    @eager_break_during_capture
     def _forward(
         self,
         qkv_proj_states: torch.Tensor,

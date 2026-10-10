@@ -355,6 +355,11 @@ class MoERunner(MoERunnerInterface):
                 [self.gate.weight, self.shared_expert_gate.weight],
                 dim=0,
             )
+            from vllm.model_executor.model_loader.reload.refresh import (
+                declare_derived,
+            )
+
+            declare_derived(self, self._combined_gate_weight)
 
     @torch.no_grad()
     def refresh(self) -> None:

@@ -1361,6 +1361,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if layer.hc_attn_fn_broadcast is None:
                 layer.hc_attn_fn_broadcast = broadcast
+                from vllm.model_executor.model_loader.reload import declare_derived
+
+                declare_derived(layer, broadcast)
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
 

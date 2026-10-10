@@ -295,6 +295,9 @@ def test_enforce_refuses_only_known_wrong(monkeypatch):
     monkeypatch.setattr(verify.logger, "warning_once", lambda *a: warned.append(a))
     report = verify.ReloadReport()
     report.add("6.2", "x", "undeclared tensor", UNSAFE)
+    verify.enforce(report)  # ownership is report-only
+    assert not warned
+    report.add("6.1", "", "root hook", UNSAFE)
     verify.enforce(report)  # warns
     assert len(warned) == 1
     report.add("6.5", "", "EPLB", UNSAFE, refuse=True)

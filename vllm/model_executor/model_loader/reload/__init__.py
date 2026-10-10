@@ -34,6 +34,8 @@ __all__ = [
     "mark_dirty",
     "refresh_derived_state",
     "register_refresh",
+    "declare_constant",
+    "declare_derived",
     "merge_reload_reports",
     "ReloadReport",
     "ReloadStatus",
@@ -68,7 +70,7 @@ from .layerwise import (
     start_reload,
     trace_loads,
 )
-from .refresh import register_refresh
+from .refresh import declare_constant, declare_derived, register_refresh
 from .torchao_decorator import (
     set_torchao_reload_attrs,
     support_quantized_model_reload_from_hp_weights,

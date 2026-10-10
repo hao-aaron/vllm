@@ -231,6 +231,8 @@ class K3DSparkModel(nn.Module):
 
     def _build_fused_context_kv_metadata(self) -> None:
         """Cross-layer geometry and the stacked buffers (allocated once)."""
+        from vllm.model_executor.model_loader.reload import declare_derived
+
         attentions = [layer.self_attn for layer in self.layers]
         assert attentions
         attn0 = attentions[0]
@@ -246,9 +248,8 @@ class K3DSparkModel(nn.Module):
                 == attn0.kv_a_layernorm.variance_epsilon
             ), "All MLA DSpark layers must share their latent KV geometry."
         norm0 = attn0.kv_a_layernorm.weight
-        self._context_kv_norm_weights = norm0.new_empty(
-            (len(attentions), *norm0.shape)
-        )
+        self._context_kv_norm_weights = norm0.new_empty((len(attentions), *norm0.shape))
+        declare_derived(self, self._context_kv_norm_weights)
         self._num_context_layers = len(attentions)
         self._context_kv_width = kv_width
         self._context_kv_lora_rank = attn0.kv_lora_rank
@@ -260,6 +261,7 @@ class K3DSparkModel(nn.Module):
         ):
             k_scale0 = attn0._k_scale
             self._context_kv_scales = k_scale0.new_empty(len(attentions))
+            declare_derived(self, self._context_kv_scales)
 
     @torch.no_grad()
     def refresh_context_kv(self) -> None:

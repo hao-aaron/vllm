@@ -36,9 +36,11 @@ class ReloadSession:
     # fused linears: id(module) -> arrivals per (param, shard); shard "*" is a
     # pre-fused checkpoint tensor covering every shard
     shard_units: dict[int, Counter] = field(default_factory=dict)
-    # dirty when this update started (a failed earlier update): only an update
-    # that covers every module clears it
+    # dirty when this update started (a failed earlier update)
     started_dirty: bool = False
+    # id(module) of modules whose live storage an unfinished or failed update
+    # wrote; the flag clears once an update re-loads every one of them
+    dirty_modules: set[int] = field(default_factory=set)
     # a partial update's declared module names (prefixes); all ranks agree on
     # it at start, and finish requires exactly these modules, complete
     modules: tuple[str, ...] | None = None

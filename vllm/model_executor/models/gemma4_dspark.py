@@ -223,6 +223,7 @@ class Gemma4DSparkModel(DFlashQwen3Model):
         self._num_kv_heads = attn0.num_kv_heads
         self._rms_norm_eps = attn0.q_norm.variance_epsilon
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+        self._declare_context_kv_buffers()
 
     @torch.no_grad()
     def _refresh_context_kv_buffers(self, layers_attn: list[nn.Module]) -> None:
@@ -346,4 +347,5 @@ class Gemma4DSparkForCausalLM(Qwen3DSparkForCausalLM):
             return loaded
         if not includes_confidence_head:
             self.model.confidence_head = None
+        self.model._build_fused_kv_buffers()
         return loaded

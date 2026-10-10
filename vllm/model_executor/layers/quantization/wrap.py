@@ -44,8 +44,10 @@ def wrap_quant_method(
                 f"Wrapped{base.__name__}",
                 (base,),
                 {
-                    "process_weights_after_loading": _wrapped_pwal,
+                    "process_weights_after_loading": _make_wrapped_pwal(base),
                     "_pwal_wrapped": True,
+                    "_pwal_before": (),
+                    "_pwal_after": (),
                     "__module__": base.__module__,
                 },
             )
@@ -59,9 +61,12 @@ def wrap_quant_method(
         method._pwal_after.append(after_pwal)
 
 
-def _wrapped_pwal(self, layer: torch.nn.Module) -> None:
-    for step in self._pwal_before:
-        step(layer)
-    super(type(self), self).process_weights_after_loading(layer)
-    for step in self._pwal_after:
-        step(layer)
+def _make_wrapped_pwal(base: type):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        for step in self._pwal_before:
+            step(layer)
+        base.process_weights_after_loading(self, layer)
+        for step in self._pwal_after:
+            step(layer)
+
+    return process_weights_after_loading

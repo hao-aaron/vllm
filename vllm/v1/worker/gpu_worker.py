@@ -1558,7 +1558,11 @@ class Worker(WorkerBase):
         try:
             if is_draft:
                 self._set_draft_weight_update_target()
-            self.weight_transfer_engine.start_weight_update()
+            from vllm.model_executor.model_loader.reload import verify
+
+            self._enforce_reload_policy()
+            with verify.policy_enforced():
+                self.weight_transfer_engine.start_weight_update()
         except BaseException:
             self.weight_transfer_engine.reset_weight_update_target()
             raise
@@ -1578,6 +1582,32 @@ class Worker(WorkerBase):
                 session.partial = partial
                 if modules is not None:
                     session.modules = tuple(sorted(modules))
+
+    def _enforce_reload_policy(self) -> None:
+        """The reload verifier's policy for every transfer engine (sparse
+        NCCL never starts a layerwise session), decided by all ranks
+        together: one rank refusing while its peers start would hang them."""
+        from vllm.model_executor.model_loader.reload import verify
+
+        model = getattr(self.weight_transfer_engine, "model", None)
+        report = (
+            verify.verify_reload(model, self.vllm_config)
+            if isinstance(model, nn.Module)
+            else None
+        )
+        refuse = report is not None and verify.refuses(report)
+        flag = torch.tensor([int(refuse)], dtype=torch.int32)
+        for group in self._weight_update_groups():
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+            )
+        if report is not None:
+            verify.enforce(report)  # raises if this rank refuses, else warns
+        if flag.item():
+            raise verify.ReloadRefusedError(
+                "Weight update refused: another rank's reload verifier refused "
+                "it (see that rank's error)."
+            )
 
     def _check_module_set_agreement(self, modules: list[str]) -> None:
         """All ranks of the update declare the same module set, before any

@@ -33,6 +33,9 @@ The verifier proves structure, not values: a wrong refresh formula passes.
 
 import enum
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -192,6 +195,7 @@ def _check_declarations(model: torch.nn.Module, report: ReloadReport) -> None:
                 name,
                 f"{type(root).__name__} opted this instance out (reload_safe=False)",
                 UNSAFE,
+                refuse=True,
             )
         if hook is not None:
             report.add(
@@ -467,9 +471,9 @@ def checkpoint_meta_from_safetensors(
         with safe_open(file, framework="pt") as f:
             for name in f.keys():  # noqa: SIM118
                 s = f.get_slice(name)
-                meta.append(
-                    (name, tuple(s.get_shape()), _SAFETENSORS_DTYPES[s.get_dtype()])
-                )
+                dtype = _SAFETENSORS_DTYPES.get(s.get_dtype())
+                if dtype is not None:  # e.g. F8 variants torch lacks
+                    meta.append((name, tuple(s.get_shape()), dtype))
     return meta
 
 
@@ -705,12 +709,37 @@ class ReloadRefusedError(RuntimeError):
     pass
 
 
+# Set while a caller (the worker, for every transfer engine, with all ranks
+# agreeing) already enforced the policy for this update
+_ENFORCED: ContextVar[bool] = ContextVar("vllm_reload_enforced", default=False)
+
+
+@contextmanager
+def policy_enforced() -> Iterator[None]:
+    token = _ENFORCED.set(True)
+    try:
+        yield
+    finally:
+        _ENFORCED.reset(token)
+
+
+def is_policy_enforced() -> bool:
+    return _ENFORCED.get()
+
+
+def refuses(report: ReloadReport) -> bool:
+    """Whether `enforce` would refuse (the override considered)."""
+    return not ALLOW_UNSAFE and any(i.refuse for i in report.items)
+
+
 def enforce(report: ReloadReport) -> None:
     """Policy at the start of an update, before any write. Items known to
     produce wrong weights refuse the update (VLLM_RELOAD_ALLOW_UNSAFE=1 runs
-    it anyway); other UNSAFE items warn, naming the rule and the fix."""
+    it anyway); other UNSAFE items warn, naming the rule and the fix. The
+    ownership check (6.2) is report-only (`check_reload_support`): it can't
+    tell a workspace from undeclared derived state."""
     refusals = [i for i in report.items if i.refuse]
-    others = [i for i in report.of(UNSAFE) if not i.refuse]
+    others = [i for i in report.of(UNSAFE) if not i.refuse and i.check != "6.2"]
     if others:
         logger.warning_once(
             "Weight update proceeds with %d unverified-unsafe item(s); a CUDA "

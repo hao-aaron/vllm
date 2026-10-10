@@ -104,6 +104,7 @@ class DeepseekV4MLP(nn.Module):
         reduce_results: bool = True,
         is_sequence_parallel: bool = False,
         prefix: str = "",
+        preshuffle_gate_up: bool = True,
     ) -> None:
         super().__init__()
 
@@ -139,7 +140,9 @@ class DeepseekV4MLP(nn.Module):
 
         # gate_up_proj B-preshuffle (ColumnParallel -> no all-reduce), right
         # after the linear's own post-load processing, on every load.
-        self._gateup = rocm_aiter_ops.is_enabled()
+        # Not when another module reads the unshuffled weight after this
+        # linear's post-load processing (heterogeneous shared-expert fusion).
+        self._gateup = preshuffle_gate_up and rocm_aiter_ops.is_enabled()
         # Block scale for the preshuffled gate_up weight; None = not preshuffled.
         self._gateup_scale: torch.Tensor | None = None
         if self._gateup:
@@ -652,6 +655,7 @@ class DeepseekV4MoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                preshuffle_gate_up=not self.fuse_heterogeneous_shared_expert,
             )
 
         self.tp_rank = get_tensor_model_parallel_rank()

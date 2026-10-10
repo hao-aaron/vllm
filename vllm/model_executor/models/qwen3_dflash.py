@@ -180,6 +180,19 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+# fused context-KV buffers of the DFlash / DSpark drafters
+_CONTEXT_KV_BUFFERS = (
+    "_fused_kv_weight",
+    "_fused_kv_bias",
+    "_fused_k_weight",
+    "_fused_k_bias",
+    "_kv_weights",
+    "_kv_biases",
+    "_k_norm_weights",
+    "_input_layernorm_weights",
+)
+
+
 def reload_active(model: nn.Module) -> bool:
     """Whether a streamed weight reload (modulewise reload) is in progress."""
     from vllm.model_executor.model_loader.reload import is_reload_active
@@ -562,13 +575,21 @@ class DFlashQwen3Model(nn.Module):
 
     def refresh_context_kv(self) -> None:
         """The fused context-KV buffers, derived from the live per-layer
-        weights: built by the first call (cold start, after every load and
+        weights: built by the first call if load_weights didn't (cold start,
         before graph capture), refilled in place afterwards (captured graphs
-        keep reading the same tensors)."""
+        keep reading the same tensors). Skipped where post-load processing
+        released the per-layer weights (CPU GEMM dispatch)."""
+        layers_attn = [layer.self_attn for layer in self.layers]
+        if any(p.numel() == 0 for a in layers_attn for p in a.parameters(recurse=True)):
+            logger.warning_once(
+                "DFlash: per-layer weights were released after loading; the "
+                "fused context-KV buffers are not refreshed by weight updates."
+            )
+            return
         if not hasattr(self, "_num_attn_layers"):
             self._build_fused_kv_buffers()
             return
-        self._refresh_context_kv_buffers([layer.self_attn for layer in self.layers])
+        self._refresh_context_kv_buffers(layers_attn)
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -612,6 +633,17 @@ class DFlashQwen3Model(nn.Module):
 
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+        self._declare_context_kv_buffers()
+
+    def _declare_context_kv_buffers(self) -> None:
+        """The fused buffers are weight-derived state refresh_model() keeps
+        current (for the reload verifier's ownership check)."""
+        from vllm.model_executor.model_loader.reload import declare_derived
+
+        for name in _CONTEXT_KV_BUFFERS:
+            t = getattr(self, name, None)
+            if isinstance(t, torch.Tensor):
+                declare_derived(self, t)
 
     def _project_context_kv(
         self,
@@ -941,6 +973,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM, SupportsReload):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
+        # Built before post-load processing, which may release the per-layer
+        # weights (CPU); a streamed reload refills them in refresh_model().
+        if not reload_active(self):
+            self.model._build_fused_kv_buffers()
 
     def refresh_model(self) -> None:
         self.model.refresh_context_kv()

@@ -224,7 +224,8 @@ def initialize_layerwise_reload(
         _check_model_hook_reload_safe(model)
         _check_moe_methods_reload_safe(model)
         _check_live_tensors_unchanged(model)
-        _verify.enforce(_verify.verify_reload(model, _current_vllm_config()))
+        if not _verify.is_policy_enforced():
+            _verify.enforce(_verify.verify_reload(model, _current_vllm_config()))
 
     # A failed update leaves the model dirty until a full update succeeds
     previous = get_reload_session(model)
@@ -236,6 +237,7 @@ def initialize_layerwise_reload(
     session = ReloadSession(
         dirty=started_dirty,
         started_dirty=started_dirty,
+        dirty_modules=set(previous.dirty_modules) if started_dirty else set(),
         partial=partial,
         required_modules=_required_modules(model),
         modules=None if modules is None else tuple(sorted(modules)),
@@ -581,6 +583,8 @@ def mark_dirty(model: torch.nn.Module) -> None:
         session = ReloadSession(active=False)
         model._reload_session = session
     session.dirty = True
+    # what this rank wrote must be re-loaded (all modules if nothing recorded)
+    session.dirty_modules |= session.touched or {id(m) for m in model.modules()}
 
 
 def check_can_serve(model: torch.nn.Module) -> None:
@@ -600,9 +604,10 @@ def check_can_serve(model: torch.nn.Module) -> None:
         )
 
 
-def _mark_dirty(info: LayerReloadingInfo) -> None:
+def _mark_dirty(info: LayerReloadingInfo, layer: torch.nn.Module) -> None:
     if info.session is not None:
         info.session.dirty = True
+        info.session.dirty_modules.add(id(layer))
 
 
 def _record_expert_unit(
@@ -653,11 +658,17 @@ def _expected_shards(layer: torch.nn.Module) -> tuple | None:
         QKVParallelLinear,
     )
 
+    # shards of size 0 never arrive (e.g. a cross-attention kv-only QKV)
+    sizes = getattr(layer, "output_sizes", None)
     if isinstance(layer, QKVParallelLinear):
-        return ("q", "k", "v")
-    if isinstance(layer, MergedColumnParallelLinear):
-        return tuple(range(len(layer.output_sizes)))
-    return None
+        names: tuple = ("q", "k", "v")
+    elif isinstance(layer, MergedColumnParallelLinear):
+        names = tuple(range(len(layer.output_sizes)))
+    else:
+        return None
+    if sizes is not None and len(sizes) == len(names):
+        names = tuple(n for n, size in zip(names, sizes) if size)
+    return names
 
 
 def _record_shard_unit(
@@ -794,13 +805,13 @@ def _check_expert_units(model: torch.nn.Module, session: ReloadSession) -> list[
 def _check_complete(model: torch.nn.Module) -> None:
     incomplete: list[str] = []
     must_raise = False
-    untouched: list[str] = []
+    missing_names: set[int] = set()  # modules with a tensor no loader reached
     session = get_reload_session(model)
     if session is not None:
         # A missing expert or fused-linear shard holds zeros (or old bytes,
         # with direct loading) in every mode, and may sit in a module that
         # already completed.
-        untouched = _check_full_update(model, session)
+        _check_full_update(model, session)
         problems = _check_expert_units(model, session) + _check_shard_units(
             model, session
         )
@@ -828,6 +839,8 @@ def _check_complete(model: torch.nn.Module) -> None:
                 and t not in info.kernel_non_persistent_buffers
                 and t not in info.loaded_names
             )
+            if never_loaded:
+                missing_names.add(id(layer))
             incomplete.append(
                 f"{name or type(layer).__name__} "
                 f"({info.load_numel}/{info.load_numel_total}"
@@ -841,16 +854,22 @@ def _check_complete(model: torch.nn.Module) -> None:
     session = get_reload_session(model)
     if session is not None:
         session.incomplete = incomplete
-        if session.started_dirty and (untouched or incomplete):
-            # "until a full update succeeds": a partial or incomplete update
-            # would otherwise re-enable serving on mixed weights
-            raise ReloadIncompleteError(
-                "The model is dirty from an earlier failed weight update, and "
-                "only an update that covers every module clears that. This one "
-                f"left {len(untouched)} module(s) without weights and "
-                f"{len(incomplete)} partially loaded, e.g. "
-                f"{(untouched + incomplete)[:4]}"
-            )
+        if session.started_dirty:
+            # "until a full update succeeds": every module the failed update
+            # wrote must be re-loaded, or serving would resume on mixed
+            # weights. Modules it never touched (a frozen tower) don't matter.
+            names = {id(m): n for n, m in model.named_modules()}
+            stale = [
+                names.get(i, "?")
+                for i in session.dirty_modules
+                if i not in session.touched or i in missing_names
+            ]
+            if stale:
+                raise ReloadIncompleteError(
+                    "The model is dirty from an earlier failed weight update: "
+                    f"{len(stale)} module(s) it wrote were not fully re-loaded "
+                    f"by this one, e.g. {sorted(stale)[:4]}"
+                )
     if not incomplete:
         return
     msg = (
@@ -972,7 +991,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                 if info.kernel_tensors is not None and param_name not in (
                     info.materialized
                 ):
-                    _mark_dirty(info)  # writes live storage (e.g. `bias`)
+                    _mark_dirty(info, layer)  # writes live storage (e.g. `bias`)
                 if info.loaded_weights:
                     _replay_buffered(layer, info)
                 bound_args.arguments["param"] = target
@@ -1111,6 +1130,7 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
             )
     if session is not None:
         session.dirty = False
+        session.dirty_modules.clear()
         session.active = False
     if reloading:
         _record_live_signatures(model)
@@ -1310,7 +1330,7 @@ def ensure_param_materialized(
             storage = live.untyped_storage()
             info.hosted[name] = (storage.data_ptr(), storage.nbytes())
             plan[name] = "hosted"
-            _mark_dirty(info)  # live bytes now hold checkpoint data
+            _mark_dirty(info, layer)  # live bytes now hold checkpoint data
         else:
             plan[name] = f"scratch:{reason}"
     if target is None:
@@ -1444,7 +1464,7 @@ def _run_attached_plans(
     for plan_stage, process in getattr(layer, "_attached_processing_plans", ()):
         if plan_stage == stage:
             # a plan may refill live tensors its owner's kernel reads
-            _mark_dirty(info)
+            _mark_dirty(info, layer)
             with torch.no_grad():
                 process(layer)
 
@@ -1688,7 +1708,7 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     with live storage is cloned first ("overlap"). All sources are resolved
     before the first copy, so no copy overwrites bytes a later one reads."""
     assert info.kernel_tensors is not None
-    _mark_dirty(info)
+    _mark_dirty(info, layer)
     parameters, buffers = info.kernel_tensors
     live_storages = {
         t.untyped_storage().data_ptr()
