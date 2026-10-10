@@ -1269,9 +1269,13 @@ class AsyncLLM(EngineClient):
             "init_weight_transfer_engine", kwargs={"init_info": request.init_info}
         )
 
-    async def start_weight_update(self, partial: bool | None = None) -> None:
+    async def start_weight_update(
+        self, partial: bool | None = None, modules: list[str] | None = None
+    ) -> None:
         """Start a new weight update (see `LLM.start_weight_update`)."""
-        kwargs = {} if partial is None else {"partial": partial}
+        kwargs: dict = {} if partial is None else {"partial": partial}
+        if modules is not None:
+            kwargs["modules"] = list(modules)
         await self.collective_rpc("start_weight_update", kwargs=kwargs)
 
     async def start_draft_weight_update(self) -> None:

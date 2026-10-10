@@ -42,6 +42,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import SupportsReload
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -344,7 +345,7 @@ def _insert_context_kv(
         )
 
 
-class DSparkDeepseekV4ForCausalLM(nn.Module):
+class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsReload):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
     has_own_embed_tokens = False
@@ -579,7 +580,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     @property
     def reload_safe(self) -> bool:
-        """Modulewise reload: the hook's work is redone per module; see
+        """The hook's work is redone per module on reload; see
         `mega_moe_reload_safe` for what fails closed."""
         from vllm.models.deepseek_v4.nvidia.model import mega_moe_reload_safe
 

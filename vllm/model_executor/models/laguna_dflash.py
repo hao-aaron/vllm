@@ -27,7 +27,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsReload,
+)
 from vllm.multimodal.inputs import NestedTensors
 
 from .laguna import LagunaDecoderLayer
@@ -259,7 +263,7 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         return loaded_params
 
 
-class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
+class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3, SupportsReload):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         speculative_config = vllm_config.speculative_config
@@ -357,7 +361,10 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
         loaded_weight_names.add("lm_head.weight")
         loaded_weight_names.add("model.embed_tokens.weight")
         # A streamed reload calls load_weights per batch with modules still on
-        # meta; the buffers are refilled by the model's refresh() instead.
+        # meta; the buffers are refilled by refresh_model() instead.
         if not reload_active(self):
             self.model._build_fused_kv_buffers()
         return loaded_weight_names
+
+    def refresh_model(self) -> None:
+        self.model.refresh_context_kv()

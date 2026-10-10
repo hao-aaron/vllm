@@ -69,7 +69,9 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
+    SupportsReload,
     SupportsReplaySSM,
+    supports_reload,
 )
 from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
 from vllm.model_executor.models.kimi_k25_vit import (
@@ -1550,6 +1552,7 @@ class KimiLinearForCausalLM(
     IsHybrid,
     SupportsEagle3,
     SupportsReplaySSM,
+    SupportsReload,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1663,11 +1666,9 @@ class KimiLinearForCausalLM(
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
-    # Modulewise reload: the model hook's only work (the mega-MoE transform)
-    # runs per module on reload (KimiK3MegaMoEExperts reload_outputs), so the
+    # SupportsReload: the model hook's only work (the mega-MoE transform) runs
+    # per module on reload (KimiK3MegaMoEExperts reload_outputs), so the
     # cold-start-only hook is safe to skip on reload.
-    reload_safe = True
-
     def process_weights_after_loading(self) -> None:
         # A parent AutoWeightsLoader may invoke load_weights repeatedly for
         # non-contiguous streamed prefixes. Finalize only after the full stream.
@@ -1709,6 +1710,7 @@ class KimiK3ForConditionalGeneration(
     HasInnerState,
     IsHybrid,
     SupportsReplaySSM,
+    SupportsReload,
 ):
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 
@@ -2126,8 +2128,10 @@ class KimiK3ForConditionalGeneration(
 
     @property
     def reload_safe(self) -> bool:
-        # Modulewise reload: the hook only runs the language model's hook.
-        return bool(getattr(self.language_model, "reload_safe", False))
+        # The hook only runs the language model's hook (its refresh_model() is
+        # called by the framework, which visits nested SupportsReload models)
+        lm = self.language_model
+        return supports_reload(lm) and bool(getattr(lm, "reload_safe", True))
 
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()

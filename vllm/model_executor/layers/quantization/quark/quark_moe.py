@@ -107,7 +107,6 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
 )
 from vllm.model_executor.utils import (
-    is_reloading,
     replace_parameter,
     set_weight_attrs,
 )
@@ -961,7 +960,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
 
         # Build once: under reload the framework lands the new values in the
         # live tensors the kernel (and captured graphs) read, then refreshes.
-        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+        if self.reload_safe and self.moe_kernel is not None:
             return
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None

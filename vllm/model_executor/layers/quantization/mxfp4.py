@@ -37,7 +37,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import (
-    is_reloading,
     is_weights_pre_processed,
     replace_parameter,
     set_weight_attrs,
@@ -432,7 +431,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w2_weight_scale", w2_scale)
         else:
             live = getattr(self, "_triton_live", None)
-            if is_reloading() and self.reload_safe and live is not None:
+            if self.reload_safe and live is not None:
                 # Refill the wrapped weights / precision configs the kernel
                 # (and captured graphs) read, instead of replacing them. They
                 # were created as inference tensors at cold start.
@@ -451,22 +450,23 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
-        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
-            # Build once; the reload framework lands results then refreshes.
-            return
+        # Build once, keyed on the kernel's presence; the reload framework
+        # lands results then refreshes.
+        if not (self.reload_safe and self.moe_kernel is not None):
+            # Build quant config
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
-        # Build quant config
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-
-        # Build kernel (modular or monolithic)
-        if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                mxfp4_backend=self.mxfp4_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._expert_routing_tables(),
-            )
+            # Build kernel (modular or monolithic)
+            if self.moe_quant_config is not None and self.experts_cls is not None:
+                self.moe_kernel = make_mxfp4_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    mxfp4_backend=self.mxfp4_backend,
+                    experts_cls=self.experts_cls,
+                    routing_tables=layer._expert_routing_tables(),
+                )
+        # the experts' own transforms run on every (re)load
+        if self.moe_kernel is not None:
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -847,7 +847,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w2_weight_scale", w2_scale)
         else:
             live = getattr(self, "_triton_live", None)
-            if is_reloading() and self.reload_safe and live is not None:
+            if self.reload_safe and live is not None:
                 # Refill the wrapped weights / precision configs the kernel
                 # (and captured graphs) read, instead of replacing them. They
                 # were created as inference tensors at cold start.
@@ -866,12 +866,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
-        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
-            # Build once; the reload framework lands results then refreshes.
-            return
-
-        # Build quant config
-        self._build_moe_kernel(layer)
+        # Build once, keyed on the kernel's presence; the reload framework
+        # lands results then refreshes.
+        if not (self.reload_safe and self.moe_kernel is not None):
+            self._build_moe_kernel(layer)
+        # the experts' own transforms run on every (re)load
+        if self.moe_kernel is not None:
+            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""
@@ -884,7 +885,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
-            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
@@ -897,6 +897,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     f"moe backend, got {self.mxfp4_backend}"
                 )
             self._build_moe_kernel(layer)
+            if self.moe_kernel is not None:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
             return
 
         w13 = layer.w13_weight

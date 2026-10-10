@@ -280,10 +280,10 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
         return hasattr(self, "experts")
 
     @torch.no_grad()
-    def refresh(self) -> None:
-        """Modulewise reload, kind A: with the source experts kept, the fused
-        FP8 buffers are derived from live params; recompute them in place
-        after the experts' new weights landed."""
+    def refresh_fused(self) -> None:
+        """With the source experts kept, the fused FP8 buffers are derived
+        from live params: recompute them in place (before they are built,
+        a no-op)."""
         if not hasattr(self, "_fused_w13_fp8") or not self.reload_safe:
             return
         for name, tensor in zip(_FUSED_FP8_BUFFERS, self._fused_fp8()):

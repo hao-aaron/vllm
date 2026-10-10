@@ -5,7 +5,7 @@ import os
 import threading
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -19,7 +19,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import reload_mode
 
 from . import direct as _direct
 from . import meta as _meta
@@ -33,6 +32,7 @@ from .meta import (
     restore_layer_on_meta,
     to_meta_tensor,
 )
+from .refresh import refresh_quant_method, run_model_refresh
 from .types import LayerReloadingInfo, ReloadSession
 from .utils import (
     get_info_size,
@@ -192,6 +192,7 @@ def _capture_init_values(
 def initialize_layerwise_reload(
     model: torch.nn.Module,
     partial: bool | None = None,
+    modules: list[str] | tuple[str, ...] | None = None,
 ):
     """Set up layerwise weight loading with deferred processing.
 
@@ -212,10 +213,17 @@ def initialize_layerwise_reload(
 
     # A failed update leaves the model dirty until a full update succeeds
     previous = get_reload_session(model)
+    started_dirty = previous is not None and previous.dirty
+    if modules is not None:
+        if partial is False:
+            raise ValueError("a module set declares a partial update (partial=True)")
+        partial = True
     session = ReloadSession(
-        dirty=previous is not None and previous.dirty,
+        dirty=started_dirty,
+        started_dirty=started_dirty,
         partial=partial,
         required_modules=_required_modules(model),
+        modules=None if modules is None else tuple(sorted(modules)),
     )
     model._reload_session = session
 
@@ -248,9 +256,9 @@ def initialize_layerwise_reload(
 
 
 # Reload never calls the free-form model hook `model.process_weights_after_loading()`
-# (cold start only). A model that has one should declare `reload_safe = True`
-# (its reload work lives in module-level PWAL / `refresh()`). Undeclared hooks
-# warn loudly on every update; VLLM_RELOAD_STRICT_MODEL_HOOK=1 raises instead.
+# (cold start only). A model that has one should implement `SupportsReload`
+# (its reload work lives in loaders, module PWAL and `refresh_model()`).
+# Others warn loudly on every update; VLLM_RELOAD_STRICT_MODEL_HOOK=1 raises.
 STRICT_MODEL_HOOK = os.getenv("VLLM_RELOAD_STRICT_MODEL_HOOK", "0") == "1"
 
 
@@ -265,15 +273,20 @@ class ReloadUnsupportedError(RuntimeError):
 
 def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
     hook = getattr(type(model), "process_weights_after_loading", None)
-    if hook is None or getattr(model, "reload_safe", False):
+    # `reload_safe` is an instance-level veto (e.g. a configuration whose
+    # model-local state cannot be refreshed)
+    if hook is None or (
+        getattr(model, "supports_reload", False) and getattr(model, "reload_safe", True)
+    ):
         return
     msg = (
         f"{type(model).__name__} has a model-level process_weights_after_loading() "
-        "hook, which reload does not call, and does not declare reload_safe. Its "
-        "post-load work is NOT redone by this weight update, so the model may "
-        "serve stale or wrong weights. Convert the hook (module-level PWAL / "
-        "refresh()) and declare reload_safe; VLLM_RELOAD_STRICT_MODEL_HOOK=1 "
-        "makes this an error."
+        "hook, which reload does not call, and does not implement SupportsReload "
+        "(or this instance opted out). Its post-load work is NOT redone by this "
+        "weight update, so the model may serve stale or wrong weights. Move it to "
+        "the weight loaders, module PWAL, refresh_model() and post_load_setup(), "
+        "and implement SupportsReload; VLLM_RELOAD_STRICT_MODEL_HOOK=1 makes "
+        "this an error."
     )
     if STRICT_MODEL_HOOK:
         raise ReloadUnsafeModelError(msg)
@@ -309,12 +322,12 @@ def _check_moe_methods_reload_safe(model: torch.nn.Module) -> None:
     msg = (
         f"MoE methods that don't declare reload_safe: {found}. Reload would "
         "rebuild their kernel, and captured CUDA graphs would keep reading the "
-        "old kernel's weight-derived state. To make a method reload-safe, build "
-        "its kernel once (skip the build under is_reloading()), keep derived "
-        "values in refresh(), and set reload_safe (a method with no derived "
-        "state only sets it); Fp8MoEMethod and Fp8MoEProcessingPlan are the "
-        "reference. Or run with enforce_eager, or set "
-        "VLLM_RELOAD_ALLOW_UNSAFE_MOE=1 to reload anyway."
+        "old kernel's weight-derived state. To make a method reload-safe, let "
+        "its PWAL always transform but build the kernel once (if "
+        "self.moe_kernel is None), keep derived values in refresh(), and set "
+        "reload_safe (a method with no derived state only sets it); "
+        "Fp8MoEMethod and Fp8MoEProcessingPlan are the reference. Or run with "
+        "enforce_eager, or set VLLM_RELOAD_ALLOW_UNSAFE_MOE=1 to reload anyway."
     )
     if ALLOW_UNSAFE_MOE:
         logger.warning_once(msg)
@@ -352,11 +365,34 @@ def _live_signature(t: torch.Tensor) -> tuple:
     return (id(t), ptr, tuple(t.shape), t.stride(), t.dtype)
 
 
+# Built-once kernel objects of reload-safe quant methods (and attention
+# impls) as the last successful update left them: captured graphs read their
+# state, so one rebuilt between updates would not be the one reload refreshes.
+_KERNEL_IDS: WeakKeyDictionary[torch.nn.Module, dict[str, int]] = WeakKeyDictionary()
+_KERNEL_ATTRS = ("moe_kernel", "moe_quant_config", "fp8_linear", "kernel")
+
+
+def _kernel_ids(layer: torch.nn.Module) -> dict[str, int]:
+    ids = {}
+    method = getattr(layer, "quant_method", None)
+    if isinstance(method, QuantizeMethodBase) and getattr(method, "reload_safe", False):
+        ids["quant_method"] = id(method)
+        for attr in _KERNEL_ATTRS:
+            obj = getattr(method, attr, None)
+            if obj is not None:
+                ids[f"quant_method.{attr}"] = id(obj)
+    impl = getattr(layer, "impl", None)
+    if impl is not None and is_deferred_attention_layer(layer):
+        ids["impl"] = id(impl)
+    return ids
+
+
 def _record_live_signatures(model: torch.nn.Module) -> None:
     for layer in model.modules():
         _LIVE_SIGNATURES[layer] = {
             name: _live_signature(t) for name, t in get_layer_tensors(layer).items()
         }
+        _KERNEL_IDS[layer] = _kernel_ids(layer)
 
 
 def _check_live_tensors_unchanged(model: torch.nn.Module) -> None:
@@ -372,6 +408,10 @@ def _check_live_tensors_unchanged(model: torch.nn.Module) -> None:
                 changed.append(f"{module_name}.{name} (removed)")
             elif _live_signature(t) != signature:
                 changed.append(f"{module_name}.{name}")
+        current_ids = _kernel_ids(layer)
+        for name, obj_id in _KERNEL_IDS.get(layer, {}).items():
+            if current_ids.get(name) != obj_id:
+                changed.append(f"{module_name}.{name} (kernel object replaced)")
     if not changed:
         return
     shown = ", ".join(changed[:5]) + (
@@ -449,11 +489,10 @@ def _required_modules(model: torch.nn.Module) -> dict[int, str]:
     return required
 
 
-def _check_full_update(model: torch.nn.Module, session: ReloadSession) -> None:
+def _check_full_update(model: torch.nn.Module, session: ReloadSession) -> list[str]:
     """Modules that received no weights: raise for a full update, report
-    when unspecified, accept for a partial one."""
-    if session.partial:
-        return
+    when unspecified, accept for a partial one. A declared module set must
+    match exactly. Returns the untouched modules."""
     untouched = [
         name
         for name, layer in model.named_modules()
@@ -463,8 +502,11 @@ def _check_full_update(model: torch.nn.Module, session: ReloadSession) -> None:
         and info.kernel_tensors is not None
         and info.load_numel == 0
     ]
-    if not untouched:
-        return
+    if session.modules is not None:
+        _check_declared_modules(model, session, untouched)
+        return untouched
+    if session.partial or not untouched:
+        return untouched
     msg = (
         f"{len(untouched)} module(s) received no weights in this update: "
         f"{untouched[:8]}"
@@ -481,6 +523,33 @@ def _check_full_update(model: torch.nn.Module, session: ReloadSession) -> None:
         "full update.",
         msg,
     )
+    return untouched
+
+
+def _check_declared_modules(
+    model: torch.nn.Module, session: ReloadSession, untouched: list[str]
+) -> None:
+    """A partial update with a declared module set (agreed by all ranks at
+    start, since PWAL may run collectives) must touch exactly those modules:
+    a rank completing a different set would hang or diverge its peers."""
+    declared = session.modules or ()
+
+    def covered(name: str) -> bool:
+        return any(name == m or name.startswith(m + ".") for m in declared)
+
+    outside = [
+        name
+        for name, layer in model.named_modules()
+        if id(layer) in session.touched and not covered(name)
+    ]
+    missing = [name for name in untouched if covered(name)]
+    if outside or missing:
+        session.incomplete = outside + missing
+        raise ReloadIncompleteError(
+            f"Partial update with a declared module set: {len(outside)} module(s) "
+            f"outside it received weights (e.g. {outside[:4]}) and "
+            f"{len(missing)} declared module(s) received none (e.g. {missing[:4]})"
+        )
 
 
 def mark_dirty(model: torch.nn.Module) -> None:
@@ -552,6 +621,101 @@ def _record_expert_unit(
     units[(param_name, shard_id, unit)] += 1
 
 
+# Per-shard inputs that are optional (a checkpoint may carry them for some
+# shards only) or metadata every shard writes in full (CT `weight_shape`)
+_OPTIONAL_SHARD_INPUTS = ("scale", "zero_point", "g_idx", "bias", "weight_shape")
+
+
+def _expected_shards(layer: torch.nn.Module) -> tuple | None:
+    from vllm.model_executor.layers.linear import (
+        MergedColumnParallelLinear,
+        QKVParallelLinear,
+    )
+
+    if isinstance(layer, QKVParallelLinear):
+        return ("q", "k", "v")
+    if isinstance(layer, MergedColumnParallelLinear):
+        return tuple(range(len(layer.output_sizes)))
+    return None
+
+
+def _record_shard_unit(
+    layer: torch.nn.Module,
+    info: LayerReloadingInfo,
+    param_name: str,
+    bound_args: inspect.BoundArguments,
+) -> bool:
+    """Required keys for fused linears: one param holds several checkpoint
+    tensors (q/k/v, gate/up), so a missing shard is invisible to name-based
+    checks. Record each arrival per (param, shard) for the whole update (a
+    module's own record resets when it completes). Returns whether every
+    shard of this call already arrived (a duplicate)."""
+    session = info.session
+    if session is None or not session.active:
+        return False
+    args = bound_args.arguments
+    if "loaded_shard_id" not in args or _expected_shards(layer) is None:
+        return False
+    shard = args["loaded_shard_id"]
+    if shard is None:
+        shards: tuple = ("*",)
+    else:
+        shards = tuple(shard) if isinstance(shard, tuple) else (shard,)
+    units = session.shard_units.setdefault(id(layer), Counter())
+    duplicate = all(units[(param_name, s)] for s in shards)
+    for s in shards:
+        units[(param_name, s)] += 1
+    return duplicate
+
+
+def check_shard_units(layer: torch.nn.Module, units: Counter) -> tuple[list, list]:
+    """(missing, duplicated) (param, shard) units of one fused linear, for every
+    param this update touched. Optional inputs (scales, biases) are exempt
+    from the missing check."""
+    expected = _expected_shards(layer)
+    if expected is None or any(s not in expected and s != "*" for _, s in units):
+        return [], []  # unknown shard layout
+    touched = {param for param, _ in units}
+    missing = [
+        (param, shard)
+        for param in sorted(touched)
+        if not units[(param, "*")]
+        and not any(o in param for o in _OPTIONAL_SHARD_INPUTS)
+        for shard in expected
+        if not units[(param, shard)]
+    ]
+    duplicated = sorted(
+        (param, shard)
+        for (param, shard), n in units.items()
+        if n > 1 and not any(o in param for o in _OPTIONAL_SHARD_INPUTS)
+    )
+    return missing, duplicated
+
+
+def _check_shard_units(model: torch.nn.Module, session: ReloadSession) -> list[str]:
+    problems = []
+    for name, layer in model.named_modules():
+        units = session.shard_units.get(id(layer))
+        if not units:
+            continue
+        missing, duplicated = check_shard_units(layer, units)
+        if missing:
+            problems.append(
+                f"{name}: {len(missing)} shard(s) never loaded, e.g. {missing[:4]}"
+            )
+        if duplicated:
+            msg = (
+                f"{name}: {len(duplicated)} shard(s) loaded more than once, "
+                f"e.g. {duplicated[:4]}"
+            )
+            if REQUIRE_COMPLETE:
+                problems.append(msg)
+            else:
+                logger.warning(msg)
+    session.shard_units.clear()
+    return problems
+
+
 def _expert_shards(layer: torch.nn.Module, param_name: str) -> tuple[str, ...]:
     if param_name.startswith("w2_"):
         return ("w2",)
@@ -609,17 +773,21 @@ def _check_expert_units(model: torch.nn.Module, session: ReloadSession) -> list[
 def _check_complete(model: torch.nn.Module) -> None:
     incomplete: list[str] = []
     must_raise = False
+    untouched: list[str] = []
     session = get_reload_session(model)
     if session is not None:
-        # A missing expert holds zeros (or old bytes, with direct loading) in
-        # every mode, and may sit in a module that already completed.
-        _check_full_update(model, session)
-        expert_problems = _check_expert_units(model, session)
-        if expert_problems:
-            session.incomplete = expert_problems
+        # A missing expert or fused-linear shard holds zeros (or old bytes,
+        # with direct loading) in every mode, and may sit in a module that
+        # already completed.
+        untouched = _check_full_update(model, session)
+        problems = _check_expert_units(model, session) + _check_shard_units(
+            model, session
+        )
+        if problems:
+            session.incomplete = problems
             raise ReloadIncompleteError(
-                "Routed experts incomplete in this update: "
-                + "; ".join(expert_problems[:8])
+                "Shards or routed experts incomplete in this update: "
+                + "; ".join(problems[:8])
             )
     for name, layer in model.named_modules():
         info = LAYERWISE_INFO.get(layer)
@@ -652,6 +820,16 @@ def _check_complete(model: torch.nn.Module) -> None:
     session = get_reload_session(model)
     if session is not None:
         session.incomplete = incomplete
+        if session.started_dirty and (untouched or incomplete):
+            # "until a full update succeeds": a partial or incomplete update
+            # would otherwise re-enable serving on mixed weights
+            raise ReloadIncompleteError(
+                "The model is dirty from an earlier failed weight update, and "
+                "only an update that covers every module clears that. This one "
+                f"left {len(untouched)} module(s) without weights and "
+                f"{len(incomplete)} partially loaded, e.g. "
+                f"{(untouched + incomplete)[:4]}"
+            )
     if not incomplete:
         return
     msg = (
@@ -732,6 +910,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             # copy so a dry run never writes live storage, and is counted
             dest = to_meta_tensor(dest)
             bound_args.arguments["param"] = dest
+        duplicate = _record_shard_unit(layer, info, param_name, bound_args)
         token = _CURRENT_LOAD.set(LoadTarget(layer, param_name, dest))
         try:
             if _TRACE is not None:
@@ -741,6 +920,8 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                 return ret
 
             info.loaded_names.add(param_name)
+            if info.session is not None:
+                info.session.touched.add(id(layer))
             if _should_buffer(layer, bound_args):
                 # CPU/mmap incoming (cold-start online quant, file reload) or a
                 # deferred attention layer: buffer the call as before and count
@@ -775,6 +956,10 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                 num_loaded, ret = get_numel_loaded(original_loader, bound_args)
         finally:
             _CURRENT_LOAD.reset(token)
+        if duplicate:
+            # A shard sent twice must not complete the module while another
+            # shard is still missing (reported at finish)
+            num_loaded = 0
         info.load_numel += num_loaded
         _record_expert_unit(layer, info, param_name, original_loader, bound_args)
 
@@ -883,10 +1068,11 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         _finalize_attention_layer(layer, info, model_config)
         info.reset()
 
-    # Model phase: declared refresh() of model-local derived state (kind A),
-    # after every module has landed. The free-form model hook is not called.
+    # Model phase, after every module has landed: declared layer refreshes and
+    # `refresh_model()`. The free-form model hook is not called. (A cold
+    # start's model phase runs from `process_weights_after_loading`.)
     if reloading:
-        _refresh_model_local(model)
+        run_model_refresh(model)
 
     LOADING_LAYERS.clear()
 
@@ -897,17 +1083,6 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         session.active = False
     if reloading:
         _record_live_signatures(model)
-
-
-def _refresh_model_local(model: torch.nn.Module) -> None:
-    # post-order-ish: children before their parents, the model last
-    for module in reversed(list(model.modules())):
-        if isinstance(module, QuantizeMethodBase):
-            continue  # refreshed in the quant phase, with their layer
-        refresh = getattr(module, "refresh", None)
-        if callable(refresh):
-            with torch.no_grad():
-                refresh()
 
 
 def finalize_layerwise_reload(*args, **kwargs):
@@ -931,13 +1106,18 @@ def _finalize_attention_layer(
     if not reloading:
         layer.process_weights_after_loading(model_config.dtype)
         return
-    # Attention PWAL runs on the live module (MLA derives W_UK_T / W_UV from
-    # the landed kv_b_proj). Land anything it re-registers back into the
-    # original tensors, so captured graphs keep reading valid storage.
+    _rerun_attention_pwal(layer, model_config.dtype, old_floats)
+
+
+def _rerun_attention_pwal(
+    layer: torch.nn.Module, act_dtype: torch.dtype, old_floats: tuple
+) -> None:
+    """Attention PWAL on the live module (MLA derives W_UK_T / W_UV from the
+    landed kv_b_proj). Land anything it re-registers back into the original
+    tensors, so captured graphs keep reading valid storage."""
     params, buffers = get_layer_params_buffers(layer)
     before = {**params, **buffers}
-    with reload_mode():
-        layer.process_weights_after_loading(model_config.dtype)
+    layer.process_weights_after_loading(act_dtype)
     # The layer PWAL refreshed backend state derived from the q/k/v scales
     # (FlashInfer bmm1/bmm2 scales, device copies filled in place). Decode
     # paths that consume host floats are baked into FULL CUDA graphs.
@@ -1174,22 +1354,28 @@ def scratch_bytes_in_flight() -> int:
 
 
 @torch.no_grad()
-def refresh_derived_state(model: torch.nn.Module) -> None:
+def refresh_derived_state(
+    model: torch.nn.Module, model_config: ModelConfig | None = None
+) -> None:
     """Recompute weight-derived state in place after weights were written
-    directly in kernel format (sparse patches, `is_checkpoint_format=False`
-    reloads), without a streaming reload session: the declared quant-method
-    `refresh()` (e.g. MoE alphas / activation gscales) and model-local
-    `refresh()` (kind A). Host-side attention scale floats are not covered."""
+    directly in live tensors (sparse patches, `is_checkpoint_format=False`
+    reloads), without a streaming reload session. Runs every refresh phase:
+    kernel refresh (e.g. MoE alphas / activation gscales), attention (PWAL
+    re-run on the live module and landed, so MLA's W_UK_T / W_UV follow a
+    patched kv_b_proj and backends recompute their scale-derived state),
+    then the model phase. Without `model_config` the attention phase only
+    runs the backends' `refresh(layer)`."""
     for layer in model.modules():
-        quant_method = getattr(layer, "quant_method", None)
-        if isinstance(quant_method, QuantizeMethodBase):
-            _refresh_quant_method(layer, quant_method)
-    _refresh_model_local(model)
-
-
-def _refresh_quant_method(layer: torch.nn.Module, quant_method) -> None:
-    if getattr(quant_method, "reload_safe", False) and hasattr(quant_method, "refresh"):
-        quant_method.refresh(layer)
+        refresh_quant_method(layer, getattr(layer, "quant_method", None))
+    for layer in model.modules():
+        if not is_deferred_attention_layer(layer):
+            continue
+        refresh = getattr(getattr(layer, "impl", None), "refresh", None)
+        if model_config is not None:
+            _rerun_attention_pwal(layer, model_config.dtype, _kv_scale_floats(layer))
+        elif callable(refresh):
+            refresh(layer)
+    run_model_refresh(model)
 
 
 def attach_processing_plan(
@@ -1197,30 +1383,20 @@ def attach_processing_plan(
     process: Callable[[torch.nn.Module], None],
     stage: Literal["checkpoint", "kernel"] = "checkpoint",
 ) -> None:
-    """Attach another module's processing step to `module`.
+    """Escape hatch: attach a reload-only step to `module`.
 
-    Processing-plan convention (optional; the framework never requires one).
-    A PWAL that follows it:
+    New code should not need this. Per-shard work belongs in the param's
+    `weight_loader` (wrap it), post-PWAL work in `wrap_quant_method`; both
+    run on cold start and reload alike. This remains for a step that is not
+    idempotent and needs a module's checkpoint-format tensors before its PWAL
+    while cold start does the same work elsewhere: today only the MegaMoE
+    shared-expert fusion (DeepSeek-V4 / Kimi K3), which loads directly into
+    the kernel layout once #60096 lands.
 
-    1. creates its plan once, before anything changes the layer (at init or in
-       the first cold PWAL); the plan holds structural decisions only;
-    2. keeps the conversion in `plan.process(...)`, which maps checkpoint-format
-       tensors to kernel-format tensors and writes nothing else (not the layer's
-       attributes, not its config);
-    3. puts every other side effect (config writes, "already done" flags, the
-       kernel build) behind `if not is_reloading()`;
-    4. keeps weight-derived values in `refresh()`.
-
-    A quant method's PWAL re-runs on reload, so its plan needs nothing more.
-    A step that a parent applies to a child's tensors from a model-level hook
-    (which reload does not call) is attached here: at cold start the owner
-    calls `process(module)` itself; on reload the framework calls it on the
-    same tensors the cold path sees. `stage` says which: "checkpoint" runs on
-    `module`'s freshly loaded checkpoint-format tensors, before its PWAL (the
-    owner's cold step runs from `load_weights`, before the quant PWAL);
-    "kernel" runs on its PWAL results, before they land (the cold step runs
-    after PWAL). See `MegaAttnLayoutPlan` (DeepSeek-V4.1) and
-    `Fp8MoEProcessingPlan`."""
+    On reload the framework calls `process(module)` on the same tensors the
+    cold path sees: "checkpoint" on `module`'s freshly loaded
+    checkpoint-format tensors, before its PWAL; "kernel" on its PWAL
+    results, before they land."""
     plans = module.__dict__.setdefault("_attached_processing_plans", [])
     plans.append((stage, process))
 
@@ -1232,7 +1408,7 @@ def _run_attached_plans(
         if plan_stage == stage:
             # a plan may refill live tensors its owner's kernel reads
             _mark_dirty(info)
-            with reload_mode(), torch.no_grad():
+            with torch.no_grad():
                 process(layer)
 
 
@@ -1279,6 +1455,8 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     """
     if info is None:
         info = get_layerwise_info(layer)
+    if info.session is not None and info.kernel_tensors is not None:
+        info.session.touched.add(id(layer))
 
     slots = info.expert_slots
     if slots is not None:
@@ -1300,19 +1478,18 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     for param in get_layer_tensors(layer).values():
         param.weight_loader = _get_original_loader(param)
 
-    # Process weights (quantization, repacking, etc.). On reload this runs in
-    # reload mode: kernel objects are built once, `replace_parameter` rebinds.
+    # Process weights (quantization, repacking, etc.). PWAL always transforms;
+    # kernel objects are built once, keyed on their own presence.
     reloading = info.kernel_tensors is not None
     if reloading:
         _run_attached_plans(layer, info, "checkpoint")
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
-        with reload_mode() if reloading else nullcontext():
-            if slots is not None:
-                quant_method.finish_experts(layer, slots.staging)  # type: ignore[attr-defined]
-                layer._already_called_process_weights_after_loading = True
-            else:
-                quant_method.process_weights_after_loading(layer)
+        if slots is not None:
+            quant_method.finish_experts(layer, slots.staging)  # type: ignore[attr-defined]
+            layer._already_called_process_weights_after_loading = True
+        else:
+            quant_method.process_weights_after_loading(layer)
         # Re-reconcile parameter TP state: process_weights_after_loading may
         # have re-created Parameters (stamped with the global rank), which would
         # otherwise break replicated (disable_tp) weights on a subsequent reload.
@@ -1322,8 +1499,7 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
         # Module-level PWAL for modules without a quant method (model-local
         # transforms, e.g. mega-MoE): runs per module, on the fresh
         # checkpoint-format tensors, writing its declared `reload_outputs`.
-        with reload_mode():
-            layer.process_weights_after_loading()
+        layer.process_weights_after_loading()
 
     # Kernel-stage attached plans run on the PWAL results before landing, so
     # the live tensors receive the final layout exactly once.
@@ -1334,9 +1510,10 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
     # this code is a no-op if not reloading (because kernel tensors is empty)
     if reloading:
         _copy_and_restore_kernel_tensors(layer, info)
-        # Refresh weight-derived state now that the live tensors hold the new
-        # values (quant phase; attention and model phases run in finalize)
-        _refresh_quant_method(layer, quant_method)
+    # Kernel refresh: weight-derived state from the live tensors, after PWAL
+    # at cold start and after landing on reload (attention and model phases
+    # run in finalize)
+    refresh_quant_method(layer, quant_method)
 
     info.reset()
     with _LOADING_LOCK:
@@ -1352,13 +1529,15 @@ def complete_module(layer: torch.nn.Module, info: LayerReloadingInfo | None = No
 def start_reload(
     model: torch.nn.Module,
     partial: bool | None = None,
+    modules: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Begin a streaming reload (alias of `initialize_layerwise_reload`).
 
     `partial=False` requires every module with checkpoint tensors to receive
     weights; `partial=True` allows updating a subset; None reports modules
-    that received nothing."""
-    initialize_layerwise_reload(model, partial=partial)
+    that received nothing. `modules` declares a partial update's module names
+    (prefixes): finish then requires exactly those modules, complete."""
+    initialize_layerwise_reload(model, partial=partial, modules=modules)
 
 
 def finish_reload(model: torch.nn.Module, model_config: ModelConfig) -> None:

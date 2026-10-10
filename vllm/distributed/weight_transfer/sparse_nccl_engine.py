@@ -149,7 +149,7 @@ class SparseNCCLWeightTransferEngine(
         the state derived from the patched kernel-format tensors."""
         from vllm.model_executor.model_loader.reload import refresh_derived_state
 
-        refresh_derived_state(self.model)
+        refresh_derived_state(self.model, self.model_config)
 
     def receive_weights(self, update_info: SparseNCCLWeightTransferUpdateInfo) -> None:
         """Receive sparse flat-index patches from the trainer and apply them."""

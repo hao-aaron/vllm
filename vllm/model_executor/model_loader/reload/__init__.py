@@ -33,6 +33,7 @@ __all__ = [
     "landing_outcomes",
     "mark_dirty",
     "refresh_derived_state",
+    "register_refresh",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -63,6 +64,7 @@ from .layerwise import (
     start_reload,
     trace_loads,
 )
+from .refresh import register_refresh
 from .torchao_decorator import (
     set_torchao_reload_attrs,
     support_quantized_model_reload_from_hp_weights,

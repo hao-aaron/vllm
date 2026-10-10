@@ -13,6 +13,7 @@ from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
     SupportsPP,
+    SupportsReload,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
@@ -62,7 +63,7 @@ def _skip_linear_init():
     info=Dots3NoteProcessingInfo,
     dummy_inputs=Dots3NoteDummyInputsBuilder,
 )
-class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
+class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsReload):
     """Dots3Note model with optional image and audio towers."""
 
     supports_encoder_tp_data = True
@@ -320,15 +321,23 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     @property
     def reload_safe(self) -> bool:
-        """Modulewise reload: the model hook's work (the vision MoE's fused
-        FP8 buffers) is redone by the blocks' refresh() when they kept their
-        source experts (weight transfer configured); otherwise fail closed.
-        The hook's torch.compile of the vision blocks is cold-start only."""
+        """The model hook's work (the vision MoE's fused FP8 buffers) is
+        redone by refresh_model() when the blocks kept their source experts
+        (weight transfer configured); otherwise not reload-safe. The hook's
+        torch.compile of the vision blocks is cold-start only."""
         if self.visual is None:
             return True
         return all(
             getattr(block.mlp, "reload_safe", True) for block in self.visual.blocks
         )
+
+    def refresh_model(self) -> None:
+        if self.visual is None:
+            return
+        for block in self.visual.blocks:
+            refresh = getattr(block.mlp, "refresh_fused", None)
+            if refresh is not None:
+                refresh()
 
     def process_weights_after_loading(self) -> None:
         if self.visual is not None:

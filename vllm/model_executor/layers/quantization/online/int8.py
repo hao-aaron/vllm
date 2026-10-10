@@ -28,7 +28,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
     weight_amax,
 )
-from vllm.model_executor.utils import is_reloading, replace_parameter
+from vllm.model_executor.utils import replace_parameter
 
 
 class Int8OnlineMoEMethod(OnlineMoEMethodBase):
@@ -131,7 +131,7 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w2_weight", w2)
 
-        if not (is_reloading() and self.reload_safe and self.moe_kernel is not None):
+        if not (self.reload_safe and self.moe_kernel is not None):
             # built once; on reload landing + refresh() update it in place
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             assert self.moe_quant_config is not None

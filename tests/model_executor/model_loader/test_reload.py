@@ -1555,59 +1555,147 @@ def test_strict_landing_flags_broadcast(monkeypatch):
     assert torch.equal(dst, torch.full((3,), 2.0))
 
 
-class _ModeRecorder(_ProcessRecorder):
+class _BuildOnceMethod(_ProcessRecorder):
+    """A reload-safe method: PWAL always transforms (doubles `w`) and builds
+    its kernel object once, keyed on the object's presence (no reload flag);
+    weight-derived state lives in refresh()."""
+
+    reload_safe = True
+
     def __init__(self):
         super().__init__()
-        self.modes: list[bool] = []
+        self.kernel = None
+        self.builds = 0
+        self.refreshed: list[torch.Tensor] = []
 
     def process_weights_after_loading(self, layer):
-        from vllm.model_executor.utils import is_reloading
+        from vllm.model_executor.utils import replace_parameter
 
-        self.modes.append(is_reloading())
         super().process_weights_after_loading(layer)
+        replace_parameter(layer, "w", layer.w * 2)
+        if self.kernel is None:
+            self.builds += 1
+            self.kernel = SimpleNamespace(w=layer.w)
+
+    def refresh(self, layer):
+        self.refreshed.append(layer.w.detach().clone())
 
 
-def test_reload_mode_only_during_reload():
-    from vllm.model_executor.utils import is_reloading, reload_mode, replace_parameter
+def _cold_config():
+    return SimpleNamespace(
+        quantization=None,
+        dtype=torch.float32,
+        word_embeddings_untied_by_checkpoint=False,
+    )
+
+
+def test_pwal_transforms_always_and_builds_once():
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
     layer = _ExpertLayer(device="cpu")
-    layer.quant_method = _ModeRecorder()
+    method = layer.quant_method = _BuildOnceMethod()
     model = torch.nn.Sequential(layer)
     record_metadata_for_reloading(model)
+    layer.w.data.fill_(1.0)
+    process_weights_after_loading(model, _cold_config(), torch.device("cpu"))
+    live = layer.w
+    assert method.kernel.w is live and torch.equal(live, torch.full((2, 4, 6), 2.0))
+    # the framework refreshes after the cold PWAL too
+    assert len(method.refreshed) == 1
+
+    for value in (3.0, 5.0):
+        initialize_layerwise_reload(model)
+        for e in (2, 5):
+            layer.w.weight_loader(layer.w, torch.full((4, 6), value), expert_id=e)
+        finalize_layerwise_reload(model, model_config=None)
+        assert layer.w is live and method.kernel.w is live
+        assert torch.equal(live, torch.full((2, 4, 6), 2 * value))
+        # refresh runs after landing: it reads the new live values
+        assert torch.equal(method.refreshed[-1], live)
+    assert method.builds == 1 and len(method.refreshed) == 3
+
+
+def test_wrap_quant_method_runs_around_pwal_on_every_load():
+    """A model-specific step around a generic layer's PWAL (the replacement
+    for monkeypatching an instance's PWAL or rewriting it from the model
+    hook): `before_pwal` sees checkpoint-format tensors, `after_pwal` the PWAL
+    results, on cold start and reload alike, and its output lands once."""
+    from vllm.model_executor.layers.quantization.wrap import wrap_quant_method
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+    from vllm.model_executor.utils import replace_parameter
+
+    layer = _ExpertLayer(device="cpu")
+    method = layer.quant_method = _BuildOnceMethod()
+    seen: list[tuple[str, float]] = []
+
+    def before(layer):
+        seen.append(("before", layer.w.flatten()[0].item()))
+
+    def after(layer):
+        seen.append(("after", layer.w.flatten()[0].item()))
+        replace_parameter(layer, "w", layer.w + 1)
+
+    wrap_quant_method(layer, before_pwal=before)
+    wrap_quant_method(layer, after_pwal=after)
+    assert isinstance(layer.quant_method, _BuildOnceMethod)
+    assert "process_weights_after_loading" not in vars(layer.quant_method)
+    assert layer.quant_method.reload_safe
+
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    layer.w.data.fill_(1.0)
+    process_weights_after_loading(model, _cold_config(), torch.device("cpu"))
+    live = layer.w
+    assert seen == [("before", 1.0), ("after", 2.0)]
+    assert torch.equal(live, torch.full((2, 4, 6), 3.0))
+
+    seen.clear()
     initialize_layerwise_reload(model)
     for e in (2, 5):
-        layer.w.weight_loader(layer.w, torch.ones(4, 6), expert_id=e)
+        layer.w.weight_loader(layer.w, torch.full((4, 6), 4.0), expert_id=e)
     finalize_layerwise_reload(model, model_config=None)
-    assert layer.quant_method.modes == [True]
-    assert not is_reloading()
-    # replace_parameter(prefer_copy=True) still copies in place in reload
-    # mode: MLA keeps W_UK_T / W_UV addresses this way during attention PWAL
-    holder = torch.nn.Module()
-    holder.p = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
-    old = holder.p
-    with reload_mode():
-        replace_parameter(holder, "p", torch.ones(2), prefer_copy=True)
-    assert holder.p is old and torch.equal(old, torch.ones(2))
+    assert seen == [("before", 4.0), ("after", 8.0)]
+    assert layer.w is live and torch.equal(live, torch.full((2, 4, 6), 9.0))
+    assert method.builds == 1
 
 
 class _HookModel(torch.nn.Sequential):
-    def __init__(self, *mods, reload_safe=False):
+    """A model with a model-level hook; as `SupportsReload`, its derived
+    buffer lives in refresh_model()."""
+
+    def __init__(self, *mods, supports_reload=False):
         super().__init__(*mods)
-        self.reload_safe = reload_safe
-        self.hook_calls = 0
+        self.supports_reload = supports_reload
+        self.calls: list[str] = []
         self.register_buffer("derived", torch.zeros(4, 6), persistent=False)
-        self.refresh_calls = 0
 
     def process_weights_after_loading(self):
-        self.hook_calls += 1
+        self.calls.append("hook")
 
-    def refresh(self):
-        # kind A: derived from live params, allocated once, written in place
-        self.refresh_calls += 1
+    def refresh_model(self):
+        # derived from live params, allocated once, written in place
+        self.calls.append("refresh_model")
         self.derived.copy_(self[0].w[0] * 2)
 
+    def post_load_setup(self):
+        self.calls.append("post_load_setup")
 
-def test_model_hook_fail_closed_and_model_phase_refresh(monkeypatch):
+
+class _NestedReloadable(torch.nn.Module):
+    supports_reload = True
+
+    def __init__(self, calls):
+        super().__init__()
+        self._calls = calls
+
+    def refresh_model(self):
+        self._calls.append("nested_refresh_model")
+
+    def post_load_setup(self):
+        self._calls.append("nested_post_load_setup")
+
+
+def test_model_hook_warns_unless_supports_reload(monkeypatch):
     layer = _ExpertLayer(device="cpu")
     unsafe = _HookModel(layer)
     record_metadata_for_reloading(unsafe)
@@ -1621,18 +1709,45 @@ def test_model_hook_fail_closed_and_model_phase_refresh(monkeypatch):
     monkeypatch.setattr(reload_layerwise, "STRICT_MODEL_HOOK", True)
     with pytest.raises(reload_layerwise.ReloadUnsafeModelError):
         initialize_layerwise_reload(unsafe)
-    monkeypatch.setattr(reload_layerwise, "STRICT_MODEL_HOOK", False)
+    # an instance can opt out of a class-level SupportsReload claim
+    unsafe.supports_reload = True
+    unsafe.reload_safe = False
+    with pytest.raises(reload_layerwise.ReloadUnsafeModelError):
+        initialize_layerwise_reload(unsafe)
+    unsafe.reload_safe = True
+    initialize_layerwise_reload(unsafe)
+    reload_layerwise.abort_reload(unsafe)
+
+
+def test_post_load_contract_order_cold_and_reload():
+    """Cold start: model hook, then declared layer refreshes, refresh_model()
+    (nested SupportsReload modules first) and post_load_setup(). Reload:
+    the same refreshes after landing; neither the hook nor the setup."""
+    from vllm.model_executor.model_loader.reload import register_refresh
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
     layer = _ExpertLayer(device="cpu")
-    model = _HookModel(layer, reload_safe=True)
+    model = _HookModel(layer, supports_reload=True)
+    model.nested = _NestedReloadable(model.calls)
+    register_refresh(layer, lambda: model.calls.append("layer_refresh"))
     record_metadata_for_reloading(model)
+    process_weights_after_loading(model, _cold_config(), torch.device("cpu"))
+    assert model.calls == [
+        "hook",
+        "layer_refresh",
+        "nested_refresh_model",
+        "refresh_model",
+        "nested_post_load_setup",
+        "post_load_setup",
+    ]
+
+    model.calls.clear()
     derived_ptr = model.derived.data_ptr()
     initialize_layerwise_reload(model)
     for e in (2, 5):
         layer.w.weight_loader(layer.w, torch.full((4, 6), float(e)), expert_id=e)
     finalize_layerwise_reload(model, model_config=None)
-    assert model.hook_calls == 0  # the free-form hook is cold-start only
-    assert model.refresh_calls == 1
+    assert model.calls == ["layer_refresh", "nested_refresh_model", "refresh_model"]
     assert model.derived.data_ptr() == derived_ptr
     assert torch.equal(model.derived, torch.full((4, 6), 4.0))
 
@@ -1890,6 +2005,176 @@ def test_failure_before_any_live_write_is_clean():
     abort_reload(model)
     assert not is_model_dirty(model)
     assert torch.equal(a.w, before)
+
+
+def test_dirty_model_is_cleared_only_by_a_full_update():
+    """After a failed update wrote live weights, an empty or partial update
+    must not re-enable serving on mixed weights; one that covers every module
+    does."""
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        finish_reload,
+        is_model_dirty,
+        start_reload,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        ReloadIncompleteError,
+    )
+
+    model, (a, b) = _two_expert_layers()
+    start_reload(model)
+    _load_layer(a, 1.0)
+    abort_reload(model)
+    assert is_model_dirty(model)
+    for partial, layers in ((None, ()), (True, (a,)), (None, (a,))):
+        start_reload(model, partial=partial)
+        for layer in layers:
+            _load_layer(layer, 2.0)
+        with pytest.raises(ReloadIncompleteError, match="dirty"):
+            finish_reload(model, model_config=None)
+        abort_reload(model)
+        assert is_model_dirty(model)
+    start_reload(model, partial=True)
+    _load_layer(a, 3.0)
+    _load_layer(b, 3.0)
+    finish_reload(model, model_config=None)
+    assert not is_model_dirty(model)
+
+
+def test_declared_module_set_must_match():
+    from vllm.model_executor.model_loader.reload import (
+        abort_reload,
+        finish_reload,
+        start_reload,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        ReloadIncompleteError,
+    )
+
+    model, (a, b) = _two_expert_layers()
+    start_reload(model, modules=["0"])
+    _load_layer(a, 1.0)
+    finish_reload(model, model_config=None)  # "1" untouched: declared partial
+
+    start_reload(model, modules=["0"])
+    _load_layer(a, 1.0)
+    _load_layer(b, 1.0)
+    with pytest.raises(ReloadIncompleteError, match="outside"):
+        finish_reload(model, model_config=None)
+    abort_reload(model)
+
+    start_reload(model, modules=["0", "1"])
+    _load_layer(a, 1.0)
+    with pytest.raises(ReloadIncompleteError, match="received none"):
+        finish_reload(model, model_config=None)
+    abort_reload(model)
+    with pytest.raises(ValueError):
+        start_reload(model, partial=False, modules=["0"])
+
+
+@requires_cuda
+@pytest.mark.parametrize("case", ["missing", "duplicate", "complete"])
+def test_fused_linear_shards_are_required(dist_init, case):
+    """A fused linear holds several checkpoint tensors in one param: q alone
+    (or q sent repeatedly, which used to push the count to the module total
+    and complete it with zero-filled k/v) fails the update."""
+    from vllm.model_executor.model_loader.reload import (
+        finish_reload,
+        is_model_dirty,
+        start_reload,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        ReloadIncompleteError,
+    )
+
+    with torch.device("cuda"):
+        qkv = QKVParallelLinear(4, 2, 2, bias=False)
+        model = torch.nn.Sequential(qkv)
+        record_metadata_for_reloading(model)
+    live = qkv.weight
+
+    def send(shard, value):
+        p = qkv.weight
+        p.weight_loader(p, torch.full((4, 4), value, device="cuda"), shard)
+
+    start_reload(model)
+    send("q", 1.0)
+    if case == "duplicate":
+        send("q", 1.0)
+        send("q", 1.0)
+        # not completed early: the module still waits for k and v
+        assert reload_layerwise.get_layerwise_info(qkv).can_load()
+    send("k", 2.0)
+    if case == "complete":
+        send("v", 3.0)
+        finish_reload(model, model_config=None)
+        assert qkv.weight is live
+        assert torch.equal(live[8:].cpu(), torch.full((4, 4), 3.0))
+        return
+    with pytest.raises(ReloadIncompleteError, match="shard"):
+        finish_reload(model, model_config=None)
+    reload_layerwise.abort_reload(model)
+    # nothing landed; hosting (direct loading) wrote live bytes, though
+    from vllm.model_executor.model_loader.reload import direct
+
+    assert is_model_dirty(model) == direct.DIRECT_LOAD
+
+
+def test_replaced_kernel_object_refuses_update_under_graphs(monkeypatch):
+    """Built-once kernel objects are recorded with the live tensors after an
+    update: one rebuilt outside reload would not be the one reload refreshes
+    (and captured graphs read)."""
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    layer = _ExpertLayer(device="cpu")
+    method = layer.quant_method = _BuildOnceMethod()
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    process_weights_after_loading(model, _cold_config(), torch.device("cpu"))
+    initialize_layerwise_reload(model)
+    _load_layer(layer, 1.0)
+    finalize_layerwise_reload(model, model_config=None)
+
+    method.kernel = SimpleNamespace(w=layer.w)  # rebuilt outside reload
+    monkeypatch.setattr(reload_layerwise, "_cudagraphs_captured", lambda: True)
+    with pytest.raises(reload_layerwise.ReloadUnsupportedError, match="kernel"):
+        initialize_layerwise_reload(model)
+
+
+class _DerivedAttention(torch.nn.Module, AttentionLayerBase):
+    """Attention whose PWAL derives a tensor from another module's live
+    weight (like MLA's W_UK_T from kv_b_proj) and re-registers it."""
+
+    def __init__(self, source: torch.nn.Module):
+        super().__init__()
+        self._source = [source]
+        self.register_buffer("derived", torch.zeros(4, 6))
+
+    def get_attn_backend(self):
+        raise NotImplementedError
+
+    def get_kv_cache_spec(self, vllm_config):
+        return None
+
+    def process_weights_after_loading(self, act_dtype):
+        self.register_buffer("derived", self._source[0].w[0] * 2)
+
+
+def test_refresh_derived_state_reruns_attention_phase():
+    """Session-less writes (sparse patches) to a weight attention derives from
+    reach the attention-derived tensor, in place (review of #59502)."""
+    from vllm.model_executor.model_loader.reload import refresh_derived_state
+
+    layer = _ExpertLayer(device="cpu")
+    attn = _DerivedAttention(layer)
+    model = torch.nn.Sequential(layer, attn)
+    attn.process_weights_after_loading(torch.float32)
+    live = attn.derived
+    with torch.no_grad():
+        layer.w.fill_(5.0)  # a sparse patch
+    refresh_derived_state(model, SimpleNamespace(dtype=torch.float32))
+    assert attn.derived is live
+    assert torch.equal(live, torch.full((4, 6), 10.0))
 
 
 def test_incomplete_module_reported_or_raised(monkeypatch):
@@ -2648,7 +2933,7 @@ def test_dots3_vision_moe_fused_fp8_refresh(monkeypatch, keep):
         for p in mlp.experts.parameters():
             p.mul_(2.0)  # a reload lands new expert weights
     expected = mlp._fused_fp8()
-    mlp.refresh()
+    mlp.refresh_fused()
     for (name, (t, ptr)), exp in zip(live.items(), expected):
         now = getattr(mlp, name)
         assert now is t and now.data_ptr() == ptr
@@ -2669,12 +2954,13 @@ def test_dots3_vision_moe_fused_fp8_refresh(monkeypatch, keep):
 @pytest.mark.parametrize("inner_safe", [True, False, None])
 def test_wrapper_models_delegate_reload_safe(module, cls_name, inner_safe):
     """Wrapper models whose hook only runs the language model's hook are as
-    reload-safe as that language model (undeclared: not safe)."""
+    reload-safe as that language model (not SupportsReload: not safe)."""
     cls = getattr(importlib.import_module(module), cls_name)
     model = object.__new__(cls)
     torch.nn.Module.__init__(model)
     inner = torch.nn.Module()
     if inner_safe is not None:
+        inner.supports_reload = True
         inner.reload_safe = inner_safe
     model.language_model = inner
     assert model.reload_safe is bool(inner_safe)
@@ -2788,7 +3074,7 @@ def test_dflash_fused_context_kv_buffers_refresh_in_place(model):
         for a in attns:  # a reload lands new per-layer weights
             for p in a.parameters():
                 p.add_(1.0)
-    m.refresh()
+    m.refresh_context_kv()
     assert (getattr(m, fused_name).data_ptr(), m._k_norm_weights.data_ptr()) == ptrs
     rebuilt = object.__new__(cls)
     torch.nn.Module.__init__(rebuilt)
@@ -2822,7 +3108,7 @@ def test_k3_dspark_context_kv_norms_refresh_in_place():
     with torch.no_grad():
         for layer in layers:
             layer.self_attn.kv_a_layernorm.weight.mul_(3.0)
-    m.refresh()
+    m.refresh_context_kv()
     assert m._context_kv_norm_weights is norms and norms.data_ptr() == ptr
     expected = torch.stack([la.self_attn.kv_a_layernorm.weight for la in layers])
     assert torch.equal(norms, expected)
@@ -2883,9 +3169,13 @@ def test_per_expert_stacked_loads_take_module_level_path(monkeypatch):
 
 def test_refresh_derived_state_runs_declared_refreshes():
     """Kernel-format writes (sparse patches, is_checkpoint_format=False) have
-    no reload session: refresh_derived_state recomputes derived state via the
-    declared quant-method and model-local refresh() hooks only."""
-    from vllm.model_executor.model_loader.reload import refresh_derived_state
+    no reload session: refresh_derived_state runs the declared refreshes only
+    (reload-safe quant methods, layer refreshes, refresh_model()); a
+    module's undeclared `refresh()` is not called."""
+    from vllm.model_executor.model_loader.reload import (
+        refresh_derived_state,
+        register_refresh,
+    )
 
     calls: list[str] = []
 
@@ -2906,14 +3196,21 @@ def test_refresh_derived_state_runs_declared_refreshes():
         def refresh(self):
             calls.append("local")
 
-    model = torch.nn.Module()
+    class _Model(torch.nn.Module):
+        supports_reload = True
+
+        def refresh_model(self):
+            calls.append("model")
+
+    model = _Model()
     model.safe = torch.nn.Module()
     model.safe.quant_method = _Method(True)
     model.unsafe = torch.nn.Module()
     model.unsafe.quant_method = _Method(False)  # rebuilds; no declared refresh
     model.local = _Local()
+    register_refresh(model.safe, lambda: calls.append("layer"))
     refresh_derived_state(model)
-    assert sorted(calls) == ["local", "quant:True"]
+    assert calls == ["quant:True", "layer", "model"]
 
 
 def _stub_moe_method(reload_safe: bool):

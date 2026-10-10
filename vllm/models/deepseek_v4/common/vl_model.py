@@ -28,6 +28,8 @@ from vllm.model_executor.models.interfaces import (
     SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
+    SupportsReload,
+    supports_reload,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
@@ -84,7 +86,12 @@ def _make_deepseek_v4_vl_weights_mapper(
     dummy_inputs=DeepseekV4VLDummyInputsBuilder,
 )
 class DeepseekV4ForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3, SupportsLoRA
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsReload,
 ):
     """Multimodal entry point for DeepSeek-V4 checkpoints with a vision tower.
 
@@ -337,8 +344,10 @@ class DeepseekV4ForConditionalGeneration(
 
     @property
     def reload_safe(self) -> bool:
-        # Modulewise reload: the hook only runs the language model's hook.
-        return bool(getattr(self.language_model, "reload_safe", False))
+        # The hook only runs the language model's hook (its refresh_model() is
+        # called by the framework, which visits nested SupportsReload models)
+        lm = self.language_model
+        return supports_reload(lm) and bool(getattr(lm, "reload_safe", True))
 
     def process_weights_after_loading(self) -> None:
         # Backbones such as the ROCm implementation require this to run only

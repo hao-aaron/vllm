@@ -48,6 +48,7 @@ from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     SupportsEagle3,
     SupportsPP,
+    SupportsReload,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -844,7 +845,7 @@ def _make_deepseek_v4_weights_mapper(
     )
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsReload):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -913,13 +914,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    # Modulewise reload: the model hook does nothing (yet).
-    reload_safe = True
-
-    def process_weights_after_loading(self) -> None:
-        # No CPU AMX weight-packing hook yet.
-        pass
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

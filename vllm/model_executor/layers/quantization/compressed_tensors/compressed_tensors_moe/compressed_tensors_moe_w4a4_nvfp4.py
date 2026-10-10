@@ -32,7 +32,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.model_executor.utils import (
-    is_reloading,
     replace_parameter,
     set_weight_attrs,
 )
@@ -262,7 +261,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 )
 
         # Setup modular kernel.
-        if not (is_reloading() and self.reload_safe and self.moe_kernel is not None):
+        if not (self.reload_safe and self.moe_kernel is not None):
             # built once; on reload landing updates what it reads in place
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             assert self.experts_cls is not None

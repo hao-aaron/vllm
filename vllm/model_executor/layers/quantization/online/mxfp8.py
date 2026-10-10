@@ -32,7 +32,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     mxfp8_e4m3_quantize,
 )
-from vllm.model_executor.utils import is_reloading, replace_parameter
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 
@@ -240,7 +240,7 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, f"w13_{self.weight_scale_name}", w13_scale)
         replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
 
-        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+        if self.reload_safe and self.moe_kernel is not None:
             return  # built once; landing + refresh() update it in place
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:

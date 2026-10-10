@@ -5581,7 +5581,7 @@ class GPUModelRunner(
                 refresh_derived_state,
             )
 
-            refresh_derived_state(model)
+            refresh_derived_state(model, self.model_config)
 
         self.reset_lora_state()
 

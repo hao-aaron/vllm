@@ -32,7 +32,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4DynamicToken,
     kNvfp4Static,
 )
-from vllm.model_executor.utils import is_reloading, is_weights_pre_processed
+from vllm.model_executor.utils import is_weights_pre_processed
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
@@ -68,6 +68,9 @@ class TrtLlmNvFp4ExpertsBase:
         self.is_situ = moe_config.activation == MoEActivation.SITU
 
         self.g1_scale_c = self._compute_g1_scale_c()
+        # Set by the first process_weights_after_loading, which binds the
+        # kernel's derived tensors to the layer's registered parameters
+        self._layer_tensors_bound = False
 
         # Fall back to moe_config.swiglu_* when quant_config doesn't carry them
         # (ModelOpt NVFP4 checkpoints store these on moe_config, not quant_config).
@@ -159,12 +162,11 @@ class TrtLlmNvFp4ExpertsBase:
         if not is_weights_pre_processed():
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
-        # Derived values are computed from the layer's tensors (the ones the
-        # quant config references at cold start). On a modulewise reload this
-        # runs on the reload's fresh tensors while the built-once quant config
-        # still references the live ones; the registered results are landed
-        # into the live parameters, which this kernel keeps referencing.
-        reloading = is_reloading()
+        # Derived values are computed from the layer's tensors and registered
+        # on the layer. The first call binds this kernel to those parameters.
+        # Later calls (a modulewise reload) run on the reload's fresh tensors;
+        # their results are landed into the bound live parameters.
+        bind = not self._layer_tensors_bound
         g1_alphas = layer.w13_weight_scale_2
         # Recompute g1_scale_c since g1_alphas was just fused in-place.
         # Register as a layer parameter so EPLB rearranges it alongside
@@ -175,7 +177,7 @@ class TrtLlmNvFp4ExpertsBase:
             "g1_scale_c",
             torch.nn.Parameter(g1_scale_c, requires_grad=False),
         )
-        if not reloading:
+        if bind:
             self.g1_scale_c = layer.g1_scale_c
 
         # Pre-fold the per-expert g1_alphas (= output1_scale_gate_scalar)
@@ -193,7 +195,7 @@ class TrtLlmNvFp4ExpertsBase:
                 "gemm1_clamp_limit",
                 torch.nn.Parameter(gemm1_clamp_limit, requires_grad=False),
             )
-            if not reloading:
+            if bind:
                 self.gemm1_clamp_limit = layer.gemm1_clamp_limit
 
         # beta shifts the raw GEMM1 accumulator, so fold by g1_alphas like the
@@ -207,7 +209,7 @@ class TrtLlmNvFp4ExpertsBase:
                 "gemm1_beta",
                 torch.nn.Parameter(gemm1_beta, requires_grad=False),
             )
-            if not reloading:
+            if bind:
                 self.gemm1_beta = layer.gemm1_beta
 
         if self.gemm1_alpha is not None:
@@ -216,6 +218,7 @@ class TrtLlmNvFp4ExpertsBase:
                 torch.nn.Parameter(self.gemm1_alpha, requires_grad=False),
             )
             self.gemm1_alpha = layer.gemm1_alpha
+        self._layer_tensors_bound = True
 
     @staticmethod
     def _supports_current_device() -> bool:

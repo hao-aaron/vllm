@@ -29,6 +29,11 @@ from vllm.model_executor.model_loader.reload import (
     record_metadata_for_reloading,
     set_torchao_reload_attrs,
 )
+from vllm.model_executor.model_loader.reload.refresh import (
+    refresh_quant_method,
+    run_model_refresh,
+    run_post_load_setup,
+)
 from vllm.model_executor.model_loader.weight_cache.utils import (
     is_draft_model_cacheable,
 )
@@ -168,6 +173,8 @@ def process_weights_after_loading(
             )
             with loading_context:
                 quant_method.process_weights_after_loading(module)
+                # kernel refresh, as on reload after landing
+                refresh_quant_method(module, quant_method)
             # process_weights_after_loading may swap in freshly-created
             # Parameters (e.g. FP8 requantization), which are stamped with the
             # global rank in BasevLLMParameter.__init__. Re-reconcile their TP
@@ -192,6 +199,11 @@ def process_weights_after_loading(
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
+
+    # Model phase of the post-load contract (`SupportsReload`): the same
+    # refreshes reload runs after landing, then the cold-start-only setup.
+    run_model_refresh(model)
+    run_post_load_setup(model)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

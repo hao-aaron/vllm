@@ -279,6 +279,10 @@ class MoERunner(MoERunnerInterface):
         # in a single launch.
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
+        # Derived from two other modules' weights: refreshed after every load
+        from vllm.model_executor.model_loader.reload.refresh import register_refresh
+
+        register_refresh(self, self.refresh)
 
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
@@ -355,7 +359,7 @@ class MoERunner(MoERunnerInterface):
     @torch.no_grad()
     def refresh(self) -> None:
         """Recompute the fused router gate in place from the live gate weights
-        (reload, model phase). Before the first forward it is not built yet."""
+        (declared layer refresh). Before the first forward it is not built."""
         if self._combined_gate_weight is not None:
             assert self.gate is not None and self.shared_expert_gate is not None
             torch.cat(

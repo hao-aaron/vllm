@@ -292,8 +292,10 @@ class EngineClient(ABC):
         """Initialize weight transfer for RL training."""
         raise NotImplementedError
 
-    async def start_weight_update(self) -> None:
-        """Start a new weight update."""
+    async def start_weight_update(
+        self, partial: bool | None = None, modules: list[str] | None = None
+    ) -> None:
+        """Start a new weight update (see `LLM.start_weight_update`)."""
         raise NotImplementedError
 
     async def start_draft_weight_update(self) -> None:

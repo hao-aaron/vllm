@@ -58,6 +58,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    SupportsReload,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -69,7 +70,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     spec_decode_needs_target_embed,
 )
-from vllm.model_executor.utils import is_reloading, set_weight_attrs
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -698,10 +699,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.register_buffer("_mega_l2_scale", l2[1], persistent=False)
 
     def process_weights_after_loading(self) -> None:
-        """Reload-only transform (cold start keeps finalize_weights from the
-        model hook, after the whole stream)."""
-        assert is_reloading(), "cold start finalizes from the model hook"
-        assert self._transformed_l1_weights is not None
+        """Reload-only transform: the framework calls it per module on reload
+        (cold start keeps finalize_weights from the model hook, after the
+        whole stream)."""
+        assert self._transformed_l1_weights is not None, (
+            "cold start finalizes from the model hook"
+        )
         assert not self.has_fused_shared_experts or getattr(
             self, "_shared_expert_reload_attached", False
         ), "MegaMoE shared-expert fusion without its reload steps"
@@ -1980,14 +1983,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
-    def refresh(self) -> None:
-        """Modulewise reload, kind A: the mHC broadcast is derived from live
-        `hc_attn_fn`; once built it is recomputed in place after landing."""
-        if get_pp_group().is_first_rank and self.start_layer < self.end_layer:
-            layer = self.layers[self.start_layer]
-            if getattr(layer, "hc_attn_fn_broadcast", None) is not None:
-                self.finalize_mhc_broadcast_weights()
-
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
             return
@@ -2092,6 +2087,7 @@ class DeepseekV4ForCausalLM(
     SupportsPP,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsReload,
     DeepseekV4MixtureOfExperts,
 ):
     finalizes_weights_during_load = True
@@ -2195,7 +2191,7 @@ class DeepseekV4ForCausalLM(
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         # A streamed reload calls load_weights per batch while modules are
         # still on meta; its post-load work runs per module (mega-MoE
-        # reload_outputs) and in the model refresh() (mHC broadcast) instead.
+        # reload_outputs) and in refresh_model() (mHC broadcast) instead.
         from vllm.model_executor.model_loader.reload import is_reload_active
 
         if not is_reload_active(self):
@@ -2204,13 +2200,17 @@ class DeepseekV4ForCausalLM(
 
     @property
     def reload_safe(self) -> bool:
-        """Modulewise reload: the model hook's work is redone per module
-        (MegaMoE reload_outputs) and by `refresh()` (mHC broadcast); see
-        `mega_moe_reload_safe` for what fails closed."""
+        """The model hook's work (MegaMoE finalize) is redone per module on
+        reload (MegaMoE reload_outputs); see `mega_moe_reload_safe` for what
+        fails closed."""
         return mega_moe_reload_safe(self)
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
+
+    def refresh_model(self) -> None:
+        # The mHC broadcast is derived from the live `hc_attn_fn`: allocated by
+        # the cold-start call, refilled in place afterwards
         self.model.finalize_mhc_broadcast_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

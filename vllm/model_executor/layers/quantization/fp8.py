@@ -76,7 +76,6 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import (
-    is_reloading,
     is_weights_pre_processed,
     replace_parameter,
     set_weight_attrs,
@@ -479,9 +478,9 @@ class Fp8MoEWeights:
 @dataclass(frozen=True)
 class Fp8MoEProcessingPlan:
     """Processing plan of `Fp8MoEMethod`: the reference implementation of the
-    processing-plan convention (see `attach_processing_plan`).
+    processing-plan convention (see `vllm.model_executor.model_loader.reload`).
 
-    Structural decisions only, made once in the first cold PWAL before anything
+    Structural decisions only, made once in the first PWAL before anything
     changes the layer, so a reload converts its checkpoint-format tensors
     exactly as the cold load did (e.g. `shard_size` is the checkpoint's, not a
     size a backend padded to)."""
@@ -634,7 +633,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             Fp8MoeBackend.DEEPGEMM,
             Fp8MoeBackend.MARLIN,
         )
-        # Created in the first cold PWAL (processing-plan convention)
+        # Created in the first PWAL (processing-plan convention)
         self.processing_plan: Fp8MoEProcessingPlan | None = None
 
     def create_weights(
@@ -816,8 +815,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ),
         )
 
-        # Install. Under reload, `replace_parameter` only rebinds; the reload
-        # framework lands the results in the live tensors.
+        # Install. `replace_parameter` only rebinds; on reload the framework
+        # lands the results in the live tensors.
         if self.processing_plan.static_input_scales:
             replace_parameter(layer, "w13_input_scale", weights.w13_input_scale)
             replace_parameter(layer, "w2_input_scale", weights.w2_input_scale)
@@ -826,10 +825,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, f"w13_{self.weight_scale_name}", weights.w13_scale)
         replace_parameter(layer, f"w2_{self.weight_scale_name}", weights.w2_scale)
 
-        # Other side effects are cold-only. Build once: the kernel (captured by
-        # CUDA graphs) keeps referencing the live tensors; the reload framework
-        # lands the new values and then calls refresh() for derived state.
-        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+        # Construction, keyed on the kernel's presence: built once, it (and
+        # captured CUDA graphs) keeps referencing the live tensors; reload
+        # lands the new values and the framework calls refresh() after it.
+        if self.reload_safe and self.moe_kernel is not None:
             return
         self._init_moe_kernel(layer)
 

@@ -341,8 +341,8 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         if reload_active(self):
             # A streamed reload sends the checkpoint in batches: load what
             # arrived; whole-checkpoint checks and the confidence-head drop
-            # are cold start only, and the fused buffers are refilled by the
-            # model's refresh().
+            # are cold start only, and the fused buffers are refilled by
+            # refresh_model().
             AutoWeightsLoader(self).load_weights(
                 model_weights.items(),
                 mapper=WeightsMapper(orig_to_new_substr={"mask_embedding": None}),

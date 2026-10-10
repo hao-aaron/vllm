@@ -58,7 +58,7 @@ from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
 from vllm.model_executor.parameter import ModelWeightParameter
-from vllm.model_executor.utils import is_reloading, replace_parameter
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.math_utils import round_up
@@ -592,7 +592,7 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
         replace_parameter(layer, f"w13_{self.weight_scale_name}", w13_scale)
         replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
 
-        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+        if self.reload_safe and self.moe_kernel is not None:
             return  # built once; landing + refresh() update it in place
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:

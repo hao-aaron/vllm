@@ -1461,7 +1461,9 @@ class Worker(WorkerBase):
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
 
-    def start_weight_update(self, partial: bool | None = None) -> None:
+    def start_weight_update(
+        self, partial: bool | None = None, modules: list[str] | None = None
+    ) -> None:
         """Start a new weight update session.
 
         Delegates engine-specific preparation (e.g. layerwise reload setup) to
@@ -1472,10 +1474,13 @@ class Worker(WorkerBase):
             partial: True if this update sends only part of the model; False
                 if it must send every module's weights (finish raises
                 otherwise); None to only report modules that received none.
+            modules: the module names (prefixes) a partial update sends. All
+                ranks must declare the same set (checked here, before any
+                write), and finish requires exactly these modules, complete.
 
         """
         with set_current_vllm_config(self.vllm_config):
-            self._start_weight_update(partial=partial)
+            self._start_weight_update(partial=partial, modules=modules)
 
     def start_draft_weight_update(self) -> None:
         """Like start_weight_update, but retargets the engine at the speculative
@@ -1485,10 +1490,27 @@ class Worker(WorkerBase):
             self._start_weight_update(is_draft=True)
 
     def _start_weight_update(
-        self, is_draft: bool = False, partial: bool | None = None
+        self,
+        is_draft: bool = False,
+        partial: bool | None = None,
+        modules: list[str] | None = None,
     ) -> None:
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
+        if modules is not None:
+            if partial is False:
+                raise ValueError(
+                    "start_weight_update: a module set declares a partial update"
+                )
+            partial = True
+            self._check_module_set_agreement(modules)
+        elif partial:
+            logger.warning_once(
+                "Partial weight update without a declared module set: ranks are "
+                "not checked to update the same modules. If post-load "
+                "processing runs collectives (online quantization, MLA with "
+                "DCP), a mismatch hangs; pass modules=[...] to check it."
+            )
 
         if is_draft and not self.weight_transfer_engine.supports_draft_weight_update:
             raise RuntimeError(
@@ -1523,6 +1545,30 @@ class Worker(WorkerBase):
             )
             if session is not None:
                 session.partial = partial
+                if modules is not None:
+                    session.modules = tuple(sorted(modules))
+
+    def _check_module_set_agreement(self, modules: list[str]) -> None:
+        """All ranks of the update declare the same module set, before any
+        write: post-load processing may run collectives per module."""
+        import hashlib
+
+        digest = hashlib.sha256("\n".join(sorted(modules)).encode()).digest()
+        value = int.from_bytes(digest[:7], "little")
+        lo = torch.tensor([value], dtype=torch.int64)
+        hi = lo.clone()
+        for group in self._weight_update_groups():
+            torch.distributed.all_reduce(
+                lo, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
+            torch.distributed.all_reduce(
+                hi, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+            )
+        if lo.item() != hi.item():
+            raise RuntimeError(
+                "start_weight_update: ranks declared different module sets for "
+                "this partial update; every rank must update the same modules."
+            )
 
     def update_weights(self, update_info: dict | list[dict]) -> None:
         """Receive one weight update chunk from the trainer.
@@ -1576,13 +1622,10 @@ class Worker(WorkerBase):
             self._weight_update_failed = True
             self.weight_transfer_engine.reset_weight_update_target()
 
-    def _weight_update_ok_on_all_ranks(self, ok: bool) -> bool:
-        """All ranks of this engine (TP x PP) agree on the outcome before any
-        of them serves: a forward runs on all of them together, so one rank's
-        failure (e.g. an expert missing on its EP shard) makes every rank's
-        weights unusable. With expert parallelism across DP replicas their
-        forwards are coupled too (MoE dispatch/combine), so the DP replicas
-        agree as well; independent DP replicas decide on their own."""
+    def _weight_update_groups(self) -> list:
+        """Groups whose ranks must agree on an update: this engine's ranks
+        (TP x PP), and the DP replicas when expert parallelism couples their
+        forwards (MoE dispatch/combine); independent replicas decide alone."""
         from vllm.distributed import parallel_state
 
         groups = []
@@ -1596,7 +1639,13 @@ class Worker(WorkerBase):
             and parallel_state._DP is not None
         ):
             groups.append(parallel_state.get_dp_group())
-        for group in groups:
+        return groups
+
+    def _weight_update_ok_on_all_ranks(self, ok: bool) -> bool:
+        """All ranks agree on the outcome before any of them serves: a forward
+        runs on all of them together, so one rank's failure (e.g. an expert
+        missing on its EP shard) makes every rank's weights unusable."""
+        for group in self._weight_update_groups():
             flag = torch.tensor([int(ok)], dtype=torch.int32)
             torch.distributed.all_reduce(
                 flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group

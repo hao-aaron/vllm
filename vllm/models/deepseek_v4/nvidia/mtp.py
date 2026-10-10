@@ -46,6 +46,7 @@ from vllm.model_executor.model_loader.mtp_validation import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
+from vllm.model_executor.models.interfaces import SupportsReload
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -302,7 +303,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-class DeepSeekV4MTP(nn.Module):
+class DeepSeekV4MTP(nn.Module, SupportsReload):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -546,8 +547,8 @@ class DeepSeekV4MTP(nn.Module):
 
     @property
     def reload_safe(self) -> bool:
-        # Modulewise reload: the hook's only work (the MegaMoE transform) is
-        # redone per module on reload.
+        # The hook's only work (the MegaMoE transform) is redone per module on
+        # reload.
         from vllm.models.deepseek_v4.nvidia.model import mega_moe_reload_safe
 
         return mega_moe_reload_safe(self)

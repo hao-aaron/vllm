@@ -15,6 +15,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.models.interfaces import SupportsReload
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -261,9 +262,9 @@ class K3DSparkModel(nn.Module):
             )
 
     @torch.no_grad()
-    def refresh(self) -> None:
-        """Modulewise reload, kind A: the stacked KV-norm weights (and KV
-        scales) are derived from the live per-layer params; refill in place."""
+    def refresh_context_kv(self) -> None:
+        """Refill the stacked KV-norm weights (and KV scales), derived from the
+        live per-layer params, in place."""
         if not hasattr(self, "_num_context_layers"):
             return
         attentions = [layer.self_attn for layer in self.layers]
@@ -448,7 +449,7 @@ class K3DSparkModel(nn.Module):
         return hidden_states
 
 
-class K3DSparkForCausalLM(nn.Module):
+class K3DSparkForCausalLM(nn.Module, SupportsReload):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
@@ -551,9 +552,8 @@ class K3DSparkForCausalLM(nn.Module):
         weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
-    # Modulewise reload: the hook's derived state is refilled in place by
-    # K3DSparkModel.refresh().
-    reload_safe = True
-
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()
+
+    def refresh_model(self) -> None:
+        self.model.refresh_context_kv()

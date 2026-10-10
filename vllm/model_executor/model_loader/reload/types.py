@@ -33,6 +33,17 @@ class ReloadSession:
     partial: bool | None = None
     # id(module) -> name, for modules a full update must touch
     required_modules: dict[int, str] = field(default_factory=dict)
+    # fused linears: id(module) -> arrivals per (param, shard); shard "*" is a
+    # pre-fused checkpoint tensor covering every shard
+    shard_units: dict[int, Counter] = field(default_factory=dict)
+    # dirty when this update started (a failed earlier update): only an update
+    # that covers every module clears it
+    started_dirty: bool = False
+    # a partial update's declared module names (prefixes); all ranks agree on
+    # it at start, and finish requires exactly these modules, complete
+    modules: tuple[str, ...] | None = None
+    # id(module) of every module that received weights in this update
+    touched: set[int] = field(default_factory=set)
 
 
 @dataclass

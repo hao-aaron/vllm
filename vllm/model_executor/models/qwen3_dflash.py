@@ -33,6 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.interfaces import SupportsReload
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
@@ -559,10 +560,10 @@ class DFlashQwen3Model(nn.Module):
             [a.k_norm.weight.data for a in layers_attn], dim=0, out=self._k_norm_weights
         )
 
-    def refresh(self) -> None:
-        """Modulewise reload, kind A: the fused context-KV buffers are derived
-        from the live per-layer weights; refill them in place after landing
-        (captured graphs keep reading the same tensors)."""
+    def refresh_context_kv(self) -> None:
+        """Refill the fused context-KV buffers, derived from the live
+        per-layer weights, in place (captured graphs keep reading the same
+        tensors). Before they are built, a no-op."""
         if getattr(self, "_k_norm_weights", None) is None:
             return
         self._refresh_context_kv_buffers([layer.self_attn for layer in self.layers])
@@ -782,7 +783,7 @@ class DFlashQwen3Model(nn.Module):
         )
 
 
-class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+class DFlashQwen3ForCausalLM(Qwen3ForCausalLM, SupportsReload):
     model_cls = DFlashQwen3Model
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -939,9 +940,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
         # A streamed reload calls load_weights per batch with modules still on
-        # meta; the buffers are refilled by the model's refresh() instead.
+        # meta; the buffers are refilled by refresh_model() instead.
         if not reload_active(self):
             self.model._build_fused_kv_buffers()
+
+    def refresh_model(self) -> None:
+        self.model.refresh_context_kv()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

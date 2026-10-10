@@ -29,6 +29,8 @@ from vllm.model_executor.models.interfaces import (
     SupportsEncoderCudaGraph,
     SupportsMultiModal,
     SupportsPP,
+    SupportsReload,
+    supports_reload,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -121,6 +123,7 @@ class DeepseekV41ForCausalLM(
     SupportsEncoderCudaGraph,
     SupportsPP,
     SupportsEagle3,
+    SupportsReload,
 ):
     """Multimodal entry point for DeepSeek-V4.1 checkpoints with a vision tower.
 
@@ -331,8 +334,10 @@ class DeepseekV41ForCausalLM(
 
     @property
     def reload_safe(self) -> bool:
-        # Modulewise reload: the hook only runs the language model's hook.
-        return bool(getattr(self.language_model, "reload_safe", False))
+        # The hook only runs the language model's hook (its refresh_model() is
+        # called by the framework, which visits nested SupportsReload models)
+        lm = self.language_model
+        return supports_reload(lm) and bool(getattr(lm, "reload_safe", True))
 
     def process_weights_after_loading(self) -> None:
         # Model-level post-load hook (called by the loader after any load

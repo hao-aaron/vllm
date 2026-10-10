@@ -341,7 +341,7 @@ class Gemma4DSparkForCausalLM(Qwen3DSparkForCausalLM):
                     if "confidence_head" in name:
                         includes_confidence_head = True
         # A streamed reload calls load_weights per batch with modules still on
-        # meta: keep the confidence head and refill the buffers in refresh().
+        # meta: keep the confidence head; refresh_model() refills the buffers.
         if reload_active(self):
             return loaded
         if not includes_confidence_head:

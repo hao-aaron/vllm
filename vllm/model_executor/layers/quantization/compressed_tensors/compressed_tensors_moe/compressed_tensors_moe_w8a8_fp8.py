@@ -43,7 +43,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from vllm.model_executor.utils import is_reloading, replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -329,7 +329,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         # In non-naive DP/EP case, we will create a ModularKernelMethod.
         # TODO(rob): unify these so FP8MoEMethod owns the ModularKernel
         # in both cases.
-        if is_reloading() and self.reload_safe and self.moe_kernel is not None:
+        if self.reload_safe and self.moe_kernel is not None:
             return  # built once; landing + refresh() update it in place
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:
