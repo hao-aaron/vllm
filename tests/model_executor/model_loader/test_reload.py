@@ -2920,7 +2920,7 @@ def test_dots3_vision_moe_fused_fp8_refresh(monkeypatch, keep):
     )
     with torch.device("cuda"):
         mlp = vision.MoESwiGLUFFNFP8(config, layer_number=0)
-    mlp.process_weights_after_loading()
+    mlp.refresh_fused()  # cold start: builds the fused buffers
     assert mlp.reload_safe is keep
     if not keep:
         assert not hasattr(mlp, "experts")
@@ -3067,6 +3067,7 @@ def test_dflash_fused_context_kv_buffers_refresh_in_place(model):
         )
     m.layers = torch.nn.ModuleList([_stub_attn(self_attn=a) for a in attns])
     m._build_context_kv_buffers(attns, True)
+    m._num_attn_layers = len(attns)  # built (the rest of the cold build)
     fused_name = "_fused_kv_weight" if model == "qwen3_dflash" else "_fused_k_weight"
     fused, norms = getattr(m, fused_name), m._k_norm_weights
     ptrs = (fused.data_ptr(), norms.data_ptr())
@@ -3102,9 +3103,11 @@ def test_k3_dspark_context_kv_norms_refresh_in_place():
         )
         layers.append(_stub_attn(self_attn=attn))
     m.layers = torch.nn.ModuleList(layers)
-    m._build_fused_context_kv_metadata()
+    m.refresh_context_kv()  # cold start: allocates and fills
     norms = m._context_kv_norm_weights
     ptr = norms.data_ptr()
+    expected = torch.stack([la.self_attn.kv_a_layernorm.weight for la in layers])
+    assert torch.equal(norms, expected)
     with torch.no_grad():
         for layer in layers:
             layer.self_attn.kv_a_layernorm.weight.mul_(3.0)

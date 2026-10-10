@@ -321,10 +321,9 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsRe
 
     @property
     def reload_safe(self) -> bool:
-        """The model hook's work (the vision MoE's fused FP8 buffers) is
-        redone by refresh_model() when the blocks kept their source experts
-        (weight transfer configured); otherwise not reload-safe. The hook's
-        torch.compile of the vision blocks is cold-start only."""
+        """The vision MoE's fused FP8 buffers are refreshed by refresh_model()
+        when the blocks kept their source experts (weight transfer
+        configured); otherwise not reload-safe."""
         if self.visual is None:
             return True
         return all(
@@ -332,16 +331,12 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsRe
         )
 
     def refresh_model(self) -> None:
-        if self.visual is None:
-            return
-        for block in self.visual.blocks:
-            refresh = getattr(block.mlp, "refresh_fused", None)
-            if refresh is not None:
-                refresh()
-
-    def process_weights_after_loading(self) -> None:
         if self.visual is not None:
-            self.visual.process_weights_after_loading()
+            self.visual.refresh_fused_experts()
+
+    def post_load_setup(self) -> None:
+        if self.visual is not None:
+            self.visual.post_load_setup()
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

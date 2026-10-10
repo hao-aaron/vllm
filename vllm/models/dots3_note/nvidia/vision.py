@@ -264,27 +264,23 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
             for t in (w13_weights, w13_scales, w2_weights, w2_scales)
         )
 
-    @torch.no_grad()
-    def process_weights_after_loading(self) -> None:
-        if hasattr(self, "_fused_w13_fp8"):
-            return
-        for name, tensor in zip(_FUSED_FP8_BUFFERS, self._fused_fp8()):
-            self.register_buffer(name, tensor, persistent=False)
-        # The fused buffers are all the forward reads. Keep the source experts
-        # only when weights can be updated in place (see `refresh`).
-        if not _keep_experts_for_reload():
-            del self.experts
-
     @property
     def reload_safe(self) -> bool:
         return hasattr(self, "experts")
 
     @torch.no_grad()
     def refresh_fused(self) -> None:
-        """With the source experts kept, the fused FP8 buffers are derived
-        from live params: recompute them in place (before they are built,
-        a no-op)."""
-        if not hasattr(self, "_fused_w13_fp8") or not self.reload_safe:
+        """The fused FP8 buffers (all the forward reads), derived from the
+        experts' live params: built by the first call (cold start), refilled
+        in place afterwards. Without weight updates the source experts are
+        dropped once built, and later calls are no-ops."""
+        if not hasattr(self, "_fused_w13_fp8"):
+            for name, tensor in zip(_FUSED_FP8_BUFFERS, self._fused_fp8()):
+                self.register_buffer(name, tensor, persistent=False)
+            if not _keep_experts_for_reload():
+                del self.experts
+            return
+        if not self.reload_safe:
             return
         for name, tensor in zip(_FUSED_FP8_BUFFERS, self._fused_fp8()):
             getattr(self, name).copy_(tensor)
@@ -567,10 +563,12 @@ class DotsMoEVitModel(PreTrainedModel):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def process_weights_after_loading(self) -> None:
+    def refresh_fused_experts(self) -> None:
         for block in self.blocks:
             if isinstance(block.mlp, MoESwiGLUFFNFP8):
-                block.mlp.process_weights_after_loading()
+                block.mlp.refresh_fused()
+
+    def post_load_setup(self) -> None:
         if self.config.enable_torch_compile:
             self.compile_block_modules()
 

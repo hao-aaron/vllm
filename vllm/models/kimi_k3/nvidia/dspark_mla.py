@@ -224,13 +224,13 @@ class K3DSparkModel(nn.Module):
     ) -> None:
         """Project target-derived context into each draft layer's latent cache."""
         if not hasattr(self, "_num_context_layers"):
-            self._build_fused_context_kv_metadata()
+            self.refresh_context_kv()
         self._precompute_fused_context_kv(
             context_states, context_positions, context_slot_mapping
         )
 
     def _build_fused_context_kv_metadata(self) -> None:
-        """Build cross-layer metadata after checkpoint loading."""
+        """Cross-layer geometry and the stacked buffers (allocated once)."""
         attentions = [layer.self_attn for layer in self.layers]
         assert attentions
         attn0 = attentions[0]
@@ -245,9 +245,10 @@ class K3DSparkModel(nn.Module):
                 and attn.kv_a_layernorm.variance_epsilon
                 == attn0.kv_a_layernorm.variance_epsilon
             ), "All MLA DSpark layers must share their latent KV geometry."
-        self._context_kv_norm_weights = torch.stack(
-            [attn.kv_a_layernorm.weight.detach() for attn in attentions], dim=0
-        ).contiguous()
+        norm0 = attn0.kv_a_layernorm.weight
+        self._context_kv_norm_weights = norm0.new_empty(
+            (len(attentions), *norm0.shape)
+        )
         self._num_context_layers = len(attentions)
         self._context_kv_width = kv_width
         self._context_kv_lora_rank = attn0.kv_lora_rank
@@ -257,16 +258,16 @@ class K3DSparkModel(nn.Module):
         if attn0.kv_cache_dtype in _GROUPED_KV_CACHE_DTYPES and is_quantized_kv_cache(
             attn0.kv_cache_dtype
         ):
-            self._context_kv_scales = torch.stack(
-                [attn._k_scale.reshape(()) for attn in attentions]
-            )
+            k_scale0 = attn0._k_scale
+            self._context_kv_scales = k_scale0.new_empty(len(attentions))
 
     @torch.no_grad()
     def refresh_context_kv(self) -> None:
-        """Refill the stacked KV-norm weights (and KV scales), derived from the
-        live per-layer params, in place."""
+        """The stacked KV-norm weights (and KV scales), derived from the live
+        per-layer params: allocated by the first call (cold start, before
+        graph capture), refilled in place afterwards."""
         if not hasattr(self, "_num_context_layers"):
-            return
+            self._build_fused_context_kv_metadata()
         attentions = [layer.self_attn for layer in self.layers]
         torch.stack(
             [attn.kv_a_layernorm.weight.detach() for attn in attentions],
@@ -551,9 +552,6 @@ class K3DSparkForCausalLM(nn.Module, SupportsReload):
         # read: 1. all weights. 2. context kv weights
         weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    def process_weights_after_loading(self) -> None:
-        self.model._build_fused_context_kv_metadata()
 
     def refresh_model(self) -> None:
         self.model.refresh_context_kv()

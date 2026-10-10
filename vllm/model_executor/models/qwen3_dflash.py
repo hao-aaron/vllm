@@ -561,10 +561,12 @@ class DFlashQwen3Model(nn.Module):
         )
 
     def refresh_context_kv(self) -> None:
-        """Refill the fused context-KV buffers, derived from the live
-        per-layer weights, in place (captured graphs keep reading the same
-        tensors). Before they are built, a no-op."""
-        if getattr(self, "_k_norm_weights", None) is None:
+        """The fused context-KV buffers, derived from the live per-layer
+        weights: built by the first call (cold start, after every load and
+        before graph capture), refilled in place afterwards (captured graphs
+        keep reading the same tensors)."""
+        if not hasattr(self, "_num_attn_layers"):
+            self._build_fused_kv_buffers()
             return
         self._refresh_context_kv_buffers([layer.self_attn for layer in self.layers])
 
@@ -939,10 +941,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM, SupportsReload):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
-        # A streamed reload calls load_weights per batch with modules still on
-        # meta; the buffers are refilled by refresh_model() instead.
-        if not reload_active(self):
-            self.model._build_fused_kv_buffers()
 
     def refresh_model(self) -> None:
         self.model.refresh_context_kv()
