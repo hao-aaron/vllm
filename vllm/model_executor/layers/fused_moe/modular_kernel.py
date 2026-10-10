@@ -514,8 +514,11 @@ class FusedMoEExperts(ABC):
         the same code and the address never changes."""
         if device is None:
             device = torch.accelerator.current_device_index()
+        from vllm.model_executor.model_loader.reload.refresh import declare_derived
+
         t = torch.empty(shape, dtype=dtype, device=device)
         setattr(self, name, t)
+        declare_derived(self, t)
         return t
 
     def refresh(self) -> None:  # noqa: B027

@@ -15,8 +15,12 @@ Checks (numbered as in the SupportsReload RFC):
   `process_weights_after_loading`; MoE methods that built a kernel are
   `reload_safe`; no instance monkeypatches of a quant method's PWAL; modules
   with their own PWAL and no quant method declare their outputs.
+- 6.2 tensor ownership: device tensors held outside the module registry
+  that no object declared (run it after CUDA graph capture).
 - 6.3 snapshot vs live structure: params or submodules recorded at init that
   are now gone (set to None, deleted), which reload cannot write.
+- 6.4 load coverage: from an observed cold load, or a dry run of
+  `load_weights` over checkpoint names and shapes.
 - 6.5 configuration: EPLB, weight offloading, LoRA, transport limits.
 - 6.6 after every update (`verify_post_update`): nothing left on meta, no
   module still holding checkpoint-format inputs.
@@ -124,6 +128,7 @@ def verify_reload(
     dry run of `load_weights` (must not run during an update)."""
     report = ReloadReport()
     _check_declarations(model, report)
+    _check_ownership(model, report)
     _check_structure(model, report)
     _check_load_coverage(model, report)
     if vllm_config is not None:
@@ -240,6 +245,114 @@ def _check_declarations(model: torch.nn.Module, report: ReloadReport) -> None:
                 "runs it",
                 UNSAFE,
             )
+
+
+# ---------------------------------------------------------------------------
+# 6.2 tensor ownership (run after CUDA graph capture, so lazy caches exist)
+# ---------------------------------------------------------------------------
+
+# Attributes holding per-step runtime state, not weights (from #60009)
+RUNTIME_STATE_ATTRS = frozenset(
+    {
+        "kv_cache",
+        "_replayssm_ring_start",
+        "_replayssm_prev_num_accepted",
+        "_replayssm_prev_query_len",
+        "deepstack_input_embeds",
+        "per_layer_embeddings",
+        "topk_indices_buffer",
+        "_topk_indices_buffer",
+        "_workspace_buffer",
+        "index_group",
+        "diffusion_states",
+        "aot_compiled_fn",
+    }
+)
+
+
+def _storage(t: torch.Tensor) -> int | None:
+    try:
+        return t.untyped_storage().data_ptr()
+    except (RuntimeError, NotImplementedError):
+        return None
+
+
+def find_unowned_tensors(model: torch.nn.Module) -> list[str]:
+    """Paths of device tensors the model holds outside its parameters and
+    buffers that no object declared (`declare_derived` / `declare_constant`
+    / `register_derived` / `add_refresh` outputs / `persistent_tensors()`).
+    A weight update leaves those stale, or at a new address captured graphs
+    don't read. Walks module attributes and the plain objects they hold
+    (quant methods, kernels, attention impls)."""
+    from .refresh import declared_tensors
+
+    owned = {_storage(t) for t in (*model.parameters(), *model.buffers())}
+    modules = {id(m) for m in model.modules()}
+    found: list[str] = []
+    seen: set[int] = set()
+
+    def visit(value: Any, path: str) -> None:
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, torch.Tensor):
+            if value.device.type not in ("cpu", "meta") and (
+                _storage(value) not in owned
+            ):
+                found.append(path)
+        elif isinstance(value, torch.nn.Module):
+            if id(value) not in modules:
+                for name, t in (*value.named_parameters(), *value.named_buffers()):
+                    visit(t, f"{path}.{name}")
+        elif isinstance(value, (tuple, list)):
+            for i, item in enumerate(value):
+                visit(item, f"{path}[{i}]")
+        elif isinstance(value, dict):
+            for key, item in list(value.items()):
+                visit(item, f"{path}[{key!r}]")
+        elif not isinstance(value, type) and isinstance(
+            getattr(value, "__dict__", None), dict
+        ):
+            owner = getattr(type(value), "__module__", "") or ""
+            if owner.startswith(("vllm.config", "transformers", "torch")):
+                return
+            owned.update(_storage(t) for t in declared_tensors(value))
+            for name, item in list(value.__dict__.items()):
+                if name not in RUNTIME_STATE_ATTRS and not name.startswith(
+                    "_vllm_reload_"
+                ):
+                    visit(item, f"{path}.{name}")
+
+    skip = {"_parameters", "_buffers", "_modules", *RUNTIME_STATE_ATTRS}
+    for module_name, module in model.named_modules():
+        owned.update(_storage(t) for t in declared_tensors(module))
+    for module_name, module in model.named_modules():
+        for name, value in vars(module).items():
+            if (
+                name not in skip
+                and not name.startswith(("_forward_", "_vllm_reload_"))
+                and name != "_reload_session"
+            ):
+                visit(value, f"{module_name or '<root>'}.{name}")
+    return found
+
+
+def _check_ownership(model: torch.nn.Module, report: ReloadReport) -> None:
+    import re
+    from collections import Counter
+
+    # one item per attribute path, layer indices folded
+    paths = Counter(re.sub(r"\.\d+\.", ".*.", p) for p in find_unowned_tensors(model))
+    for path, n in sorted(paths.items()):
+        report.add(
+            "6.2",
+            path,
+            f"device tensor held outside the module registry, not declared"
+            f"{f' (x{n})' if n > 1 else ''}: if weight-derived, a weight update "
+            "leaves it stale (declare_derived + a refresh); if not, "
+            "declare_constant",
+            UNSAFE,
+        )
 
 
 # ---------------------------------------------------------------------------

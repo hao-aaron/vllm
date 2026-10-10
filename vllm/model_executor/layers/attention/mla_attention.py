@@ -1292,8 +1292,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # triton kernel to avoid runtime compilation for unseen batch sizes
             # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
             # On DS-R1, this step adds roughly 50s to the model loading time.
+            # Shapes don't change across weight updates: compile once.
             max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            pre_compilation_list = list(range(1, max_batch_size + 1))
+            already = getattr(self, "_aiter_fp8_bmm_precompiled", False)
+            self._aiter_fp8_bmm_precompiled = True
+            pre_compilation_list = [] if already else list(range(1, max_batch_size + 1))
             if is_global_first_rank():
                 pre_compilation_list = tqdm(
                     pre_compilation_list,

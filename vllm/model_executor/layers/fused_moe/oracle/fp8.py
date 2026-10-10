@@ -801,7 +801,7 @@ def make_fp8_moe_quant_config(
             torch.reciprocal(a1_scale, out=a1_gscale)
             torch.reciprocal(a2_scale, out=a2_gscale)
 
-        quant_config.add_refresh(_refresh)
+        quant_config.add_refresh(_refresh, g1_alphas, g2_alphas, a1_gscale, a2_gscale)
         return quant_config
     # MXFP8 (block [1, 32]) dispatches to the mxfp8 activation quant. Scales are
     # the non-swizzled (num_tokens, hidden_dim // 32) uint8 UE8M0 layout for all

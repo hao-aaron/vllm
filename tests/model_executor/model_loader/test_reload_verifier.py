@@ -253,3 +253,33 @@ def test_checkpoint_meta_from_safetensors(tmp_path):
         ("a", (2, 3), torch.bfloat16),
         ("b", (4,), torch.float32),
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="device tensors")
+def test_ownership_flags_undeclared_device_tensors():
+    from vllm.model_executor.model_loader.reload.refresh import (
+        declare_constant,
+        declare_derived,
+    )
+
+    class _Kernel:
+        pass
+
+    model = _Reloadable(n=2)
+    for layer in model.layers:
+        kernel = layer.quant_method.kernel = _Kernel()
+        kernel.alphas = torch.ones(4, device="cuda")  # undeclared, derived
+        kernel.weight_view = layer.weight  # a registered tensor: owned
+        kernel.workspace = torch.empty(8, device="cuda")
+        kernel.lut = torch.arange(4, device="cuda")
+        declare_constant(kernel, kernel.workspace)
+    declare_derived(
+        model.layers[1].quant_method.kernel, model.layers[1].quant_method.kernel.alphas
+    )
+    model.layers[0].kv_cache = [torch.empty(2, device="cuda")]  # runtime state
+    items = _items(verify_reload(model), "6.2")
+    # layer indices folded: one item per attribute path
+    assert items == [
+        ("layers.*.quant_method.kernel.alphas", UNSAFE),  # layer 0 only
+        ("layers.*.quant_method.kernel.lut", UNSAFE),
+    ]

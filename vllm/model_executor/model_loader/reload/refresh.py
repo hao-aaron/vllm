@@ -22,6 +22,9 @@ import torch
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 __all__ = [
+    "declare_constant",
+    "declare_derived",
+    "declared_tensors",
     "register_refresh",
     "refresh_quant_method",
     "run_model_refresh",
@@ -29,6 +32,34 @@ __all__ = [
 ]
 
 _REFRESHES_ATTR = "_vllm_reload_refreshes"
+_DERIVED_ATTR = "_vllm_reload_derived"
+_CONSTANT_ATTR = "_vllm_reload_constants"
+
+
+def declare_derived(holder: object, *tensors: torch.Tensor) -> None:
+    """Declare weight-derived tensors an object (a kernel, a quant config)
+    holds outside the module registry: allocated once, rewritten in place by a
+    declared refresh. The reload verifier's ownership check accepts them."""
+    holder.__dict__.setdefault(_DERIVED_ATTR, []).extend(tensors)
+
+
+def declare_constant(holder: object, *tensors: torch.Tensor) -> None:
+    """Declare tensors an object holds that do not depend on weights
+    (workspaces, lookup tables): a weight update leaves them valid."""
+    holder.__dict__.setdefault(_CONSTANT_ATTR, []).extend(tensors)
+
+
+def declared_tensors(holder: object) -> list[torch.Tensor]:
+    """Tensors `holder` declared (derived or constant, or #60009's
+    `persistent_tensors()`)."""
+    d = getattr(holder, "__dict__", None)
+    if not isinstance(d, dict):
+        return []
+    out = [*d.get(_DERIVED_ATTR, ()), *d.get(_CONSTANT_ATTR, ())]
+    persistent = getattr(type(holder), "persistent_tensors", None)
+    if callable(persistent):
+        out += list(persistent(holder).values())
+    return out
 
 
 def register_refresh(module: torch.nn.Module, fn: Callable[[], None]) -> None:

@@ -271,8 +271,12 @@ class FusedMoEQuantConfig:
             "illegal quantization"
         )
 
-    def add_refresh(self, fn: Callable[[], None]) -> None:
-        """Declare an in-place refresh of derived state; runs once now."""
+    def add_refresh(self, fn: Callable[[], None], *outputs: torch.Tensor) -> None:
+        """Declare an in-place refresh of derived state, writing `outputs`;
+        runs once now."""
+        from vllm.model_executor.model_loader.reload.refresh import declare_derived
+
+        declare_derived(self, *outputs)
         self._refresh_fns.append(fn)
         fn()
 

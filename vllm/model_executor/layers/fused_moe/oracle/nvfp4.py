@@ -607,7 +607,7 @@ def make_nvfp4_moe_quant_config(
         a1_gscale.copy_(1.0 / a13_scale)
         a2_gscale.copy_(1.0 / a2_scale)
 
-    quant_config.add_refresh(_refresh)
+    quant_config.add_refresh(_refresh, a1_gscale, a2_gscale)
     return quant_config
 
 
