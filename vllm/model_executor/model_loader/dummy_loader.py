@@ -19,6 +19,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 
 
 class DummyModelLoader(BaseModelLoader):
+    observes_load = False  # writes params directly, by design
+
     """Model loader that will set model weights to random values."""
 
     def __init__(self, load_config: LoadConfig):

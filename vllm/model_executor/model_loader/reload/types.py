@@ -44,6 +44,8 @@ class ReloadSession:
     modules: tuple[str, ...] | None = None
     # id(module) of every module that received weights in this update
     touched: set[int] = field(default_factory=set)
+    # (id(module), name) of live tensors already on meta at start
+    meta_before: set[tuple[int, str]] = field(default_factory=set)
 
 
 @dataclass

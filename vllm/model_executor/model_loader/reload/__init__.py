@@ -34,6 +34,10 @@ __all__ = [
     "mark_dirty",
     "refresh_derived_state",
     "register_refresh",
+    "merge_reload_reports",
+    "ReloadReport",
+    "ReloadStatus",
+    "verify_reload",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -69,3 +73,4 @@ from .torchao_decorator import (
     set_torchao_reload_attrs,
     support_quantized_model_reload_from_hp_weights,
 )
+from .verify import ReloadReport, ReloadStatus, merge_reload_reports, verify_reload

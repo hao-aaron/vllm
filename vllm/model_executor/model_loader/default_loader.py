@@ -501,23 +501,40 @@ class DefaultModelLoader(BaseModelLoader):
     def track_weights_loading(
         self, model: nn.Module, loaded_weights: set[str] | None
     ) -> None:
+        from vllm.model_executor.layers.quantization.kv_cache import (
+            BaseKVCacheMethod,
+        )
+
         weights_to_load = {name for name, _ in model.named_parameters()}
         if loaded_weights is not None:
-            # ignore online quantization scales
+            # kv_cache scales and online quant scales can be missing in
+            # checkpoints. Other quantized modules used to be exempt too
+            # (every linear, embedding and MoE layer), which hid missing
+            # weights: they are reported, as a warning for now.
+            exempt: set[str] = set()
+            reported: set[str] = set()
             for name, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 has_online_quant = getattr(quant_method, "uses_meta_device", False)
                 has_postprocess_quant = getattr(
                     quant_method, "process_weights_after_loading", None
                 )
-                # ignore kv_cache scale and online quant scale,
-                # which can be missing in checkpoints
-                if has_online_quant or has_postprocess_quant:
-                    for param_name, _ in module.named_parameters():
-                        full_name = f"{name}.{param_name}" if name else param_name
-                        loaded_weights.add(full_name)
-            weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
+                if has_online_quant or isinstance(quant_method, BaseKVCacheMethod):
+                    target = exempt
+                elif has_postprocess_quant:
+                    target = reported
+                else:
+                    continue
+                for param_name, _ in module.named_parameters():
+                    target.add(f"{name}.{param_name}" if name else param_name)
+            weights_not_loaded = weights_to_load - loaded_weights - exempt
+            if missing := weights_not_loaded & reported:
+                logger.warning(
+                    "Following weights of quantized modules were not initialized "
+                    "from checkpoint: %s",
+                    sorted(missing),
+                )
+            if weights_not_loaded := weights_not_loaded - reported:
                 raise ValueError(
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"

@@ -1269,6 +1269,15 @@ class AsyncLLM(EngineClient):
             "init_weight_transfer_engine", kwargs={"init_info": request.init_info}
         )
 
+    async def check_reload_support(self, checkpoint: str | None = None) -> dict:
+        """The reload verifier's report (see `LLM.check_reload_support`)."""
+        from vllm.model_executor.model_loader.reload import merge_reload_reports
+
+        kwargs = {} if checkpoint is None else {"checkpoint": checkpoint}
+        return merge_reload_reports(
+            await self.collective_rpc("check_reload_support", kwargs=kwargs)
+        )
+
     async def start_weight_update(
         self, partial: bool | None = None, modules: list[str] | None = None
     ) -> None:

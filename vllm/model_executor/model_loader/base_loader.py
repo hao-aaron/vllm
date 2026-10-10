@@ -9,7 +9,10 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+from vllm.model_executor.model_loader.reload import (
+    coverage,
+    finalize_layerwise_processing,
+)
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -24,6 +27,9 @@ logger = init_logger(__name__)
 
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
+
+    # Loads go through the model's `load_weights` (see reload.coverage)
+    observes_load = True
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
@@ -77,7 +83,12 @@ class BaseModelLoader(ABC):
                 )
 
             logger.debug("Loading weights on %s ...", load_device)
-            self.load_weights(model, model_config)
+            if coverage.OBSERVE_LOAD and self.observes_load:
+                with coverage.observe_load(model) as cov:
+                    self.load_weights(model, model_config)
+                model.__dict__["_reload_load_coverage"] = cov
+            else:
+                self.load_weights(model, model_config)
 
             # Log peak GPU memory after loading weights. This is needed
             # to have test coverage on peak memory for online quantization.

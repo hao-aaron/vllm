@@ -887,6 +887,23 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             "init_weight_transfer_engine", kwargs={"init_info": init_info_dict}
         )
 
+    def check_reload_support(self, checkpoint: str | None = None) -> dict:
+        """Whether this engine's weights can be updated in place correctly.
+
+        Runs the reload verifier on every rank. With `checkpoint` (a local
+        safetensors directory), it also dry-runs `load_weights` on its names
+        and shapes (no data) to find weights reload would not reach; run that
+        only while no update is in progress. Returns
+        `{"status": SAFE|UNVERIFIED|UNSAFE, "items": [...]}`, the worst status
+        over ranks and every rank's non-SAFE items (with their rank).
+        """
+        from vllm.model_executor.model_loader.reload import merge_reload_reports
+
+        kwargs = {} if checkpoint is None else {"checkpoint": checkpoint}
+        return merge_reload_reports(
+            self.llm_engine.collective_rpc("check_reload_support", kwargs=kwargs)
+        )
+
     def start_weight_update(
         self, partial: bool | None = None, modules: list[str] | None = None
     ) -> None:

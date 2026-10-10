@@ -1460,6 +1460,37 @@ class Worker(WorkerBase):
         # Parse dict into backend-specific typed dataclass
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
+        # Report only (for now): what the reload verifier can tell up front
+        report = self._verify_reload()
+        if report is not None and report.status.value != "SAFE":
+            logger.warning_once("%s", report.summary())
+
+    def _verify_reload(self, checkpoint: str | None = None):
+        from vllm.model_executor.model_loader.reload import verify_reload
+        from vllm.model_executor.model_loader.reload.verify import (
+            checkpoint_meta_from_safetensors,
+        )
+
+        model = getattr(self.model_runner, "model", None)
+        if not isinstance(model, nn.Module):
+            return None
+        meta = None
+        if checkpoint is not None:
+            if getattr(self, "_weight_update_active", False):
+                raise RuntimeError("check_reload_support: a weight update is active")
+            meta = checkpoint_meta_from_safetensors(checkpoint)
+        with set_current_vllm_config(self.vllm_config):
+            return verify_reload(model, self.vllm_config, checkpoint_meta=meta)
+
+    def check_reload_support(self, checkpoint: str | None = None) -> dict:
+        """The reload verifier's report for this rank's model. With a local
+        safetensors `checkpoint`, also a dry-run load coverage check."""
+        report = self._verify_reload(checkpoint)
+        return (
+            {"status": "UNVERIFIED", "items": []}
+            if report is None
+            else (report.to_dict())
+        )
 
     def start_weight_update(
         self, partial: bool | None = None, modules: list[str] | None = None

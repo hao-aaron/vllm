@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from . import direct as _direct
 from . import meta as _meta
 from . import per_expert as _per_expert
+from . import verify as _verify
 from .meta import (
     SKIP_LOAD_TENSORS,
     SKIP_MODULES,
@@ -117,10 +118,19 @@ class LoadTrace:
     def __init__(self):
         self.copied_numel: dict[torch.nn.Module, int] = {}
         self._totals: dict[torch.nn.Module, int] = {}
+        # checkpoint name being loaded (set by whoever feeds `load_weights`)
+        # -> number of loader calls it reached
+        self.current_name: str | None = None
+        self.name_hits: Counter = Counter()
 
     def _record(self, module: torch.nn.Module, numel: int, total: int) -> None:
         self.copied_numel[module] = self.copied_numel.get(module, 0) + numel
         self._totals[module] = total
+        if self.current_name is not None:
+            self.name_hits[self.current_name] += 1
+
+    def total(self, module: torch.nn.Module) -> int | None:
+        return self._totals.get(module)
 
     def complete_modules(self) -> list[torch.nn.Module]:
         """Modules whose copied numel reached their loadable size: the same rule
@@ -156,6 +166,8 @@ def record_metadata_for_reloading(model: torch.nn.Module):
         info.restore_metadata = capture_layer_to_meta(layer)
         info.restore_device = torch.get_default_device()
         info.init_values = _capture_init_values(layer, info)
+    # module structure at init, for the verifier (deleted submodules)
+    model.__dict__["_reload_module_names"] = [n for n, _ in model.named_modules()]
 
 
 # Small scale tensors keep their create-time value as the reload initial value:
@@ -193,6 +205,7 @@ def initialize_layerwise_reload(
     model: torch.nn.Module,
     partial: bool | None = None,
     modules: list[str] | tuple[str, ...] | None = None,
+    preflight: bool = True,
 ):
     """Set up layerwise weight loading with deferred processing.
 
@@ -207,9 +220,10 @@ def initialize_layerwise_reload(
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
-    _check_model_hook_reload_safe(model)
-    _check_moe_methods_reload_safe(model)
-    _check_live_tensors_unchanged(model)
+    if preflight:  # a dry run (`trace_loads`) writes nothing
+        _check_model_hook_reload_safe(model)
+        _check_moe_methods_reload_safe(model)
+        _check_live_tensors_unchanged(model)
 
     # A failed update leaves the model dirty until a full update succeeds
     previous = get_reload_session(model)
@@ -225,6 +239,12 @@ def initialize_layerwise_reload(
         required_modules=_required_modules(model),
         modules=None if modules is None else tuple(sorted(modules)),
     )
+    session.meta_before = {
+        (id(layer), name)
+        for layer in model.modules()
+        for name, t in get_layer_tensors(layer).items()
+        if t.is_meta
+    }
     model._reload_session = session
 
     if _direct.DIRECT_LOAD:
@@ -891,7 +911,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             # For now, `load_numel_total` is still safe to use as long as
             # there's no way to reach `load_numel_total` without loading all
             # necessary weights. `weight_shape` is very small, so this is safe.
-            # see Limitations(4)
+            # see Limitations (3) in __init__.py
             logger.debug("%s: Excessive loading", layer.__class__.__name__)
             return
 
@@ -916,7 +936,9 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             if _TRACE is not None:
                 # Dry run (`trace_loads`): run on meta and count, nothing else
                 num_loaded, ret = get_numel_loaded(original_loader, bound_args)
-                _TRACE._record(layer, num_loaded, info.load_numel_total)
+                _TRACE._record(
+                    layer, 0 if duplicate else num_loaded, info.load_numel_total
+                )
                 return ret
 
             info.loaded_names.add(param_name)
@@ -1044,7 +1066,7 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         # Process non-attention layers which did not load all elements. This can happen
         # if the created weight has extra padding elements which are not loaded
         # Having too many of these delayed layers can lead to excess memory usage
-        # see Limitations(4)
+        # see Limitations (3) in __init__.py
         elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
             logger.debug("%s: Delayed processing", layer.__class__.__name__)
             complete_module(layer, info)
@@ -1076,8 +1098,16 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
     LOADING_LAYERS.clear()
 
-    # The update finished: the model may serve again
+    # The update finished: check its invariants, then the model may serve
     session = get_reload_session(model)
+    if session is not None and reloading:
+        problems = _verify.verify_post_update(model, session.meta_before)
+        if problems:
+            session.dirty = True
+            session.active = False
+            raise ReloadIncompleteError(
+                f"weight update left the model inconsistent: {problems[:8]}"
+            )
     if session is not None:
         session.dirty = False
         session.active = False
@@ -1577,7 +1607,7 @@ def trace_loads(model: torch.nn.Module) -> Iterator[LoadTrace]:
     processed. `start_reload` on enter, `abort_reload` on exit."""
     global _TRACE
     trace = LoadTrace()
-    start_reload(model)
+    initialize_layerwise_reload(model, preflight=False)
     _TRACE = trace
     try:
         yield trace

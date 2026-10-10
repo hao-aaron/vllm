@@ -187,6 +187,12 @@ async def start_weight_update(
     return JSONResponse(content={"message": "Weight update started"})
 
 
+@router.get("/check_reload_support")
+async def check_reload_support(raw_request: Request, checkpoint: str | None = None):
+    report = await engine_client(raw_request).check_reload_support(checkpoint)
+    return JSONResponse(content=report)
+
+
 @router.post("/start_draft_weight_update")
 async def start_draft_weight_update(raw_request: Request):
     with weight_operation_metrics().record("start_draft"):

@@ -292,6 +292,10 @@ class EngineClient(ABC):
         """Initialize weight transfer for RL training."""
         raise NotImplementedError
 
+    async def check_reload_support(self, checkpoint: str | None = None) -> dict:
+        """The reload verifier's report (see `LLM.check_reload_support`)."""
+        raise NotImplementedError
+
     async def start_weight_update(
         self, partial: bool | None = None, modules: list[str] | None = None
     ) -> None:
