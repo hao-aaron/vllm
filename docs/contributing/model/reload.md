@@ -77,6 +77,25 @@ or rewriting the layer's tensors from a model hook. `before_pwal` sees the
 checkpoint-format tensors, `after_pwal` the PWAL results; both run on every
 load and their results land once.
 
+## Integrity
+
+No forward runs between `start_weight_update` and `finish_weight_update`: the
+engine pauses a running scheduler at start and resumes it after a successful
+finish, and the worker refuses any step mid-update (DP engines are not paused
+automatically; pause them before updating). All ranks agree before any write
+(the reload policy, a declared module set) and on the outcome before any of
+them serves.
+
+A failed update leaves the model dirty: the engine keeps generation paused,
+rejects new requests and refuses to resume, while weight-update RPCs keep
+working. An update clears it when it succeeds and re-completes every module
+the failed one wrote (a module counts when every tensor the cold load wrote
+received a loader call). A sparse update never clears it.
+
+`start_weight_update(partial=False)` requires the update to reach every module
+the cold load wrote (finish raises otherwise); `partial=True` allows a
+subset, with `modules=[...]` checked to be the same on every rank.
+
 ## Checking a model
 
 ```python
@@ -86,9 +105,10 @@ llm.check_reload_support()  # declarations, ownership, structure, configuration
 
 The same report is served at `GET /check_reload_support`. Each item is SAFE,
 UNVERIFIED (not checkable from structure) or UNSAFE (an update would serve
-stale or wrong weights). The report never refuses an update; reload itself
-refuses, before any write, the cases it knows it cannot apply under CUDA
-graphs (an undeclared MoE method that built a kernel, a kernel object or live
-tensor replaced outside reload). The verifier proves structure, not values:
+stale or wrong weights). An update is refused, before any write, only for
+cases known to produce wrong weights: configurations (EPLB, weight
+offloading, sparse patches into kernel layouts; `VLLM_RELOAD_ALLOW_UNSAFE=1`
+overrides) and, under CUDA graphs, an undeclared MoE method that built a
+kernel or a kernel object or live tensor replaced outside reload. The verifier proves structure, not values:
 every reload-safe model or backend also needs a refit-equals-fresh test
 (`tests/model_executor/model_loader/test_reload_refit.py`).

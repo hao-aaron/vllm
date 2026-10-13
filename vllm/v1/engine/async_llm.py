@@ -1335,9 +1335,14 @@ class AsyncLLM(EngineClient):
 
         return merge_reload_reports(await self.collective_rpc("check_reload_support"))
 
-    async def start_weight_update(self) -> None:
-        """Start a new weight update."""
-        await self.collective_rpc("start_weight_update")
+    async def start_weight_update(
+        self, partial: bool | None = None, modules: list[str] | None = None
+    ) -> None:
+        """Start a new weight update (see `LLM.start_weight_update`)."""
+        kwargs: dict = {} if partial is None else {"partial": partial}
+        if modules is not None:
+            kwargs["modules"] = list(modules)
+        await self.collective_rpc("start_weight_update", kwargs=kwargs)
 
     async def start_draft_weight_update(self) -> None:
         """Start a new weight update targeting the speculative draft model."""

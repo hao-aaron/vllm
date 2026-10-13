@@ -354,6 +354,11 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     supports_draft_weight_update: bool = True
 
+    writes_partial_modules: bool = False
+    """Whether an update writes only part of each module it touches (sparse
+    patches into live tensors). Such an update can never clear a failed one:
+    the worker runs it in a sparse reload session."""
+
     defers_processing: bool = False
     """Whether `update_weights` returns before the weights are on the device.
 

@@ -12,8 +12,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 
 from .layerwise import (
+    abort_reload,
+    begin_update,
+    end_update,
     finalize_layerwise_reload,
     initialize_layerwise_reload,
+    is_reload_active,
+    record_written,
     refresh_derived_state,
 )
 
@@ -93,11 +98,23 @@ def reload_weights(
 
     # begin loading weights
     logger.info_once("Reloading weights inplace...")
+    # A failure leaves the model dirty: it refuses to serve until an update
+    # succeeds that re-completes what this one wrote
     if is_checkpoint_format:
         # load weights from checkpoint/ original model format
-        initialize_layerwise_reload(model)
-        loaded_weights = model.load_weights(weights_iterator)
-        finalize_layerwise_reload(model, model_config)
+        try:
+            initialize_layerwise_reload(model)
+        except BaseException:
+            if is_reload_active(model):
+                abort_reload(model, dirty=False)  # nothing was written yet
+            raise
+        try:
+            loaded_weights = model.load_weights(weights_iterator)
+            finalize_layerwise_reload(model, model_config)
+        except BaseException:
+            if is_reload_active(model):
+                abort_reload(model)
+            raise
 
     else:
         # load weights from kernel format
@@ -105,14 +122,22 @@ def reload_weights(
             "Reloading with `is_checkpoint_format=False` requires that "
             "weights be in kernel format and already sharded",
         )
-        loaded_weights = set()
-        for name, loaded_weight in weights_iterator:
-            param = get_parameter_for_reload(model, name)  # TODO: buffers?
-            param.copy_(loaded_weight)
-            loaded_weights.add(name)
-        # kernel-format tensors were written in place: recompute the state
-        # derived from them (MoE alphas / gscales, attention, model buffers)
-        refresh_derived_state(model, model_config)
+        begin_update(model, partial=True)
+        try:
+            loaded_weights = set()
+            for name, loaded_weight in weights_iterator:
+                param = get_parameter_for_reload(model, name)  # TODO: buffers?
+                record_written(model, [name.rpartition(".")[0]])
+                param.copy_(loaded_weight)
+                loaded_weights.add(name)
+            # kernel-format tensors were written in place: recompute the state
+            # derived from them (MoE alphas / gscales, attention, model buffers)
+            refresh_derived_state(model, model_config)
+            end_update(model)
+        except BaseException:
+            if is_reload_active(model):
+                abort_reload(model)
+            raise
 
     # logging and validation
     counter_after_reloading = time.perf_counter()

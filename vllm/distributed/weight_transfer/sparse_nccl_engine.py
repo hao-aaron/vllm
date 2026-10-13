@@ -122,6 +122,7 @@ class SparseNCCLWeightTransferEngine(
     init_info_cls = NCCLWeightTransferInitInfo
     update_info_cls = SparseNCCLWeightTransferUpdateInfo
     supports_draft_weight_update = False
+    writes_partial_modules = True
 
     def __init__(
         self,
@@ -157,6 +158,16 @@ class SparseNCCLWeightTransferEngine(
                 "NCCL weight transfer not initialized. "
                 "Call init_transfer_engine() first."
             )
+
+        from vllm.model_executor.model_loader.reload import record_written
+
+        # Patches write live tensors in place, through loaders whose target
+        # module isn't known up front: if this round fails, every module may
+        # hold part of it
+        record_written(
+            self.model,
+            {name.rpartition(".")[0] for name, _ in self.model.named_parameters()},
+        )
 
         # Receive on the communicator's device rather than relying on the
         # ambient current device in the RPC thread.

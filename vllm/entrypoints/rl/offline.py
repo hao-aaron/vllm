@@ -44,9 +44,27 @@ class RLOfflineMixin(OfflineInferenceMixin):
             self.llm_engine.collective_rpc("check_reload_support")
         )
 
-    def start_weight_update(self) -> None:
-        """Start a new weight update."""
-        self.llm_engine.collective_rpc("start_weight_update")
+    def start_weight_update(
+        self, partial: bool | None = None, modules: list[str] | None = None
+    ) -> None:
+        """Start a new weight update.
+
+        Generation is paused until the update finishes. If it fails after
+        starting, the engine refuses to serve until an update succeeds that
+        re-sends every module the failed one wrote.
+
+        Args:
+            partial: True if the update sends only part of the model; False
+                to require every module the cold load wrote (finish raises
+                otherwise); None (default) to only log modules it missed.
+            modules: the module names (prefixes) a partial update sends; every
+                rank checks it declares the same set.
+
+        """
+        kwargs: dict = {} if partial is None else {"partial": partial}
+        if modules is not None:
+            kwargs["modules"] = list(modules)
+        self.llm_engine.collective_rpc("start_weight_update", kwargs=kwargs)
 
     def start_draft_weight_update(self) -> None:
         """Start a new weight update targeting the speculative draft model."""

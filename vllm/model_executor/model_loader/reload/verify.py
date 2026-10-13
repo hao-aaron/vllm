@@ -21,8 +21,10 @@ Checks (numbered as in the SupportsReload RFC):
   are now gone (set to None, deleted), which reload cannot write.
 - 6.5 configuration: EPLB, weight offloading, LoRA, transport limits.
 
-Report only: nothing here refuses an update. Items marked `refuse` are the
-ones known to produce wrong weights.
+`check_reload_support` reports everything. At the start of every update,
+`enforce` refuses only items known to produce wrong weights (configuration:
+EPLB, weight offloading, sparse patches into kernel layouts), decided by all
+ranks together; VLLM_RELOAD_ALLOW_UNSAFE=1 overrides.
 
 The verifier proves structure, not values: a wrong refresh formula passes.
 """
@@ -33,6 +35,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -40,6 +43,10 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 logger = init_logger(__name__)
 
 __all__ = [
+    "ReloadRefusedError",
+    "enforce",
+    "policy_report",
+    "refuses",
     "find_unowned_tensors",
     "merge_reload_reports",
     "ReloadItem",
@@ -500,3 +507,48 @@ def merge_reload_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
         if item["status"] != "SAFE"
     ]
     return {"status": status, "items": items}
+
+
+# ---------------------------------------------------------------------------
+# Policy at the start of an update
+# ---------------------------------------------------------------------------
+
+# VLLM_RELOAD_ALLOW_UNSAFE=1 lets updates run despite known-wrong items
+ALLOW_UNSAFE = envs.VLLM_RELOAD_ALLOW_UNSAFE
+
+
+class ReloadRefusedError(RuntimeError):
+    pass
+
+
+def policy_report(model: torch.nn.Module, vllm_config: Any) -> ReloadReport:
+    """The checks an update's start enforces: configuration (6.5). Cheap
+    enough to run before every update."""
+    report = ReloadReport()
+    _check_configuration(model, vllm_config, report)
+    return report
+
+
+def refuses(report: ReloadReport) -> bool:
+    """Whether `enforce` would refuse (the override considered)."""
+    return not ALLOW_UNSAFE and any(i.refuse for i in report.items)
+
+
+def enforce(report: ReloadReport) -> None:
+    """Refuse an update only for items known to produce wrong weights
+    (VLLM_RELOAD_ALLOW_UNSAFE=1 runs it anyway, with a warning). Everything
+    else is left to `check_reload_support`."""
+    refusals = [i for i in report.items if i.refuse]
+    if not refusals:
+        return
+    msg = "; ".join(
+        f"[{i.check}] {i.module or '<model>'}: {i.reason}" for i in refusals[:5]
+    )
+    if ALLOW_UNSAFE:
+        logger.warning_once("UNSAFE WEIGHT UPDATE (allowed): %s", msg)
+        return
+    raise ReloadRefusedError(
+        f"Weight update refused, it would serve wrong weights: {msg}. Fix the "
+        "configuration (see LLM.check_reload_support()), or set "
+        "VLLM_RELOAD_ALLOW_UNSAFE=1 to update anyway."
+    )

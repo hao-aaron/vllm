@@ -594,6 +594,7 @@ def test_padded_moe_reload_releases_each_layer(
                 # Kernel-specific tests cover padding, which is not checkpoint data.
                 mask = torch.isfinite(expected[name])
                 assert torch.equal(original[mask], expected[name][mask])
+        finalize_layerwise_reload(model, model_config=None)
 
 
 def test_get_numel_loaded():

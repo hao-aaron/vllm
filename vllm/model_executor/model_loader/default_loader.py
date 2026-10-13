@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
+from vllm.model_executor.model_loader.reload.layerwise import record_cold_load
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -495,6 +496,8 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        # the modules a full weight update must reach
+        record_cold_load(model, loaded_weights)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

@@ -337,6 +337,7 @@ if TYPE_CHECKING:
     VLLM_RELOAD_ALLOW_UNSAFE_MOE: bool = False
     VLLM_RELOAD_STRICT_LANDING: bool = True
     VLLM_RELOAD_STRICT_MODEL_HOOK: bool = False
+    VLLM_RELOAD_ALLOW_UNSAFE: bool = False
 
 
 def get_default_cache_root():
@@ -2303,6 +2304,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # hook that does not implement SupportsReload warns on every update; 1 raises.
     "VLLM_RELOAD_STRICT_MODEL_HOOK": lambda: bool(
         int(os.getenv("VLLM_RELOAD_STRICT_MODEL_HOOK", "0"))
+    ),
+    # Weight updates: run even when the reload verifier reports known-wrong items.
+    "VLLM_RELOAD_ALLOW_UNSAFE": lambda: bool(
+        int(os.getenv("VLLM_RELOAD_ALLOW_UNSAFE", "0"))
     ),
 }
 

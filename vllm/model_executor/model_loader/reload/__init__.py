@@ -22,6 +22,15 @@ __all__ = [
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
     "refresh_derived_state",
+    "abort_reload",
+    "begin_update",
+    "check_can_serve",
+    "end_update",
+    "get_reload_session",
+    "is_model_dirty",
+    "is_reload_active",
+    "mark_dirty",
+    "record_written",
     "register_refresh",
     "declare_constant",
     "declare_derived",
@@ -34,10 +43,19 @@ __all__ = [
 ]
 
 from .layerwise import (
+    abort_reload,
+    begin_update,
+    check_can_serve,
+    end_update,
     finalize_layerwise_processing,
     finalize_layerwise_reload,
+    get_reload_session,
     initialize_layerwise_reload,
+    is_model_dirty,
+    is_reload_active,
+    mark_dirty,
     record_metadata_for_reloading,
+    record_written,
     refresh_derived_state,
 )
 from .refresh import declare_constant, declare_derived, register_refresh

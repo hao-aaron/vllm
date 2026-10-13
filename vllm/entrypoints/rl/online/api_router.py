@@ -182,9 +182,15 @@ async def check_reload_support(raw_request: Request):
 
 
 @router.post("/start_weight_update")
-async def start_weight_update(raw_request: Request):
+async def start_weight_update(
+    raw_request: Request,
+    partial: Annotated[bool | None, Body(embed=True)] = None,
+    modules: Annotated[list[str] | None, Body(embed=True)] = None,
+):
     with weight_operation_metrics().record("start"):
-        await engine_client(raw_request).start_weight_update()
+        await engine_client(raw_request).start_weight_update(
+            partial=partial, modules=modules
+        )
     return JSONResponse(content={"message": "Weight update started"})
 
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from functools import wraps
 from weakref import WeakKeyDictionary, WeakSet
@@ -24,7 +24,7 @@ from .meta import (
     restore_layer_on_meta,
 )
 from .refresh import refresh_quant_method, run_model_refresh
-from .types import LayerReloadingInfo
+from .types import LayerReloadingInfo, ReloadSession
 from .utils import (
     get_info_size,
     get_layer_params_buffers,
@@ -42,6 +42,18 @@ __all__ = [
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
     "refresh_derived_state",
+    "abort_reload",
+    "begin_update",
+    "check_can_serve",
+    "end_update",
+    "get_reload_session",
+    "is_model_dirty",
+    "is_reload_active",
+    "mark_dirty",
+    "record_cold_load",
+    "record_written",
+    "ReloadDirtyError",
+    "ReloadIncompleteError",
     "ReloadUnsafeModelError",
     "ReloadUnsupportedError",
     "LandingMismatchError",
@@ -90,8 +102,17 @@ def record_metadata_for_reloading(model: torch.nn.Module):
 
 
 @torch.no_grad()
-def initialize_layerwise_reload(model: torch.nn.Module):
+def initialize_layerwise_reload(
+    model: torch.nn.Module,
+    partial: bool | None = None,
+    modules: list[str] | tuple[str, ...] | None = None,
+):
     """Set up layerwise weight loading with deferred processing.
+
+    `partial=False` requires every module the cold load wrote to receive
+    weights (finish raises otherwise); `partial=True` allows updating a
+    subset; None logs modules that received nothing. `modules` names a partial
+    update's modules (prefixes).
 
     Must be called after `record_metadata_for_reloading`. This function:
     1. Saves current kernel tensors for later copying
@@ -109,12 +130,15 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     _check_model_hook_reload_safe(model)
     _check_moe_methods_reload_safe(model)
 
+    session = begin_update(model, partial=partial, modules=modules)
+
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
 
-    for layer in model.modules():
+    for name, layer in model.named_modules():
         info = get_layerwise_info(layer)
+        info.session, info.name = session, name
 
         # Skip if the layer has already been initialized
         if info.can_load():
@@ -185,6 +209,9 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             # see Limitations (3) in __init__.py
             logger.debug("%s: Excessive loading", layer.__class__.__name__)
             return
+        if info.session is not None and info.session.active:
+            info.session.touched.add(info.name)
+            info.session.touched_tensors.add((info.name, param_name))
 
         # Re-run on each load: layers may register parameters later (e.g., `bias`).
         # Wrap late parameters and refresh `load_numel_total` so processing waits
@@ -254,6 +281,12 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
+    # Before any finish-time processing: a full update must have reached
+    # every module the cold load wrote
+    session = get_reload_session(model)
+    if session is not None and session.active:
+        _check_coverage(model, session)
+
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
     reloading = False
 
@@ -314,9 +347,13 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     # `process_weights_after_loading`).
     if reloading:
         run_model_refresh(model)
-        _record_live_signatures(model)
 
     LOADING_LAYERS.clear()
+
+    if session is not None and session.active:
+        end_update(model)
+    elif reloading:
+        _record_live_signatures(model)
 
 
 def finalize_layerwise_reload(*args, **kwargs):
@@ -532,6 +569,8 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     first. All sources are resolved before the first copy, so no copy
     overwrites bytes a later one reads."""
     assert info.kernel_tensors is not None
+    # from here on the live tensors hold this update's values
+    _record_landing(layer, info)
     parameters, buffers = info.kernel_tensors
     non_persistent = info.kernel_non_persistent_buffers
     loaded_tensor_names = {name for name, _ in info.loaded_weights}
@@ -862,3 +901,284 @@ def refresh_derived_state(
             if callable(refresh):
                 refresh(layer)
     run_model_refresh(model)
+
+
+# ---------------------------------------------------------------------------
+# Integrity: update sessions and the dirty flag
+#
+# Every weight update (layerwise reload, sharded RDT, nccl_m2n, sparse NCCL)
+# runs inside a session: `begin_update` ... `end_update`, or `abort_reload` on
+# failure. A failed update leaves the model dirty: no forward may run until an
+# update succeeds that re-completes every module the failed one wrote
+# (layerwise reload writes a module's live tensors only when it completes).
+# ---------------------------------------------------------------------------
+
+
+class ReloadIncompleteError(RuntimeError):
+    """A full update did not reach every module the cold load wrote."""
+
+
+class ReloadDirtyError(RuntimeError):
+    """The update succeeded, but the model stays dirty from a failed one."""
+
+
+def get_reload_session(model: torch.nn.Module) -> ReloadSession | None:
+    return model.__dict__.get("_reload_session")
+
+
+def _session(model: torch.nn.Module) -> ReloadSession:
+    session = get_reload_session(model)
+    if session is None:
+        session = model.__dict__["_reload_session"] = ReloadSession()
+    return session
+
+
+def begin_update(
+    model: torch.nn.Module,
+    *,
+    partial: bool | None = None,
+    modules: list[str] | tuple[str, ...] | None = None,
+    sparse: bool = False,
+) -> ReloadSession:
+    """Start an update session on `model` (no forward may run until it ends)."""
+    session = _session(model)
+    if session.active:
+        raise RuntimeError("a weight update is already active on this model")
+    _resolve_required(model)
+    session.active = True
+    session.sparse = sparse
+    session.partial = partial
+    session.modules = None if modules is None else tuple(sorted(modules))
+    session.touched = set()
+    session.touched_tensors = set()
+    session.completed = set()
+    session.written = set()
+    session.coverage_checked = False
+    return session
+
+
+def end_update(model: torch.nn.Module) -> None:
+    """End a successful update. Clears dirty when this update re-completed
+    every module a failed one wrote; raises `ReloadDirtyError` otherwise (the
+    model keeps refusing to serve)."""
+    session = _session(model)
+    _check_coverage(model, session)
+    session.active = False
+    _record_live_signatures(model)
+    if not session.dirty:
+        return
+    if session.sparse:
+        raise ReloadDirtyError(
+            "A sparse update cannot clear a failed weight update: it writes "
+            "only part of each module. The model still refuses to serve; send "
+            f"a non-sparse update covering {_shown(session.dirty_modules)}."
+        )
+    missing = session.dirty_modules - session.completed
+    if missing:
+        partial = sorted(missing & session.written)
+        raise ReloadDirtyError(
+            "The update succeeded, but the model still refuses to serve: a "
+            "failed update wrote modules this one did not re-complete: "
+            f"{_shown(missing)}"
+            + (
+                f" ({_shown(partial)} received only part of their tensors)"
+                if partial
+                else ""
+            )
+            + "."
+        )
+    session.dirty = False
+    session.dirty_modules.clear()
+
+
+def abort_reload(model: torch.nn.Module, dirty: bool = True) -> None:
+    """End a failed update: put the original tensor objects back, reset reload
+    state and unwrap loaders, and mark the model dirty. Modules the update had
+    completed (or written outside a loader) must be re-completed by a later
+    successful update before the model serves again. `dirty=False` for a
+    start that failed before any write."""
+    for layer in model.modules():
+        info = LAYERWISE_INFO.get(layer)
+        if info is None or not info.can_load():
+            continue
+        if info.kernel_tensors is not None:
+            _place_kernel_tensors(layer, info)
+        for tensor in get_layer_tensors(layer).values():
+            loader = getattr(tensor, "weight_loader", None)
+            if getattr(loader, "__name__", None) == "online_process_loader":
+                tensor.weight_loader = _get_original_loader(tensor)
+        info.reset()
+    if hasattr(model, "_original_do_torchao_reload"):
+        model._do_torchao_reload = model._original_do_torchao_reload
+    LOADING_LAYERS.clear()
+    session = _session(model)
+    if session.active and dirty:
+        session.dirty_modules |= session.completed | session.written
+        session.dirty = True
+    session.active = False
+
+
+def mark_dirty(model: torch.nn.Module) -> None:
+    """The update finished here but failed on another rank: what this rank
+    completed must be re-completed before the model serves again."""
+    session = _session(model)
+    session.dirty = True
+    session.dirty_modules |= session.completed | session.written
+    session.active = False
+
+
+def is_model_dirty(model: torch.nn.Module) -> bool:
+    session = get_reload_session(model)
+    return session is not None and session.dirty
+
+
+def is_reload_active(model: torch.nn.Module) -> bool:
+    session = get_reload_session(model)
+    return session is not None and session.active
+
+
+def check_can_serve(model: torch.nn.Module) -> None:
+    """Refuse a forward mid-update or after a failed update."""
+    session = get_reload_session(model)
+    if session is None:
+        return
+    if session.active:
+        raise RuntimeError(
+            "Model is mid weight update (start_weight_update without "
+            "finish_weight_update); no forward may run until it finishes."
+        )
+    if session.dirty:
+        raise RuntimeError(
+            "A weight update failed; the model refuses to serve until an update "
+            "succeeds that re-completes every module the failed one wrote."
+        )
+
+
+def record_written(model: torch.nn.Module, module_names: Iterable[str]) -> None:
+    """For writers that bypass loaders (planned direct writes, sparse patches):
+    the named modules received data in this update, and their live tensors
+    were written."""
+    session = get_reload_session(model)
+    if session is None or not session.active:
+        return
+    names = set(module_names)
+    session.touched |= names
+    session.completed |= names
+
+
+def record_touched(layer: torch.nn.Module) -> None:
+    """For writers that bypass loaders but land through layerwise reload
+    (sharded RDT scatters, by plan): every tensor of `layer` receives data in
+    this update."""
+    info = LAYERWISE_INFO.get(layer)
+    if info is not None and info.session is not None and info.session.active:
+        info.session.touched.add(info.name)
+        info.session.touched_tensors |= {
+            (info.name, name) for name in get_layer_tensors(layer)
+        }
+
+
+def _record_landing(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
+    """A module lands this update's values in its live tensors. It counts as
+    completed when every tensor the cold load wrote received a loader call
+    (finalize also lands modules that received only some); otherwise it is
+    only written. Counts can't tell a missing shard of a fused tensor from
+    padding a loader never writes, so a missing shard still completes it."""
+    session = info.session
+    if session is None or not session.active:
+        return
+    required = layer.__dict__.get("_reload_required_tensors")
+    if required is None or all(
+        (info.name, name) in session.touched_tensors for name in required
+    ):
+        session.completed.add(info.name)
+    else:
+        session.written.add(info.name)
+        logger.warning(
+            "%s (%s) landed with only some of its tensors loaded (%s missing); "
+            "the missing ones hold undefined values until an update sends them.",
+            info.name,
+            type(layer).__name__,
+            sorted(
+                n for n in required if (info.name, n) not in session.touched_tensors
+            ),
+        )
+
+
+def record_cold_load(model: torch.nn.Module, loaded: Iterable[str] | None) -> None:
+    """Record the modules a cold load wrote (from the parameter names
+    `load_weights` returned): a full update must reach each of them."""
+    if loaded is None:
+        return
+    model.__dict__["_reload_cold_loaded"] = frozenset(loaded)
+    _resolve_required(model)
+
+
+def _resolve_required(model: torch.nn.Module) -> None:
+    """Map the cold load's parameter names to the modules that own them now.
+    A parameter shared by several modules (a tied `lm_head`) counts for its
+    first owner, the module whose loader reload wraps. Resolved again at each
+    update: post-load steps may re-tie parameters after the cold load (an
+    `lm_head` the checkpoint shipped, found identical to the embeddings)."""
+    loaded = model.__dict__.get("_reload_cold_loaded")
+    if loaded is None:
+        return
+    first_owner: dict[int, str] = {}
+    for name, module in model.named_modules():
+        module.__dict__.pop("_reload_required_tensors", None)
+        for t in module._parameters.values():
+            if t is not None:
+                first_owner.setdefault(id(t), name)
+    params = dict(model.named_parameters(remove_duplicate=False))
+    modules = dict(model.named_modules())
+    required: dict[str, set[str]] = {}
+    for name in loaded:
+        param = params.get(name.replace(".base_layer.", "."), params.get(name))
+        if param is None or id(param) not in first_owner:
+            continue
+        owner = first_owner[id(param)]
+        tensor_name = next(
+            n for n, t in modules[owner]._parameters.items() if t is param
+        )
+        required.setdefault(owner, set()).add(tensor_name)
+    model.__dict__["_reload_required_modules"] = set(required)
+    for owner, tensor_names in required.items():
+        modules[owner].__dict__["_reload_required_tensors"] = tensor_names
+
+
+def _check_coverage(model: torch.nn.Module, session: ReloadSession) -> None:
+    """A full update (partial=False) must reach every module the cold load
+    wrote; unspecified only logs the modules it missed."""
+    if session.coverage_checked or session.sparse or session.partial:
+        return
+    session.coverage_checked = True
+    required = model.__dict__.get("_reload_required_modules")
+    if required is None:
+        if session.partial is False:
+            logger.warning_once(
+                "Full weight update requested, but the cold load did not report "
+                "which modules it wrote (load_weights returned no names); "
+                "coverage is not checked."
+            )
+        return
+    untouched = required - session.touched
+    if not untouched:
+        return
+    msg = f"{len(untouched)} module(s) received no weights: {_shown(untouched)}"
+    if session.partial is False:
+        raise ReloadIncompleteError(
+            f"Full weight update incomplete, {msg}. Start the update with "
+            "partial=True to update a subset of the model."
+        )
+    logger.warning(
+        "%s. They keep their previous weights; start the update with "
+        "partial=True to mark this intended, or partial=False to require a "
+        "full update.",
+        msg,
+    )
+
+
+def _shown(names: Iterable[str], limit: int = 8) -> str:
+    names = sorted(names)
+    more = f" and {len(names) - limit} more" if len(names) > limit else ""
+    return f"{names[:limit]}{more}"

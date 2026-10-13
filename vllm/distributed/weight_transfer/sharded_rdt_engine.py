@@ -1306,6 +1306,7 @@ class ShardedRDTWeightTransferEngine(
         """
         from vllm.model_executor.model_loader.reload.layerwise import (
             LAYERWISE_INFO,
+            record_touched,
         )
         from vllm.model_executor.model_loader.reload.meta import materialize_layer
 
@@ -1333,6 +1334,8 @@ class ShardedRDTWeightTransferEngine(
                             "update_weights)."
                         )
                     materialize_layer(layer, info)
+                    # scatters bypass the loaders that record this
+                    record_touched(layer)
                 for sc in chunk.scatters:
                     param = getattr(sc.layer, sc.param_name)
                     # Through .data, exactly like default_weight_loader: params

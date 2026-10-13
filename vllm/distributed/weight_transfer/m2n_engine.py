@@ -375,6 +375,18 @@ class M2NWeightTransferEngine(
         # Reshard lazily so one `load_weights` invocation sees the complete
         # fallback sequence without staging every full tensor at once. Direct
         # destinations still execute in request order as the iterator advances.
+        from vllm.model_executor.model_loader.reload import record_written
+
+        # Direct entries write live storage without a loader call
+        record_written(
+            self.model,
+            {
+                self._parameter_destinations[index].name.rpartition(".")[0]
+                for _, index in requested
+                if self._parameter_destinations[index].tensor is not None
+            },
+        )
+
         def reshard_requested_weights() -> Iterator[tuple[str, torch.Tensor]]:
             for name, index in requested:
                 meta = self._metas[index]

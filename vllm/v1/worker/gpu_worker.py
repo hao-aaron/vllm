@@ -226,6 +226,9 @@ class Worker(WorkerBase):
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         self._weight_update_is_draft = False
+        # an update failed on this rank since its start; finish still joins
+        # the all-ranks agreement so peers don't wait for this rank
+        self._weight_update_failed = False
 
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -627,8 +630,32 @@ class Worker(WorkerBase):
             setattr(self, config_name, new_config)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        """Reload weights in place (from disk or an iterator), with the same
+        integrity as a weight-transfer update: all ranks agree on the policy
+        at start and on the outcome at the end, and a failure leaves the model
+        dirty."""
+        from vllm.model_executor.model_loader.reload import mark_dirty
+
+        if self._weight_update_active:
+            raise RuntimeError("reload_weights: a weight update is active")
         with set_current_vllm_config(self.vllm_config):
-            self.model_runner.reload_weights(*args, **kwargs)
+            model = self.get_model()
+            self._agree_on_start(model, modules=None)
+            error: BaseException | None = None
+            try:
+                self.model_runner.reload_weights(*args, **kwargs)
+            except BaseException as e:
+                error = e  # reload_weights aborted the reload (dirty)
+            all_ok = self._weight_update_ok_on_all_ranks(error is None)
+            if error is not None:
+                raise error
+            if not all_ok:
+                mark_dirty(model)
+                raise RuntimeError(
+                    "reload_weights failed on another rank; this rank's weights "
+                    "are marked dirty and the model refuses to serve until an "
+                    "update succeeds."
+                )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -1311,6 +1338,9 @@ class Worker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        if forward_pass:
+            # last resort behind the engine's pause and refusal
+            self._check_can_serve(dummy=False)
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
@@ -1429,6 +1459,9 @@ class Worker(WorkerBase):
         )
 
     def execute_dummy_batch(self) -> None:
+        # DP peers need this rank's dummy batches even when its model is dirty
+        # (the output is discarded); never mid-update, though
+        self._check_can_serve(dummy=True)
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(
             num_tokens,
@@ -1504,6 +1537,25 @@ class Worker(WorkerBase):
         if self.weight_transfer_engine is not None:
             self.weight_transfer_engine.shutdown()
 
+    def _check_can_serve(self, dummy: bool) -> None:
+        from vllm.model_executor.model_loader.reload import (
+            check_can_serve,
+            is_reload_active,
+        )
+
+        models = [self.model_runner.get_model()]
+        get_draft_model = getattr(self.model_runner, "get_draft_model", None)
+        if callable(get_draft_model) and (draft := get_draft_model()) is not None:
+            models.append(draft)
+        for model in models:
+            if not dummy:
+                check_can_serve(model)
+            elif is_reload_active(model):
+                raise RuntimeError(
+                    "A DP dummy batch ran mid weight update; pause generation "
+                    "on every DP engine before starting a weight update."
+                )
+
     def check_reload_support(self) -> dict:
         """The reload verifier's report for this rank's model (report only)."""
         from vllm.model_executor.model_loader.reload import verify_reload
@@ -1513,15 +1565,25 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             return verify_reload(self.get_model(), self.vllm_config).to_dict()
 
-    def start_weight_update(self) -> None:
+    def start_weight_update(
+        self, partial: bool | None = None, modules: list[str] | None = None
+    ) -> None:
         """Start a new weight update session.
 
         Delegates engine-specific preparation (e.g. layerwise reload setup) to
-        the configured weight transfer engine. The worker only tracks that a
-        session is active.
+        the configured weight transfer engine. Before any write, all ranks
+        agree on the reload policy and on a declared module set.
+
+        Args:
+            partial: True if this update sends only part of the model; False
+                if it must reach every module the cold load wrote (finish
+                raises otherwise); None to only log modules it missed.
+            modules: the module names (prefixes) a partial update sends. All
+                ranks must declare the same set.
+
         """
         with set_current_vllm_config(self.vllm_config):
-            self._start_weight_update()
+            self._start_weight_update(partial=partial, modules=modules)
 
     def start_draft_weight_update(self) -> None:
         """Like start_weight_update, but retargets the engine at the speculative
@@ -1530,9 +1592,26 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self._start_weight_update(is_draft=True)
 
-    def _start_weight_update(self, is_draft: bool = False) -> None:
+    def _start_weight_update(
+        self,
+        is_draft: bool = False,
+        partial: bool | None = None,
+        modules: list[str] | None = None,
+    ) -> None:
+        from vllm.model_executor.model_loader.reload import (
+            abort_reload,
+            begin_update,
+            get_reload_session,
+        )
+
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
+        if modules is not None:
+            if partial is False:
+                raise ValueError(
+                    "start_weight_update: a module set declares a partial update"
+                )
+            partial = True
 
         if is_draft and not self.weight_transfer_engine.supports_draft_weight_update:
             raise RuntimeError(
@@ -1546,15 +1625,114 @@ class Worker(WorkerBase):
                 "active. Call finish_weight_update first."
             )
 
+        engine = self.weight_transfer_engine
+        model = self.get_draft_model() if is_draft else self.get_model()
+        assert model is not None
+        # Before any write, decided by all ranks together: one rank refusing
+        # while its peers start would hang them
+        self._agree_on_start(model, modules)
         try:
             if is_draft:
                 self._set_draft_weight_update_target()
-            self.weight_transfer_engine.start_weight_update()
+            engine.start_weight_update()
+            session = get_reload_session(engine.model)
+            if session is None or not session.active:
+                # engines that don't run a layerwise reload (sparse patches,
+                # planned direct writes) still run inside a session
+                begin_update(
+                    engine.model,
+                    partial=partial,
+                    modules=modules,
+                    sparse=engine.writes_partial_modules,
+                )
+            else:
+                session.partial = partial
+                session.modules = None if modules is None else tuple(sorted(modules))
         except BaseException:
-            self.weight_transfer_engine.reset_weight_update_target()
+            abort_reload(engine.model, dirty=False)  # nothing was written yet
+            engine.reset_weight_update_target()
             raise
         self._weight_update_active = True
+        self._weight_update_failed = False
         self._weight_update_is_draft = is_draft
+
+    def _agree_on_start(
+        self, model: nn.Module, modules: list[str] | tuple[str, ...] | None
+    ) -> None:
+        """All ranks decide together, before any write, whether the update may
+        start: the reload policy (configurations known to produce wrong
+        weights refuse it) and a partial update's declared module set."""
+        import hashlib
+
+        from vllm.model_executor.model_loader.reload import verify
+
+        report = verify.policy_report(model, self.vllm_config)
+        refuse = verify.refuses(report)
+        digest = hashlib.sha256("\n".join(sorted(modules or ())).encode()).digest()
+        value = int.from_bytes(digest[:7], "little")
+        flags = torch.tensor([int(refuse), value, -value], dtype=torch.int64)
+        for group in self._weight_update_groups():
+            torch.distributed.all_reduce(
+                flags, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+            )
+        verify.enforce(report)  # raises if this rank refuses, else may warn
+        if flags[0].item():
+            raise verify.ReloadRefusedError(
+                "Weight update refused: another rank's reload policy refused it "
+                "(see that rank's error)."
+            )
+        if flags[1].item() != -flags[2].item():
+            raise RuntimeError(
+                "start_weight_update: ranks declared different module sets for "
+                "this partial update; every rank must update the same modules."
+            )
+
+    def _weight_update_groups(self) -> list:
+        """Groups whose ranks must agree on an update: this engine's ranks
+        (TP x PCP x PP), and every DP replica when expert parallelism couples
+        their forwards; independent DP replicas decide alone."""
+        from vllm.distributed import parallel_state
+
+        if not torch.distributed.is_initialized():
+            return []
+        pc = self.parallel_config
+        if pc.data_parallel_size == 1 or pc.enable_expert_parallel:
+            world = parallel_state.get_world_group()
+            return [world] if world.world_size > 1 else []
+        return [
+            g
+            for g in (
+                parallel_state.get_tp_group(),
+                parallel_state.get_pcp_group(),
+                parallel_state.get_pp_group(),
+            )
+            if g.world_size > 1
+        ]
+
+    def _weight_update_ok_on_all_ranks(self, ok: bool) -> bool:
+        """All ranks agree on the outcome before any of them serves: a forward
+        runs on all of them together, so one rank's failure makes every
+        rank's weights unusable."""
+        flag = torch.tensor([int(ok)], dtype=torch.int32)
+        for group in self._weight_update_groups():
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
+        return bool(flag.item())
+
+    def _abort_weight_update(self) -> None:
+        """Put the original tensors back and end the session after a failure.
+        The model stays dirty until an update re-completes what this one
+        wrote."""
+        assert self.weight_transfer_engine is not None
+        from vllm.model_executor.model_loader.reload import abort_reload
+
+        try:
+            abort_reload(self.weight_transfer_engine.model)
+        finally:
+            self._weight_update_active = False
+            self._weight_update_failed = True
+            self.weight_transfer_engine.reset_weight_update_target()
 
     def update_weights(self, update_info: dict | list[dict]) -> None:
         """Receive one weight update chunk from the trainer.
@@ -1589,8 +1767,7 @@ class Worker(WorkerBase):
                     local_update_info = update_info
                 self.weight_transfer_engine.update_weights(local_update_info)
             except BaseException:
-                self._weight_update_active = False
-                self.weight_transfer_engine.reset_weight_update_target()
+                self._abort_weight_update()
                 raise
 
     def finish_weight_update(self) -> None:
@@ -1598,15 +1775,60 @@ class Worker(WorkerBase):
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
 
-        if not self._weight_update_active:
+        from vllm.model_executor.model_loader.reload import (
+            abort_reload,
+            end_update,
+            is_reload_active,
+            mark_dirty,
+        )
+
+        engine = self.weight_transfer_engine
+        failed_earlier = self._weight_update_failed
+        if not self._weight_update_active and not failed_earlier:
             raise RuntimeError(
                 "finish_weight_update called without a matching start_weight_update."
             )
 
         with set_current_vllm_config(self.vllm_config):
-            self.weight_transfer_engine.finish_weight_update()
-            self.weight_transfer_engine.reset_weight_update_target()
+            # Agree before finish-time processing, which may run collectives:
+            # a rank whose update already failed must not leave its peers
+            # waiting in them
+            if not self._weight_update_ok_on_all_ranks(not failed_earlier):
+                if self._weight_update_active:
+                    self._abort_weight_update()
+                self._weight_update_failed = False
+                raise RuntimeError(
+                    "finish_weight_update: this weight update failed on "
+                    + (
+                        "this rank (see the earlier error)"
+                        if failed_earlier
+                        else "another rank"
+                    )
+                    + "; the model refuses to serve until an update succeeds."
+                )
+            model = engine.model
+            error: BaseException | None = None
+            try:
+                engine.finish_weight_update()
+                if is_reload_active(model):
+                    end_update(model)
+            except BaseException as e:
+                error = e
+                if is_reload_active(model):
+                    abort_reload(model)
+            all_ok = self._weight_update_ok_on_all_ranks(error is None)
+            engine.reset_weight_update_target()
             self._weight_update_active = False
+            self._weight_update_failed = False
+            if error is not None:
+                raise error
+            if not all_ok:
+                mark_dirty(model)
+                raise RuntimeError(
+                    "finish_weight_update: the weight update failed on another "
+                    "rank; this rank's weights are marked dirty and the model "
+                    "refuses to serve until an update succeeds."
+                )
 
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
