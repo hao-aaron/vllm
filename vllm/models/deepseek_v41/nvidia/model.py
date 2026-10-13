@@ -48,6 +48,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.reload import declare_derived
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     drop_checkpoint_cache,
@@ -58,6 +59,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    SupportsReload,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -1349,9 +1351,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    param = params_dict[name]
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    param.weight_loader(param, narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
@@ -1426,7 +1428,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 .sum(dim=1)
             )
             if layer.hc_attn_fn_broadcast is None:
+                # allocated once, by the cold start's refresh
                 layer.hc_attn_fn_broadcast = broadcast
+                declare_derived(layer, broadcast)
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
 
@@ -1544,6 +1548,7 @@ class DeepseekV41LLMForCausalLM(
     SupportsPP,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsReload,
     DeepseekV4MixtureOfExperts,
 ):
     model_cls = DeepseekV4Model
@@ -1666,8 +1671,13 @@ class DeepseekV41LLMForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.process_weights_after_loading()
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def refresh_model(self) -> None:
+        # the mHC broadcast weight is derived from the first layer's hc_attn_fn
+        self.model.finalize_mhc_broadcast_weights()
+
+    def post_load_setup(self) -> None:
         config = self.model.vllm_config
         if config.engram_config and config.engram_config.use_thp:
             # Loading weights refills the file cache; release it before MADV_COLLAPSE.
@@ -1682,10 +1692,6 @@ class DeepseekV41LLMForCausalLM(
             ):
                 if layer.engram is not None:
                     layer.engram.embed_tokens.collapse_huge_pages()
-        return loaded_params
-
-    def process_weights_after_loading(self) -> None:
-        self.model.finalize_mhc_broadcast_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
