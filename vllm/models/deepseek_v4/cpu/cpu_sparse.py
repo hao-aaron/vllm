@@ -15,6 +15,8 @@ import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.quantization.wrap import wrap_quant_method
+from vllm.model_executor.model_loader.reload import declare_derived
 from vllm.models.deepseek_v4.attention import (
     DeepseekV4Attention,
     DeepseekV4Indexer,
@@ -294,8 +296,8 @@ class DeepseekV4CPUAttention(DeepseekV4Attention):
 
         Runs after every quantized layer's own
         ``process_weights_after_loading`` (see ``is_deferred_attention_layer``);
-        ``wo_a``'s packing must happen *before* that phase instead, so it's a
-        separate monkeypatch in ``__init__``.
+        ``wo_a``'s packing must happen *before* that phase instead, so it
+        wraps ``wo_a``'s quant method in ``__init__``.
         """
         self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(
             torch.float32
@@ -306,23 +308,30 @@ class DeepseekV4CPUAttention(DeepseekV4Attention):
             self.indexer.compressor.cache_norm_weight_fp32()
 
     def _wrap_wo_a_process_weights_after_loading(self) -> None:
-        """Snapshot and pack ``wo_a``'s weight into a bf16 copy for
-        ``bmm_cpu`` before the FP8 kernel's own
-        ``process_weights_after_loading`` VNNI-repacks it in place for
-        row-major reads ``_o_proj`` never does."""
-        wo_a = self.wo_a
-        quant_method = wo_a.quant_method
-        orig_pwal = quant_method.process_weights_after_loading
+        """Pack ``wo_a``'s weight into a bf16 copy for ``bmm_cpu`` before the
+        FP8 kernel's own ``process_weights_after_loading`` VNNI-repacks it in
+        place for row-major reads ``_o_proj`` never does. Runs on every load;
+        a reload refills the packed copy in place."""
         heads_per_group = self.n_local_heads // self.n_local_groups
         k_dim = heads_per_group * self.head_dim
 
-        def _capture_and_pack(layer: torch.nn.Module) -> None:
+        def pack(layer: torch.nn.Module) -> None:
             dequant = _dequant_linear_weight(layer).to(torch.bfloat16)
             dequant = dequant.view(self.n_local_groups, self.o_lora_rank, k_dim)
-            self._wo_a_packed = torch.ops._C.convert_weight_packed(dequant.contiguous())
-            orig_pwal(layer)
-            # orig_pwal VNNI-repacks layer.weight/scale for ordinary-linear
-            # use that _o_proj never needs -- free them, same pattern as
+            packed = torch.ops._C.convert_weight_packed(dequant.contiguous())
+            live = self._wo_a_packed
+            if live is not None and (live.shape, live.dtype) == (
+                packed.shape,
+                packed.dtype,
+            ):
+                live.copy_(packed)
+            else:
+                self._wo_a_packed = packed
+                declare_derived(self, packed)
+
+        def release(layer: torch.nn.Module) -> None:
+            # The PWAL VNNI-repacks layer.weight/scale for ordinary-linear use
+            # that _o_proj never needs -- free them, same pattern as
             # dispatch_cpu_unquantized_gemm's remove_weight=True.
             layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
             scale_attr = (
@@ -337,9 +346,7 @@ class DeepseekV4CPUAttention(DeepseekV4Attention):
                     torch.nn.Parameter(torch.empty(0), requires_grad=False),
                 )
 
-        quant_method.process_weights_after_loading = (  # type: ignore[method-assign]
-            _capture_and_pack
-        )
+        wrap_quant_method(self.wo_a, before_pwal=pack, after_pwal=release)
 
     def forward(
         self,
