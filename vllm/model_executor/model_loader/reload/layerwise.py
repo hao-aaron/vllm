@@ -167,7 +167,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             # For now, `load_numel_total` is still safe to use as long as
             # there's no way to reach `load_numel_total` without loading all
             # necessary weights. `weight_shape` is very small, so this is safe.
-            # see Limitations(4)
+            # see Limitations (3) in __init__.py
             logger.debug("%s: Excessive loading", layer.__class__.__name__)
             return
 
@@ -269,7 +269,7 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         # Process non-attention layers which did not load all elements. This can happen
         # if the created weight has extra padding elements which are not loaded
         # Having too many of these delayed layers can lead to excess memory usage
-        # see Limitations(4)
+        # see Limitations (3) in __init__.py
         elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
             logger.debug("%s: Delayed processing", layer.__class__.__name__)
             _layerwise_process(layer, info)
@@ -297,13 +297,17 @@ def _finalize_attention_layer(
     elif info.load_numel > 0:
         # Reload with new scale weights from checkpoint
         _place_kernel_tensors(layer, info)
-        _reload_attention_scales(layer, info)
+        _reload_attention_scales(layer, info, model_config)
     else:
         _place_kernel_tensors(layer, info)
     layer.process_weights_after_loading(model_config.dtype)
 
 
-def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
+def _reload_attention_scales(
+    layer: torch.nn.Module,
+    info: LayerReloadingInfo,
+    model_config: ModelConfig | None = None,
+) -> None:
     """Load and process attention scale weights (k_scale, v_scale, etc.)
     during reload.
 
@@ -313,8 +317,18 @@ def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -
     quant_method = getattr(layer, "quant_method", None)
     if quant_method is not None:
         # Re-create scale Parameters with sentinel values so unloaded scales
-        # are correctly detected by process_weights_after_loading
-        quant_method.create_weights(layer)
+        # are correctly detected by process_weights_after_loading. Under the
+        # model dtype, as at model init: the scales are 0-dim tensors of the
+        # default dtype, so an fp32 checkpoint scale is rounded the same way
+        # on reload as on a fresh load.
+        from vllm.utils.torch_utils import set_default_torch_dtype
+
+        dtype = model_config.dtype if model_config is not None else None
+        if isinstance(dtype, torch.dtype):
+            with set_default_torch_dtype(dtype):
+                quant_method.create_weights(layer)
+        else:
+            quant_method.create_weights(layer)
 
     for name, args in info.loaded_weights:
         param = getattr(layer, name)
