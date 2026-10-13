@@ -226,13 +226,27 @@ def _per_block_cast_to_fp8_padded(
 
 
 class MoESwiGLUFFNFP8(MoESwiGLUFFN):
-    """NOTE vision MoE using the checkpoint's local block-FP8 semantics."""
+    """NOTE vision MoE using the checkpoint's local block-FP8 semantics.
+
+    The fused block-FP8 expert buffers are derived from the per-expert
+    weights: built by the first refresh (cold start) and refilled in place
+    after a weight update. The per-expert weights are kept only when weight
+    transfer is configured (otherwise they are released after the first
+    refresh, and the vision MoE cannot be updated in place)."""
+
+    def __init__(self, config: DotsMoEVitConfig, layer_number: int):
+        super().__init__(config, layer_number)
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        self._keep_experts = (
+            vllm_config is not None and vllm_config.weight_transfer_config is not None
+        )
 
     @torch.no_grad()
-    def process_weights_after_loading(self) -> None:
-        if hasattr(self, "_fused_w13_fp8"):
-            return
-
+    def refresh(self) -> None:
+        if not hasattr(self, "experts"):
+            return  # released after the first refresh (no weight transfer)
         w13_weights = []
         w13_scales = []
         w2_weights = []
@@ -246,27 +260,21 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
             w2_weights.append(w2)
             w2_scales.append(s2)
 
-        self.register_buffer(
-            "_fused_w13_fp8",
-            torch.stack(w13_weights).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w13_scale",
-            torch.stack(w13_scales).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w2_fp8",
-            torch.stack(w2_weights).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w2_scale",
-            torch.stack(w2_scales).contiguous(),
-            persistent=False,
-        )
-        del self.experts
+        fused = {
+            "_fused_w13_fp8": w13_weights,
+            "_fused_w13_scale": w13_scales,
+            "_fused_w2_fp8": w2_weights,
+            "_fused_w2_scale": w2_scales,
+        }
+        for name, parts in fused.items():
+            if hasattr(self, name):
+                torch.stack(parts, out=getattr(self, name))
+            else:
+                self.register_buffer(
+                    name, torch.stack(parts).contiguous(), persistent=False
+                )
+        if not self._keep_experts:
+            del self.experts
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not hasattr(self, "_fused_w13_fp8"):
@@ -546,10 +554,16 @@ class DotsMoEVitModel(PreTrainedModel):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def process_weights_after_loading(self) -> None:
+    # SupportsReload: the fused vision MoE buffers are refreshed after every
+    # load; compiling the blocks is cold-start setup
+    supports_reload = True
+
+    def refresh_model(self) -> None:
         for block in self.blocks:
             if isinstance(block.mlp, MoESwiGLUFFNFP8):
-                block.mlp.process_weights_after_loading()
+                block.mlp.refresh()
+
+    def post_load_setup(self) -> None:
         if self.config.enable_torch_compile:
             self.compile_block_modules()
 

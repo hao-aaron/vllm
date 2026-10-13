@@ -13,6 +13,7 @@ from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
     SupportsPP,
+    SupportsReload,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
@@ -62,7 +63,7 @@ def _skip_linear_init():
     info=Dots3NoteProcessingInfo,
     dummy_inputs=Dots3NoteDummyInputsBuilder,
 )
-class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
+class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsReload):
     """Dots3Note model with optional image and audio towers."""
 
     supports_encoder_tp_data = True
@@ -318,9 +319,14 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             mapper=self.hf_to_vllm_mapper,
         )
 
-    def process_weights_after_loading(self) -> None:
-        if self.visual is not None:
-            self.visual.process_weights_after_loading()
+    # The vision tower's post-load work is its own refresh_model() and
+    # post_load_setup(), which the framework runs on every SupportsReload
+    # module of the tree.
+    def refresh_model(self) -> None:
+        return
+
+    def post_load_setup(self) -> None:
+        return
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(
