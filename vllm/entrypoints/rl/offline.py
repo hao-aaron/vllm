@@ -30,6 +30,20 @@ class RLOfflineMixin(OfflineInferenceMixin):
         """Release the trainer connection without shutting down inference."""
         self.llm_engine.collective_rpc("shutdown_weight_transfer_engine")
 
+    def check_reload_support(self) -> dict:
+        """Whether this engine's weights can be updated in place correctly.
+
+        Runs the reload verifier on every rank (report only: it never refuses
+        an update). Returns `{"status": SAFE|UNVERIFIED|UNSAFE, "items": [...]}`,
+        the worst status over ranks and every rank's non-SAFE items (with
+        their rank). See "Writing a reloadable model" in the contributing docs.
+        """
+        from vllm.model_executor.model_loader.reload import merge_reload_reports
+
+        return merge_reload_reports(
+            self.llm_engine.collective_rpc("check_reload_support")
+        )
+
     def start_weight_update(self) -> None:
         """Start a new weight update."""
         self.llm_engine.collective_rpc("start_weight_update")

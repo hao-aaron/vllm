@@ -1329,6 +1329,12 @@ class AsyncLLM(EngineClient):
         """Release the trainer connection without shutting down inference."""
         await self.collective_rpc("shutdown_weight_transfer_engine")
 
+    async def check_reload_support(self) -> dict:
+        """The reload verifier's report (see `LLM.check_reload_support`)."""
+        from vllm.model_executor.model_loader.reload import merge_reload_reports
+
+        return merge_reload_reports(await self.collective_rpc("check_reload_support"))
+
     async def start_weight_update(self) -> None:
         """Start a new weight update."""
         await self.collective_rpc("start_weight_update")

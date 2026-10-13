@@ -175,6 +175,12 @@ async def shutdown_weight_transfer_engine(raw_request: Request):
     return JSONResponse(content={"message": "Weight transfer shut down"})
 
 
+@router.get("/check_reload_support")
+async def check_reload_support(raw_request: Request):
+    report = await engine_client(raw_request).check_reload_support()
+    return JSONResponse(content=report)
+
+
 @router.post("/start_weight_update")
 async def start_weight_update(raw_request: Request):
     with weight_operation_metrics().record("start"):

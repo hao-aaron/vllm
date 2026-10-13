@@ -25,6 +25,10 @@ __all__ = [
     "register_refresh",
     "declare_constant",
     "declare_derived",
+    "merge_reload_reports",
+    "ReloadReport",
+    "ReloadStatus",
+    "verify_reload",
     "set_torchao_reload_attrs",
     "support_quantized_model_reload_from_hp_weights",
 ]
@@ -41,3 +45,4 @@ from .torchao_decorator import (
     set_torchao_reload_attrs,
     support_quantized_model_reload_from_hp_weights,
 )
+from .verify import ReloadReport, ReloadStatus, merge_reload_reports, verify_reload

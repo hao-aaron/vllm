@@ -1504,6 +1504,15 @@ class Worker(WorkerBase):
         if self.weight_transfer_engine is not None:
             self.weight_transfer_engine.shutdown()
 
+    def check_reload_support(self) -> dict:
+        """The reload verifier's report for this rank's model (report only)."""
+        from vllm.model_executor.model_loader.reload import verify_reload
+
+        if self._weight_update_active:
+            raise RuntimeError("check_reload_support: a weight update is active")
+        with set_current_vllm_config(self.vllm_config):
+            return verify_reload(self.get_model(), self.vllm_config).to_dict()
+
     def start_weight_update(self) -> None:
         """Start a new weight update session.
 
