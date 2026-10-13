@@ -416,11 +416,14 @@ def _reload_attention_scales(
         from vllm.utils.torch_utils import set_default_torch_dtype
 
         dtype = model_config.dtype if model_config is not None else None
-        if isinstance(dtype, torch.dtype):
-            with set_default_torch_dtype(dtype):
+        # On the model's device, as at model init: the results land in the
+        # live scales (reload runs in an RPC thread whose default is the CPU)
+        with info.restore_device:
+            if isinstance(dtype, torch.dtype):
+                with set_default_torch_dtype(dtype):
+                    quant_method.create_weights(layer)
+            else:
                 quant_method.create_weights(layer)
-        else:
-            quant_method.create_weights(layer)
 
     for name, args in info.loaded_weights:
         param = getattr(layer, name)
