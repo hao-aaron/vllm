@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .meta import (
     SKIP_LOAD_TENSORS,
+    capture_init_fill,
     capture_layer_to_meta,
     get_numel_loaded,
     materialize_layer,
@@ -83,6 +84,7 @@ def record_metadata_for_reloading(model: torch.nn.Module):
         info = get_layerwise_info(layer)
         info.restore_metadata = capture_layer_to_meta(layer)
         info.restore_device = torch.get_default_device()
+        info.init_fill = capture_init_fill(layer)
     # module structure at init, for the verifier (deleted submodules)
     model.__dict__["_reload_module_names"] = [n for n, _ in model.named_modules()]
 

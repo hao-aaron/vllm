@@ -579,3 +579,32 @@ def test_undeclared_moe_method_fails_closed_under_graphs(
     else:
         initialize_layerwise_reload(model)
         finalize_layerwise_reload(model, model_config=None)
+
+
+def test_reload_targets_start_from_create_time_values():
+    """Elements no loader writes (padding, scales a checkpoint lacks) hold
+    their create-time value after a reload, as after a fresh load: weights
+    created zero, scales created as ones or sentinels. They used to hold
+    whatever `torch.empty` returned."""
+    layer = torch.nn.Module()
+    padded = torch.nn.Parameter(torch.zeros(6, 4), requires_grad=False)
+    scale = torch.nn.Parameter(torch.full((3,), -1.0), requires_grad=False)
+    garbage = torch.nn.Parameter(torch.arange(4.0), requires_grad=False)
+
+    def load_rows(param, loaded_weight):  # writes the first rows only
+        param.data[: loaded_weight.shape[0]].copy_(loaded_weight)
+
+    for name, p in (("padded", padded), ("scale", scale), ("garbage", garbage)):
+        p.weight_loader = load_rows
+        layer.register_parameter(name, p)
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+
+    initialize_layerwise_reload(model)
+    layer.padded.weight_loader(layer.padded, torch.ones(4, 4))
+    layer.scale.weight_loader(layer.scale, torch.full((1,), 2.0))
+    layer.garbage.weight_loader(layer.garbage, torch.full((2,), 7.0))
+    finalize_layerwise_reload(model, model_config=None)
+    assert torch.equal(padded[4:], torch.zeros(2, 4))  # padding: create-time 0
+    assert torch.equal(scale, torch.tensor([2.0, -1.0, -1.0]))  # sentinel kept
+    assert torch.equal(garbage, torch.tensor([7.0, 7.0, 0.0, 0.0]))  # zero-filled

@@ -150,7 +150,33 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
     with info.restore_device:
         for name, tensor in get_layer_tensors(layer).items():
             if name not in SKIP_TENSORS and tensor.is_meta:
-                setattr(layer, name, materialize_meta_tensor(tensor))
+                target = materialize_meta_tensor(tensor)
+                # Start from the create-time value: elements no loader writes
+                # (padding, scales a checkpoint lacks) then hold what a fresh
+                # load holds
+                target.data.fill_(info.init_fill.get(name, 0))
+                setattr(layer, name, target)
+
+
+def capture_init_fill(layer: torch.nn.Module) -> dict[str, float]:
+    """The value of each tensor of `layer` that was created uniform (e.g.
+    zeros, ones, `FP8_SCALE_SENTINEL`). Tensors created with `torch.empty`
+    are generally not uniform and are left out."""
+    fill = {}
+    for name, tensor in get_layer_tensors(layer).items():
+        if name in SKIP_TENSORS or tensor.is_meta or tensor.numel() == 0:
+            continue
+        try:
+            with torch.no_grad():
+                flat = tensor.detach().reshape(-1)
+                if flat.element_size() == 1:  # FP8, packed FP4, bool
+                    flat = flat.view(torch.uint8)
+                lo, hi = torch.aminmax(flat)
+                if bool(lo == hi):
+                    fill[name] = tensor.detach().reshape(-1)[0].float().item()
+        except (RuntimeError, NotImplementedError, TypeError):
+            continue  # tensor subclasses, unsupported dtypes
+    return fill
 
 
 class CopyCounter(TorchDispatchMode):
