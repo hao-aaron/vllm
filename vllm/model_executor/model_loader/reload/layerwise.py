@@ -705,7 +705,8 @@ STRICT_MODEL_HOOK = envs.VLLM_RELOAD_STRICT_MODEL_HOOK
 
 
 def _check_model_hook_reload_safe(model: torch.nn.Module) -> None:
-    hook = getattr(type(model), "process_weights_after_loading", None)
+    # (an instance attribute counts: wrappers forward a backbone's hook)
+    hook = getattr(model, "process_weights_after_loading", None)
     if hook is None or getattr(model, "supports_reload", False):
         return
     msg = (

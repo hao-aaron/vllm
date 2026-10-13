@@ -48,6 +48,7 @@ from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     SupportsEagle3,
     SupportsPP,
+    SupportsReload,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -758,9 +759,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    param = params_dict[name]
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    param.weight_loader(param, narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
@@ -844,7 +845,7 @@ def _make_deepseek_v4_weights_mapper(
     )
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsReload):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -914,9 +915,11 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
-    def process_weights_after_loading(self) -> None:
-        # No CPU AMX weight-packing hook yet.
-        pass
+    def refresh_model(self) -> None:
+        return
+
+    def post_load_setup(self) -> None:
+        return
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
