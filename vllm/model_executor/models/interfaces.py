@@ -1179,6 +1179,56 @@ def supports_replayssm(
 
 
 @runtime_checkable
+class SupportsReload(Protocol):
+    """The post-load contract for models whose weights can be updated in
+    place (weight transfer, `reload_weights`).
+
+    Post-load work has one place per kind:
+
+    - per-shard transforms: the param's `weight_loader`;
+    - checkpoint -> kernel conversion: the module's quant method PWAL, which
+      always transforms and builds kernel objects once;
+    - weight-derived values held by kernels: kernel `refresh()`;
+    - weight-derived values spanning modules: `refresh_model()`;
+    - non-weight setup (compile, device placement): `post_load_setup()`.
+
+    The framework calls `refresh_model()` after every load (cold start and
+    reload) on every module of the model tree that implements this protocol,
+    children first, after the kernel and attention refreshes; and
+    `post_load_setup()` once, after the cold-start refresh.
+    """
+
+    supports_reload: ClassVar[Literal[True]] = True
+
+    def refresh_model(self) -> None:
+        """Recompute weight-derived values that span modules, from the live
+        (landed) tensors. Write only buffers allocated by the first call
+        (cold start, before CUDA graph capture), with `copy_` / `out=`. Must be
+        idempotent and safe under partial updates; collectives only if every
+        rank calls them."""
+        return
+
+    def post_load_setup(self) -> None:
+        """Non-weight setup (compile, device placement, geometry). Cold start
+        only."""
+        return
+
+
+@overload
+def supports_reload(model: type[object]) -> TypeIs[type[SupportsReload]]: ...
+
+
+@overload
+def supports_reload(model: object) -> TypeIs[SupportsReload]: ...
+
+
+def supports_reload(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsReload]] | TypeIs[SupportsReload]:
+    return getattr(model, "supports_reload", False)
+
+
+@runtime_checkable
 class SupportsCrossEncoding(Protocol):
     """The interface required for all models that support cross encoding."""
 

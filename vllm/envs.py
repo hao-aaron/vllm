@@ -334,6 +334,9 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_ENABLE_HPC_OPS: bool = False
+    VLLM_RELOAD_ALLOW_UNSAFE_MOE: bool = False
+    VLLM_RELOAD_STRICT_LANDING: bool = True
+    VLLM_RELOAD_STRICT_MODEL_HOOK: bool = False
 
 
 def get_default_cache_root():
@@ -2285,6 +2288,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to skip version suffix when building package
     "VLLM_SKIP_VERSION_SUFFIX": lambda: bool(
         int(os.getenv("VLLM_SKIP_VERSION_SUFFIX", "0"))
+    ),
+    # Weight updates: under CUDA graphs, a MoE quant method that does not
+    # declare itself reload-safe is refused before any write; 1 warns instead.
+    "VLLM_RELOAD_ALLOW_UNSAFE_MOE": lambda: bool(
+        int(os.getenv("VLLM_RELOAD_ALLOW_UNSAFE_MOE", "0"))
+    ),
+    # Weight updates: a reloaded result whose shape, dtype or device differs
+    # from its live tensor raises; 0 downgrades it to a warning.
+    "VLLM_RELOAD_STRICT_LANDING": lambda: bool(
+        int(os.getenv("VLLM_RELOAD_STRICT_LANDING", "1"))
+    ),
+    # Weight updates: a model with a model-level process_weights_after_loading()
+    # hook that does not implement SupportsReload warns on every update; 1 raises.
+    "VLLM_RELOAD_STRICT_MODEL_HOOK": lambda: bool(
+        int(os.getenv("VLLM_RELOAD_STRICT_MODEL_HOOK", "0"))
     ),
 }
 

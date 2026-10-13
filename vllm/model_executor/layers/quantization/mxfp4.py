@@ -49,6 +49,49 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+# Backends whose kernels are built once and whose weight-derived state is
+# declared (modulewise reload).
+_RELOAD_SAFE_MXFP4_BACKENDS = (
+    Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+    Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+    Mxfp4MoeBackend.TRITON,
+    # weights and packed scales are registered; the experts keep no
+    # weight-derived state (verified bitwise on tiny Kimi K3)
+    Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+    Mxfp4MoeBackend.MARLIN,
+)
+
+
+def _refill_tensors(live: object, new: object, seen: set[int] | None = None) -> None:
+    """Copy every tensor reachable from `new` (a triton_kernels wrapped tensor
+    or PrecisionConfig) into the same-path tensor of `live`, in place: the
+    kernel and captured graphs keep reading the live objects' storage."""
+    seen = set() if seen is None else seen
+    if id(live) in seen or live is new:
+        return
+    seen.add(id(live))
+    if isinstance(live, torch.Tensor):
+        assert isinstance(new, torch.Tensor)
+        assert (live.shape, live.stride(), live.dtype) == (
+            new.shape,
+            new.stride(),
+            new.dtype,
+        ), "reload changed the MXFP4 Triton layout"
+        live.copy_(new)
+        return
+    if isinstance(live, (list, tuple)):
+        assert isinstance(new, (list, tuple)) and len(live) == len(new)
+        for a, b in zip(live, new):
+            _refill_tensors(a, b, seen)
+        return
+    fields = getattr(live, "__dict__", None)
+    if fields is None:
+        return
+    for name, value in fields.items():
+        if isinstance(value, (torch.Tensor, list, tuple)) or hasattr(value, "__dict__"):
+            _refill_tensors(value, getattr(new, name), seen)
+
+
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
 
@@ -153,6 +196,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.weight_dtype = "gpt_oss_mxfp4"
         self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(moe)
+        self.reload_safe = self.mxfp4_backend in _RELOAD_SAFE_MXFP4_BACKENDS
 
         self.max_capture_size = moe.max_capture_size
 
@@ -363,6 +407,17 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_weight_scale", w13_scale)
             replace_parameter(layer, "w2_weight_scale", w2_scale)
         else:
+            live = getattr(self, "_triton_live", None)
+            if self.reload_safe and live is not None:
+                # Refill the wrapped weights / precision configs the kernel
+                # (and captured graphs) read, instead of replacing them. They
+                # were created as inference tensors at cold start.
+                with torch.inference_mode():
+                    for old, new in zip(live, (w13, w2, w13_scale, w2_scale)):
+                        _refill_tensors(old, new)
+                w13, w2, w13_scale, w2_scale = live
+            else:
+                self._triton_live = (w13, w2, w13_scale, w2_scale)
             layer.w13_weight = w13
             layer.w2_weight = w2
             self.w13_precision_config = w13_scale
@@ -372,18 +427,23 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
-        # Build quant config
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        # Build once, keyed on the kernel's presence; the reload framework
+        # lands results then refreshes.
+        if not (self.reload_safe and self.moe_kernel is not None):
+            # Build quant config
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
-        # Build kernel (modular or monolithic)
-        if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                mxfp4_backend=self.mxfp4_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._expert_routing_tables(),
-            )
+            # Build kernel (modular or monolithic)
+            if self.moe_quant_config is not None and self.experts_cls is not None:
+                self.moe_kernel = make_mxfp4_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    mxfp4_backend=self.mxfp4_backend,
+                    experts_cls=self.experts_cls,
+                    routing_tables=layer._expert_routing_tables(),
+                )
+        # the experts' own transforms run on every (re)load
+        if self.moe_kernel is not None:
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -570,6 +630,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
                 moe
             )
+        self.reload_safe = self.mxfp4_backend in _RELOAD_SAFE_MXFP4_BACKENDS
 
         self.max_capture_size = moe.max_capture_size
 
@@ -842,6 +903,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_weight_scale", w13_scale)
             replace_parameter(layer, "w2_weight_scale", w2_scale)
         else:
+            live = getattr(self, "_triton_live", None)
+            if self.reload_safe and live is not None:
+                # Refill the wrapped weights / precision configs the kernel
+                # (and captured graphs) read, instead of replacing them. They
+                # were created as inference tensors at cold start.
+                with torch.inference_mode():
+                    for old, new in zip(live, (w13, w2, w13_scale, w2_scale)):
+                        _refill_tensors(old, new)
+                w13, w2, w13_scale, w2_scale = live
+            else:
+                self._triton_live = (w13, w2, w13_scale, w2_scale)
             layer.w13_weight = w13
             layer.w2_weight = w2
             self.w13_precision_config = w13_scale
@@ -851,8 +923,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
-        # Build quant config
-        self._build_moe_kernel(layer)
+        # Build once, keyed on the kernel's presence; the reload framework
+        # lands results then refreshes.
+        if not (self.reload_safe and self.moe_kernel is not None):
+            self._build_moe_kernel(layer)
+        # the experts' own transforms run on every (re)load
+        if self.moe_kernel is not None:
+            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""
@@ -865,7 +942,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
-            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def _setup_kernel_k3_situ_gfx942(self, layer: RoutedExperts) -> None:
         import inspect
@@ -1013,6 +1089,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     f"moe backend, got {self.mxfp4_backend}"
                 )
             self._build_moe_kernel(layer)
+            if self.moe_kernel is not None:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
             return
 
         if self.is_k3_situ_int4_gfx942:

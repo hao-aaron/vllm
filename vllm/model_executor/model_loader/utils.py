@@ -29,6 +29,11 @@ from vllm.model_executor.model_loader.reload import (
     record_metadata_for_reloading,
     set_torchao_reload_attrs,
 )
+from vllm.model_executor.model_loader.reload.refresh import (
+    refresh_quant_method,
+    run_model_refresh,
+    run_post_load_setup,
+)
 from vllm.model_executor.model_loader.weight_cache.utils import (
     is_draft_model_cacheable,
 )
@@ -195,6 +200,21 @@ def process_weights_after_loading(
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
 
+    # Kernel refresh, after every quant PWAL: the same phase order reload runs
+    # (quant PWAL -> kernel refresh -> attention -> layer/model refresh).
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase) and getattr(
+            quant_method, "reload_safe", False
+        ):
+            loading_context = (
+                device_loading_context(module, target_device)
+                if quant_method.requires_device_loading
+                else nullcontext()
+            )
+            with loading_context:
+                refresh_quant_method(module, quant_method)
+
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.
@@ -208,6 +228,11 @@ def process_weights_after_loading(
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
+
+    # Model phase of the post-load contract (`SupportsReload`): the same
+    # refreshes reload runs after landing, then the cold-start-only setup.
+    run_model_refresh(model)
+    run_post_load_setup(model)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

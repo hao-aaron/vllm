@@ -110,6 +110,15 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
         self.weight_scale_name = "weight_scale"
 
         self.fp8_backend, self.experts_cls = select_mxfp8_moe_backend(config=self.moe)
+        from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+        # Backends verified to read the (landed) layer weights and scales
+        # through the quant config, with no other weight-derived state.
+        self.reload_safe = self.fp8_backend in (
+            Fp8MoeBackend.FLASHINFER_TRTLLM,
+            Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.MARLIN,
+        )
 
     def create_weights(
         self,
@@ -195,6 +204,8 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, f"w13_{self.weight_scale_name}", w13_scale)
         replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
 
+        if self.reload_safe and self.moe_kernel is not None:
+            return  # built once; landing + refresh() update it in place
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:
             assert self.experts_cls is not None

@@ -529,6 +529,15 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
             activation_key=activation_key,
             allow_vllm_cutlass=allow_vllm_cutlass,
         )
+        from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+        self.reload_safe = self.fp8_backend in (
+            Fp8MoeBackend.FLASHINFER_CUTLASS,
+            Fp8MoeBackend.FLASHINFER_TRTLLM,
+            Fp8MoeBackend.TRITON,
+            Fp8MoeBackend.DEEPGEMM,
+            Fp8MoeBackend.VLLM_CUTLASS,
+        )
 
     def _setup_kernel(
         self,
@@ -564,6 +573,8 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
         replace_parameter(layer, f"w13_{self.weight_scale_name}", w13_scale)
         replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
 
+        if self.reload_safe and self.moe_kernel is not None:
+            return  # built once; landing + refresh() update it in place
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:
             assert self.experts_cls is not None

@@ -11,7 +11,11 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 
-from .layerwise import finalize_layerwise_reload, initialize_layerwise_reload
+from .layerwise import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+    refresh_derived_state,
+)
 
 logger = init_logger(__name__)
 
@@ -106,6 +110,9 @@ def reload_weights(
             param = get_parameter_for_reload(model, name)  # TODO: buffers?
             param.copy_(loaded_weight)
             loaded_weights.add(name)
+        # kernel-format tensors were written in place: recompute the state
+        # derived from them (MoE alphas / gscales, attention, model buffers)
+        refresh_derived_state(model, model_config)
 
     # logging and validation
     counter_after_reloading = time.perf_counter()
