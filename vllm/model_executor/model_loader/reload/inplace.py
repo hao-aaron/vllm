@@ -11,16 +11,17 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 
+from . import finish_reload, start_reload
+from .core import run_trace
 from .layerwise import (
     abort_reload,
     begin_update,
     end_update,
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
     is_reload_active,
     record_written,
     refresh_derived_state,
 )
+from .units import track_names
 
 logger = init_logger(__name__)
 
@@ -79,6 +80,7 @@ def reload_weights(
     counter_before_reloading = time.perf_counter()
 
     # load weights from disk if none are provided
+    source = None
     if weights_iterator is None:
         model_loader = get_model_loader(load_config)
         if not hasattr(model_loader, "get_all_weights"):
@@ -95,6 +97,10 @@ def reload_weights(
             model_config.revision = None
         weights_iterator = model_loader.get_all_weights(model_config, model)
         weights_iterator = cast(Iterable[tuple[str, torch.Tensor]], weights_iterator)
+        if is_checkpoint_format:
+            # the units this checkpoint delivers, from its headers (its format
+            # can differ from the cold load's, e.g. fused vs split QKV)
+            source = trace_checkpoint(model, model_config.model, model_config.revision)
 
     # begin loading weights
     logger.info_once("Reloading weights inplace...")
@@ -103,14 +109,14 @@ def reload_weights(
     if is_checkpoint_format:
         # load weights from checkpoint/ original model format
         try:
-            initialize_layerwise_reload(model)
+            start_reload(model, source=source)
         except BaseException:
             if is_reload_active(model):
                 abort_reload(model, dirty=False)  # nothing was written yet
             raise
         try:
-            loaded_weights = model.load_weights(weights_iterator)
-            finalize_layerwise_reload(model, model_config)
+            loaded_weights = model.load_weights(track_names(weights_iterator))
+            finish_reload(model, model_config)
         except BaseException:
             if is_reload_active(model):
                 abort_reload(model)
@@ -153,3 +159,77 @@ def reload_weights(
                 "Following weights were not loaded from checkpoint: %s",
                 weights_not_loaded,
             )
+
+
+def trace_checkpoint(
+    model: nn.Module, path: str, revision: str | None = None
+) -> str | None:
+    """Trace `model.load_weights` over a safetensors checkpoint's headers
+    (names, shapes, dtypes; no data), once per checkpoint. Returns the source
+    key of the resulting expected units, or None if the checkpoint has no
+    safetensors headers to trace (the cold-load observation is used)."""
+    import glob
+    import os
+
+    directory = path if os.path.isdir(path) else None
+    if directory is None:
+        try:
+            from vllm.transformers_utils.repo_utils import hf_api
+
+            directory = hf_api().snapshot_download(
+                path,
+                revision=revision,
+                local_files_only=True,
+                allow_patterns=["*.safetensors"],
+            )
+        except Exception:  # noqa: BLE001
+            return None
+    files = sorted(glob.glob(os.path.join(directory, "*.safetensors")))
+    if not files:
+        logger.warning_once(
+            "Reloading %s: no safetensors headers to trace, so the expected "
+            "units come from the cold load (UNVERIFIED if its format differs).",
+            path,
+        )
+        return None
+    key = "checkpoint:" + "|".join(
+        f"{f}:{os.path.getmtime(f)}:{os.path.getsize(f)}" for f in files
+    )
+    if key in model.__dict__.get("_reload_traces", {}):
+        return key
+    run_trace(model, checkpoint_metadata(files), key)
+    return key
+
+
+_SAFETENSORS_DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def checkpoint_metadata(
+    files: list[str],
+) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+    """Names, shapes and dtypes of safetensors files (headers only)."""
+    from safetensors import safe_open
+
+    meta = []
+    for file in files:
+        with safe_open(file, framework="pt") as f:
+            for name in f.keys():  # noqa: SIM118
+                s = f.get_slice(name)
+                dtype = _SAFETENSORS_DTYPES.get(s.get_dtype())
+                if dtype is not None:  # e.g. F8 variants torch lacks
+                    meta.append((name, tuple(s.get_shape()), dtype))
+    return meta

@@ -203,6 +203,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    @property
+    def reload_post_step(self) -> str:
+        """Weight reload: the live layout is the checkpoint layout, and the
+        PWAL only repacks on CPU and XPU."""
+        if current_platform.is_cpu() or current_platform.is_xpu():
+            return "pwal"
+        return "none"
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if current_platform.is_cpu():
             # MLA's kv_b_proj (see `_cpu_skip_gemm_dispatch`): not

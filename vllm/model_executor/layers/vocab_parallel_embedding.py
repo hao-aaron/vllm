@@ -64,6 +64,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    @property
+    def reload_post_step(self) -> str:
+        """Weight reload: the live layout is the checkpoint layout, and the
+        PWAL only repacks on CPU."""
+        return "pwal" if current_platform.is_cpu() else "none"
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm

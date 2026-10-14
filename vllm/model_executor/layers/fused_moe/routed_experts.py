@@ -711,6 +711,11 @@ class RoutedExperts(PluggableLayer):
 
         if expert_id == -1 and not use_global_sf:
             # Failed to load this param since it's not local to this rank
+            from vllm.model_executor.model_loader.reload.units import (
+                report_declined,
+            )
+
+            report_declined()  # weight reload: this call delivered nothing
             return False if return_success else None
         # Hereafter, `expert_id` is local physical id
 

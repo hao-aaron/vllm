@@ -3,7 +3,7 @@
 """IPC-based weight transfer engine using CUDA IPC for communication."""
 
 import pickle
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 import pybase64 as base64
@@ -20,6 +20,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferEngine,
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
+    weight_metadata,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +43,11 @@ class IPCWeightTransferInitInfo(WeightTransferInitInfo):
     not need the buffer size (producer-only)."""
 
     packed: bool = False
+    # (name, dtype name, shape) of every tensor the trainer sends, if known:
+    # weight reload traces load_weights over it once, at init
+    weight_metadata: list[tuple[str, str, list[int]]] | None = field(
+        default=None, repr=False
+    )
 
 
 @dataclass
@@ -57,6 +63,8 @@ class IPCTrainerInitInfo(TrainerInitInfo):
     backend: ClassVar[str] = "ipc"
     packed: bool = False
     packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
+    # ship the source's metadata at init (see `weight_metadata`)
+    send_weight_metadata: bool = True
 
 
 @dataclass
@@ -158,20 +166,16 @@ class IPCWeightTransferEngine(
         self.packed = init_info.packed
 
     def start_weight_update(self) -> None:
-        """Initialize layerwise reloading for the incoming checkpoint weights."""
-        from vllm.model_executor.model_loader.reload import (
-            initialize_layerwise_reload,
-        )
+        """Start reloading the model for the incoming checkpoint weights."""
+        from vllm.model_executor.model_loader.reload import start_reload
 
-        initialize_layerwise_reload(self.model)
+        start_reload(self.model, source="trainer")
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading after all weights have been received."""
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-        )
+        """Finish reloading after all weights have been received."""
+        from vllm.model_executor.model_loader.reload import finish_reload
 
-        finalize_layerwise_reload(self.model, self.model_config)
+        finish_reload(self.model, self.model_config)
         # Every reduce_tensor call is a fresh export with its own refcount
         # slot, so releasing once per update always balances this update's
         # export and lets the trainer reclaim its staging buffer. Callers
@@ -240,9 +244,10 @@ class IPCWeightTransferEngine(
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,
         )
+        from vllm.model_executor.model_loader.reload import track_names
 
         with disable_mtp_completeness_check():
-            self.model.load_weights(weights)
+            self.model.load_weights(track_names(weights))
 
     def shutdown(self) -> None:
         self._packed_importer.close()
@@ -296,10 +301,15 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
             packed=init_info.packed,
             packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
         )
+        # every rank: metadata() may be a collective
+        metadata = weight_metadata(source) if init_info.send_weight_metadata else None
         # IPC needs no data-plane rendezvous. The sender ships the must-agree
         # `packed` flag so the worker decodes exactly as this trainer encodes.
         if engine.is_sender:
-            engine.client.init_weight_transfer_engine({"packed": init_info.packed})
+            payload: dict = {"packed": init_info.packed}
+            if metadata is not None:
+                payload["weight_metadata"] = metadata
+            engine.client.init_weight_transfer_engine(payload)
         return engine
 
     def send_weights(self) -> None:

@@ -1666,7 +1666,11 @@ def test_ipc_trainer_init_ships_packed_to_worker():
     assert engine.is_sender is True
     assert engine.packed is True
     assert client.order == ["init"]
-    assert client.last_init_info == {"packed": True}
+    # (with the trainer's weight metadata: the reload core's expected units)
+    assert client.last_init_info == {
+        "packed": True,
+        "weight_metadata": [("w", "float32", [4])],
+    }
 
 
 def test_nccl_trainer_init_ships_worker_init_info(monkeypatch):
@@ -1707,6 +1711,7 @@ def test_nccl_trainer_init_ships_worker_init_info(monkeypatch):
         "packed": True,
         "packed_buffer_size_bytes": 1024,
         "packed_num_buffers": 3,
+        "weight_metadata": [("w", "float32", [4])],
     }
 
 

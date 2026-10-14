@@ -96,7 +96,14 @@ def test_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs):
     _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs)
 
 
-def _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs):
+# Models whose updates are expected to take the legacy (layerwise) path. The
+# list only shrinks.
+EXPECTED_LEGACY: set[str] = set()
+
+
+def _check_refit_equals_fresh(
+    vllm_runner, model_a, model_b, kwargs, reload_kwargs=None
+):
     kwargs = dict(kwargs)
     common = dict(
         enable_prefix_caching=False,
@@ -115,14 +122,24 @@ def _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs):
         expected = fresh.collective_rpc("mw_checksums")
 
     with vllm_runner(model_a, **common) as llm:
+        # R7: the update takes the reload core, not the legacy path
+        legacy = llm.collective_rpc("mw_route")[0]["legacy"]
+        if model_a not in EXPECTED_LEGACY:
+            assert legacy is None, (
+                f"{model_a} reloads through the legacy path: {legacy}"
+            )
         before = llm.collective_rpc("mw_ptr_snapshot")
         for _ in range(2):  # the second reload runs against built-once kernels
             stats = llm.collective_rpc(
                 "mw_reload",
-                kwargs=dict(path=model_b),
+                kwargs=dict(path=model_b, **(reload_kwargs or {})),
             )
         after = llm.collective_rpc("mw_ptr_snapshot")
         got = llm.collective_rpc("mw_checksums")
+        # the reloaded engine still serves (forwards read every live tensor)
+        assert llm.generate_greedy(["The capital of France is"], 4)
+        if model_a not in EXPECTED_LEGACY:
+            assert llm.collective_rpc("mw_route")[0]["last_plan"] is not None
 
     for rank, (g, e, b, a, st) in enumerate(zip(got, expected, before, after, stats)):
         assert _diff_checksums(g, e) == {"registered": [], "off_registry": []}, (
@@ -160,16 +177,6 @@ def _backend(name, recipe, source, moe_backend, marks=(), **kwargs):
     )
 
 
-# Layerwise reload counts loaded elements to decide when a module is complete.
-# A static per-tensor FP8 MoE checkpoint carries one input scale per w1 and w3
-# shard, both loaded into one per-expert slot, so the count reaches the total
-# early: the module completes before its last weights arrive, and those then
-# land in the live (processed) tensors. Arrival units fix it (reload core).
-_COUNTS_COMPLETE_EARLY = pytest.mark.xfail(
-    strict=True, reason="layerwise reload completes the module early (over-count)"
-)
-
-
 BACKEND_CASES = [
     # Fp8MoEMethod, block FP8
     *(
@@ -179,23 +186,11 @@ BACKEND_CASES = [
     ),
     # Fp8MoEMethod, per-tensor FP8 with static activation scales
     *(
-        _backend(
-            "fp8-tensor-static",
-            "fp8_static",
-            OLMOE,
-            b,
-            marks=[_COUNTS_COMPLETE_EARLY],
-        )
+        _backend("fp8-tensor-static", "fp8_static", OLMOE, b)
         for b in ("triton", "flashinfer_cutlass", "marlin")
     ),
     # (TRT-LLM's per-tensor FP8 MoE kernel doesn't support OLMoE's routing)
-    _backend(
-        "fp8-tensor-static",
-        "fp8_static",
-        QWEN3_MOE,
-        "flashinfer_trtllm",
-        marks=[_COUNTS_COMPLETE_EARLY],
-    ),
+    _backend("fp8-tensor-static", "fp8_static", QWEN3_MOE, "flashinfer_trtllm"),
     # compressed-tensors W8A8 FP8 MoE
     *(
         _backend("ct-fp8", "hub", DSV3_CT_FP8, b)
@@ -286,6 +281,27 @@ def test_model_family_refit_equals_fresh(vllm_runner, name, kwargs):
         pytest.skip("the tiny checkpoints' MoE backends are SM100")
     model_a, model_b = _tiny(name)
     _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs)
+
+
+# R5: any arrival order and batching completes every module correctly. CI runs
+# a few seeds; VLLM_TEST_RELOAD_SEEDS raises it locally.
+_SEEDS = range(int(os.environ.get("VLLM_TEST_RELOAD_SEEDS", "2")))
+
+
+@pytest.mark.slow_test
+@pytest.mark.parametrize("seed", _SEEDS)
+@pytest.mark.parametrize("name,kwargs", TINY_CASES)
+def test_refit_any_order(vllm_runner, name, kwargs, seed):
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("the tiny checkpoints' MoE backends are SM100")
+    model_a, model_b = _tiny(name)
+    _check_refit_equals_fresh(
+        vllm_runner,
+        model_a,
+        model_b,
+        kwargs,
+        reload_kwargs=dict(order="shuffle", seed=seed, batch_size=(1, 7, 64)[seed % 3]),
+    )
 
 
 # ---------------------------------------------------------------------------

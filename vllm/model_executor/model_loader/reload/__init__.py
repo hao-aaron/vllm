@@ -1,22 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Layerwise weight reloading utilities for vLLM.
+"""In-place weight reloading (weight transfer, `reload_weights`).
 
-This module provides functionality to reload model weights layer-by-layer,
-which is useful for weight updates without full model reconstruction.
+`start_reload` / `finish_reload` run an update on the reload core (`core.py`):
+each module loads straight into its live memory when the live bytes can hold
+the checkpoint format, otherwise into scratch, and completes when the units
+its loaders report have arrived. Models that run post-load work inside
+`load_weights`, or whose loads were never observed, take the legacy layerwise
+path (`layerwise.py`; `VLLM_RELOAD_LEGACY=1` selects it everywhere).
 
-Limitations:
-1. Composition with CPU offloading has not been implemented
-2. Tied parameters will only reflect processing from one of the parent layers (for
-   example, only processing from embed_tokens will have an effect)
-3. This design assumes that the number of weights loaded from disk is the same as the
-   number of weights created at model init time. This is not true for quant methods
-   which (1) pad weights or (2) load qkv weights into the same parameter. Both of these
-   cases are non-issues for today's quant methods, but future quantizations may cause
-   reloading to fail
+Limitations: CPU weight offloading and EPLB rebalancing are not supported (an
+update is refused).
 """
 
+import torch
+
 __all__ = [
+    "start_reload",
+    "finish_reload",
+    "report_units",
+    "report_declined",
+    "current_load",
+    "track_names",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -63,4 +68,48 @@ from .torchao_decorator import (
     set_torchao_reload_attrs,
     support_quantized_model_reload_from_hp_weights,
 )
+from .units import current_load, report_declined, report_units, track_names
 from .verify import ReloadReport, ReloadStatus, merge_reload_reports, verify_reload
+
+
+def start_reload(
+    model: torch.nn.Module,
+    partial: bool | None = None,
+    modules: list[str] | tuple[str, ...] | None = None,
+    source: str | None = None,
+) -> None:
+    """Begin a weight update: the reload core, or the legacy layerwise path
+    (`VLLM_RELOAD_LEGACY=1`, models that run post-load work inside
+    `load_weights`, or whose loads were never observed). `source` names the
+    expected-unit set ("trainer", or a checkpoint trace key)."""
+    from .core import legacy_reason, start_core
+
+    reason = legacy_reason(model, source)
+    if reason is None:
+        start_core(model, partial=partial, modules=modules, source=source)
+        return
+    _log_legacy(model, reason)
+    initialize_layerwise_reload(model, partial=partial, modules=modules)
+
+
+def finish_reload(model: torch.nn.Module, model_config) -> None:
+    """Finish the weight update `start_reload` began."""
+    from .core import core_active, finish_core
+
+    if core_active(model):
+        finish_core(model, model_config)
+    else:
+        finalize_layerwise_reload(model, model_config)
+
+
+def _log_legacy(model, reason: str) -> None:
+    from vllm.logger import init_logger
+
+    logged = model.__dict__.setdefault("_reload_legacy_logged", set())
+    if reason not in logged:
+        logged.add(reason)
+        init_logger(__name__).warning(
+            "%s reloads through the legacy (layerwise) path: %s.",
+            type(model).__name__,
+            reason,
+        )

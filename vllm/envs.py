@@ -338,6 +338,11 @@ if TYPE_CHECKING:
     VLLM_RELOAD_STRICT_LANDING: bool = True
     VLLM_RELOAD_STRICT_MODEL_HOOK: bool = False
     VLLM_RELOAD_ALLOW_UNSAFE: bool = False
+    VLLM_RELOAD_LEGACY: bool = False
+    VLLM_RELOAD_DIRECT: bool = True
+    VLLM_RELOAD_SHADOW_COUNT: bool = False
+    VLLM_RELOAD_OBSERVE_COLD: bool = True
+    VLLM_RELOAD_OBSERVE_WRITES: bool = False
 
 
 def get_default_cache_root():
@@ -2308,6 +2313,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Weight updates: run even when the reload verifier reports known-wrong items.
     "VLLM_RELOAD_ALLOW_UNSAFE": lambda: bool(
         int(os.getenv("VLLM_RELOAD_ALLOW_UNSAFE", "0"))
+    ),
+    # Weight updates: 1 sends every update through the legacy layerwise path
+    # instead of the reload core.
+    "VLLM_RELOAD_LEGACY": lambda: bool(int(os.getenv("VLLM_RELOAD_LEGACY", "0"))),
+    # Weight updates: 0 disables DIRECT loading into live memory, so every
+    # module loads through MODULEWISE scratch.
+    "VLLM_RELOAD_DIRECT": lambda: bool(int(os.getenv("VLLM_RELOAD_DIRECT", "1"))),
+    # Weight updates (development): also count loaded elements as layerwise
+    # reload does and record where count-based completion would disagree.
+    "VLLM_RELOAD_SHADOW_COUNT": lambda: bool(
+        int(os.getenv("VLLM_RELOAD_SHADOW_COUNT", "0"))
+    ),
+    # Weight updates: observe the cold load's loader calls as the fallback set
+    # of expected units; 0 skips the observation.
+    "VLLM_RELOAD_OBSERVE_COLD": lambda: bool(
+        int(os.getenv("VLLM_RELOAD_OBSERVE_COLD", "1"))
+    ),
+    # Weight updates (CI): check that every write to a model tensor during an
+    # update goes through a weight loader.
+    "VLLM_RELOAD_OBSERVE_WRITES": lambda: bool(
+        int(os.getenv("VLLM_RELOAD_OBSERVE_WRITES", "0"))
     ),
 }
 

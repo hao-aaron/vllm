@@ -135,9 +135,36 @@ def verify_reload(
     _check_declarations(model, report)
     _check_ownership(model, report)
     _check_structure(model, report)
+    _check_load_path(model, report)
     if vllm_config is not None:
         _check_configuration(model, vllm_config, report)
     return report
+
+
+def _check_load_path(model: torch.nn.Module, report: ReloadReport) -> None:
+    """6.4: which reload path updates take, and what their completeness is
+    checked against."""
+    from .core import legacy_reason
+
+    traces = model.__dict__.get("_reload_traces", {})
+    source = "trainer" if "trainer" in traces else None
+    reason = legacy_reason(model, source)
+    if reason is not None:
+        report.add(
+            "6.4",
+            "",
+            f"weight updates take the legacy (layerwise) reload path: {reason}",
+            UNVERIFIED,
+        )
+    elif source is None:
+        report.add(
+            "6.4",
+            "",
+            "update completeness is checked against the cold load's units: a "
+            "sender whose format differs (e.g. fused vs split QKV) is checked per "
+            "tensor; ship the trainer's weight metadata at init for an exact check",
+            UNVERIFIED,
+        )
 
 
 # ---------------------------------------------------------------------------

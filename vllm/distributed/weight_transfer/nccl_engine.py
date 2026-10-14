@@ -22,6 +22,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightSource,
     WeightTransferEngine,
     WeightTransferUpdateInfo,
+    weight_metadata,
 )
 from vllm.distributed.weight_transfer.nccl_common import (
     NCCLWeightTransferInitInfo,
@@ -78,6 +79,8 @@ class NCCLTrainerInitInfo(TrainerInitInfo):
     packed: bool = True
     packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
     packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
+    # ship the source's metadata at init (see `weight_metadata`)
+    send_weight_metadata: bool = True
 
 
 @dataclass
@@ -157,20 +160,16 @@ class NCCLWeightTransferEngine(
         )
 
     def start_weight_update(self) -> None:
-        """Initialize layerwise reloading for the incoming checkpoint weights."""
-        from vllm.model_executor.model_loader.reload import (
-            initialize_layerwise_reload,
-        )
+        """Start reloading the model for the incoming checkpoint weights."""
+        from vllm.model_executor.model_loader.reload import start_reload
 
-        initialize_layerwise_reload(self.model)
+        start_reload(self.model, source="trainer")
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading after all weights have been received."""
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-        )
+        """Finish reloading after all weights have been received."""
+        from vllm.model_executor.model_loader.reload import finish_reload
 
-        finalize_layerwise_reload(self.model, self.model_config)
+        finish_reload(self.model, self.model_config)
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         """Receive weights from trainer via NCCL broadcast.
@@ -194,6 +193,7 @@ class NCCLWeightTransferEngine(
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,
         )
+        from vllm.model_executor.model_loader.reload import track_names
 
         with disable_mtp_completeness_check():
             if self.packed:
@@ -209,7 +209,9 @@ class NCCLWeightTransferEngine(
                     iterator=state_dict_info_iterator(),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=self.model.load_weights,
+                    post_unpack_func=lambda weights: self.model.load_weights(
+                        track_names(weights)
+                    ),
                     buffer_size_bytes=self.packed_buffer_size_bytes,
                     num_buffers=self.packed_num_buffers,
                     device=self.device,
@@ -224,7 +226,7 @@ class NCCLWeightTransferEngine(
                     self.model_update_group.broadcast(
                         weight, src=0, stream=torch.cuda.current_stream()
                     )
-                    self.model.load_weights([(name, weight)])
+                    self.model.load_weights(track_names([(name, weight)]))
                     del weight
 
     def shutdown(self) -> None:
@@ -285,6 +287,8 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
             packed_num_buffers=init_info.packed_num_buffers,
         )
+        # every rank: metadata() may be a collective
+        metadata = weight_metadata(source) if init_info.send_weight_metadata else None
         if not engine.is_sender:
             # Non-sender trainer ranks aren't part of the transfer NCCL group and
             # don't drive the inference side; they only participate in the
@@ -300,6 +304,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             packed=init_info.packed,
             packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
             packed_num_buffers=init_info.packed_num_buffers,
+            weight_metadata=metadata,
         )
 
         # The inference workers block inside init_weight_transfer_engine waiting

@@ -101,6 +101,11 @@ class NCCLWeightTransferInitInfo(WeightTransferInitInfo):
     packed: bool = False
     packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
     packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
+    # (name, dtype name, shape) of every tensor the trainer sends, if known:
+    # weight reload traces load_weights over it once, at init
+    weight_metadata: list[tuple[str, str, list[int]]] | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         _ = self.nccl_unique_id_bytes

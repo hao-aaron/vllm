@@ -1527,6 +1527,21 @@ class Worker(WorkerBase):
         # Parse dict into backend-specific typed dataclass
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
+        # The trainer's names / shapes / dtypes: the exact units its updates
+        # deliver, from a dry run of load_weights (no data)
+        metadata = getattr(typed_init_info, "weight_metadata", None)
+        if metadata:
+            from vllm.model_executor.model_loader.reload.core import run_trace
+
+            with set_current_vllm_config(self.vllm_config):
+                run_trace(
+                    self.weight_transfer_engine.model,
+                    [
+                        (name, tuple(shape), getattr(torch, dtype_name))
+                        for name, dtype_name, shape in metadata
+                    ],
+                    "trainer",
+                )
 
     def shutdown_weight_transfer_engine(self) -> None:
         """Release a trainer connection without shutting down inference."""

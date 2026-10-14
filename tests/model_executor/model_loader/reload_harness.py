@@ -306,6 +306,7 @@ class ReloadHarnessExtension:
         max_batch_bytes = 0
         max_held_after_batch = 0
         held_series: list[int] = []
+        measure_seconds = 0.0  # the per-batch gc and memory reads below
         t0 = time.perf_counter()
         sent = 0
         with set_current_vllm_config(self.vllm_config):
@@ -334,12 +335,14 @@ class ReloadHarnessExtension:
                     sent += len(refs)
                     if fail_after is not None and sent >= fail_after:
                         raise RuntimeError("harness: injected failure")
+                    t_measure = time.perf_counter()
                     gc.collect()  # loader generator chains can hold cycles
                     alive = [n for n, r in refs if r() is not None]
                     retained.extend(alive)
                     held = torch.accelerator.memory_allocated() - base
                     max_held_after_batch = max(max_held_after_batch, held)
                     held_series.append(held)
+                    measure_seconds += time.perf_counter() - t_measure
                 finish(model, self.model_config)
             except BaseException:
                 abort = getattr(reload_api, "abort_reload", None)
@@ -360,8 +363,24 @@ class ReloadHarnessExtension:
             "batch_size": batch_size,
             "order": order,
             "seconds": dt,
+            "measure_seconds": measure_seconds,
         }
         return stats
+
+    def mw_route(self) -> dict:
+        """Which reload path an update takes, and why (legacy routing)."""
+        from vllm.model_executor.model_loader.reload.core import legacy_reason
+
+        model = self._mw_model()
+        return {
+            "legacy": legacy_reason(model),
+            "sources": sorted(model.__dict__.get("_reload_traces", {})),
+            "last_plan": model.__dict__.get("_reload_last_plan"),
+            "shadow": {
+                f"{kind} ({cls})": n
+                for (kind, cls), n in model.__dict__.get("_reload_shadow", {}).items()
+            },
+        }
 
     def mw_call(self, fn_path: str, *args, **kwargs):
         """Call ``module:function(model, *args)`` in the worker."""

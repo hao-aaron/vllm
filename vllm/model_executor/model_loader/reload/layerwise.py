@@ -69,6 +69,10 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
     WeakKeyDictionary()
 )
 
+# weight_loader wrappers reload installs (layerwise, and the reload core's,
+# which observes the cold load on top of online quantization's)
+_RELOAD_WRAPPERS = ("online_process_loader", "core_loader")
+
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
 
@@ -179,7 +183,7 @@ def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
     for name, tensor in get_layer_tensors(layer).items():
         if name in SKIP_LOAD_TENSORS:
             continue
-        if _get_weight_loader(tensor).__name__ != "online_process_loader":
+        if _get_weight_loader(tensor).__name__ not in _RELOAD_WRAPPERS:
             tensor.weight_loader = make_online_process_loader(layer, name)
 
 
@@ -550,7 +554,7 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
 def _get_original_loader(tensor: torch.Tensor) -> Callable:
     """Return the weight loader with any layerwise wrappers removed."""
     loader = _get_weight_loader(tensor)
-    while loader.__name__ == "online_process_loader":
+    while loader.__name__ in _RELOAD_WRAPPERS:
         loader = loader.__wrapped__  # type: ignore[union-attr]
 
     return loader
@@ -998,6 +1002,9 @@ def abort_reload(model: torch.nn.Module, dirty: bool = True) -> None:
     completed (or written outside a loader) must be re-completed by a later
     successful update before the model serves again. `dirty=False` for a
     start that failed before any write."""
+    from .core import abort_core
+
+    abort_core(model)
     for layer in model.modules():
         info = LAYERWISE_INFO.get(layer)
         if info is None or not info.can_load():
@@ -1006,7 +1013,7 @@ def abort_reload(model: torch.nn.Module, dirty: bool = True) -> None:
             _place_kernel_tensors(layer, info)
         for tensor in get_layer_tensors(layer).values():
             loader = getattr(tensor, "weight_loader", None)
-            if getattr(loader, "__name__", None) == "online_process_loader":
+            if getattr(loader, "__name__", None) in _RELOAD_WRAPPERS:
                 tensor.weight_loader = _get_original_loader(tensor)
         info.reset()
     if hasattr(model, "_original_do_torchao_reload"):
@@ -1034,6 +1041,10 @@ def is_model_dirty(model: torch.nn.Module) -> bool:
 
 
 def is_reload_active(model: torch.nn.Module) -> bool:
+    from .core import note_reload_active_query
+
+    if note_reload_active_query():  # a trace stands in for a reload
+        return True
     session = get_reload_session(model)
     return session is not None and session.active
 

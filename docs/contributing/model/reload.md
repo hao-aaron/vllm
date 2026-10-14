@@ -2,11 +2,28 @@
 
 RL frameworks update a running engine's weights in place
 (`start_weight_update` → `update_weights` → `finish_weight_update`, or
-`reload_weights`). Reload restores each module's checkpoint-format params,
-runs the model's own `load_weights` and weight loaders on the new tensors,
-re-runs each module's post-load processing, and lands the results in the
-live tensors, which captured CUDA graphs keep reading. Then every
-weight-derived value is recomputed in place.
+`reload_weights`). The model's own `load_weights` and weight loaders run on
+the new tensors; each module's post-load processing runs again, and its
+results land in the live tensors, which captured CUDA graphs keep reading.
+Then every weight-derived value is recomputed in place.
+
+Each module takes one of two paths, chosen at the start of every update from
+what was recorded at model init:
+
+- **direct**: loaders write live memory, either the live tensor itself (its
+  shape, stride and dtype are the checkpoint's) or a checkpoint-layout view of
+  its bytes. Scales whose live form is smaller than their checkpoint form are
+  staged in small side buffers. No extra memory; the live bytes hold the
+  update from the first write.
+- **modulewise**: loaders write a fresh checkpoint-format scratch tensor (e.g.
+  online quantization, where the BF16 checkpoint doesn't fit the FP8 live
+  bytes); the live bytes are untouched until the module lands.
+
+`VLLM_RELOAD_DIRECT=0` forces modulewise everywhere. A module completes when
+every unit it expects arrived (see below): its post-load processing runs and
+its results land. Models that run post-load work inside `load_weights`, or
+whose loads were never observed, use the legacy layerwise path
+(`VLLM_RELOAD_LEGACY=1` selects it for every model).
 
 Cold start and reload run the same phases, in the same order:
 
@@ -37,6 +54,9 @@ A model that implements `SupportsReload` does not define a model-level
 
 Loaders:
 
+- **L0.** No post-load work inside `load_weights` (no `is_reload_active()`
+  checks, no writes outside loaders): with direct loading it would run on live
+  bytes mid-update. Such models take the legacy path.
 - **L1.** Every write to a loadable param goes through that param's
   `weight_loader`. `load_weights` only routes names. During a reload the
   params are meta placeholders until a loader runs, so `param.data.copy_(...)`
@@ -60,6 +80,13 @@ Post-load processing (PWAL):
 - **P5.** Don't set params to `None` or delete submodules reload needs.
 - **P6.** A MoE method whose kernel holds undeclared derived state keeps
   `reload_safe = False`; under CUDA graphs reload refuses it.
+- **P7.** A quant method may declare `reload_post_step`: `"pwal"` (default,
+  runs when the module's units arrived), `"pwal_at_finish"` (runs at finish,
+  after every other module landed: required when the PWAL runs collectives or
+  reads another module's weights), or `"none"` (only when the live layout is
+  the checkpoint layout, or the transform happens in the loader; each
+  declaration needs a refit-equals-fresh case on the hardware it's declared
+  for).
 
 Refresh (`refresh_model`, kernel `refresh`, `register_refresh`):
 
@@ -76,6 +103,23 @@ construction instead of monkeypatching `quant_method.process_weights_after_loadi
 or rewriting the layer's tensors from a model hook. `before_pwal` sees the
 checkpoint-format tensors, `after_pwal` the PWAL results; both run on every
 load and their results land once.
+
+## Arrival units
+
+Every loader call reports what it delivered: a whole tensor, one shard of a
+fused linear (`loaded_shard_id`), or one expert's shard (`shard_id`,
+`expert_id`); the framework infers these from the loader's arguments. A loader
+that declines data belonging to another rank calls `report_declined()`; one
+that writes a tensor over several calls whose arguments don't say which part
+calls `report_units(...)`.
+
+An update's expected units come, in order of preference, from a dry run of
+`load_weights` over the trainer's metadata (shipped at
+`init_weight_transfer_engine`), over a reloaded checkpoint's safetensors
+headers, or from the units the cold load delivered. At finish, a module that
+received only some of its units fails the update: its live bytes would be
+mixed. A unit whose tensor was created with a meaningful value (ones, scale
+sentinels) is optional unless the sender's own metadata lists it.
 
 ## Integrity
 

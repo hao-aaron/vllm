@@ -264,6 +264,17 @@ class ModuleSource(WeightSource):
             yield name, materialize_full_tensor(param)
 
 
+def weight_metadata(source: WeightSource) -> list[tuple[str, str, list[int]]]:
+    """`(name, dtype name, shape)` of every tensor `source` sends, for the
+    worker init info: inference workers trace their weight loading over it
+    once, so each update's completeness is checked against the trainer's own
+    contract. `metadata()` may be a collective: call it on every rank."""
+    return [
+        (m.name, str(m.dtype).removeprefix("torch."), list(m.shape))
+        for m in source.metadata()
+    ]
+
+
 # Base protocols for backend-specific dataclasses
 @dataclass
 class WeightTransferInitInfo(ABC):  # noqa: B024

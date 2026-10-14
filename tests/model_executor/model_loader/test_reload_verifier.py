@@ -72,7 +72,8 @@ def _items(report, check):
 def test_declarations():
     assert _items(verify_reload(_Model()), "6.1") == [("", UNVERIFIED)]
     assert _items(verify_reload(_Reloadable()), "6.1") == []
-    assert verify_reload(_Reloadable()).status == SAFE
+    # (6.4 reports the load path: these toy models' loads were never observed)
+    assert {i.check for i in verify_reload(_Reloadable()).items} == {"6.4"}
     assert _items(verify_reload(_HookedReloadable()), "6.1") == [("", UNSAFE)]
 
     class _Hooked(_Model):
@@ -163,7 +164,9 @@ def test_merge_reports():
     b = verify_reload(_HookedReloadable()).to_dict()
     merged = merge_reload_reports([a, b])
     assert merged["status"] == "UNSAFE"
-    assert [(i["rank"], i["check"]) for i in merged["items"]] == [(1, "6.1")]
+    assert [
+        (i["rank"], i["check"]) for i in merged["items"] if i["check"] != "6.4"
+    ] == [(1, "6.1")]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="device tensors")
@@ -212,3 +215,18 @@ def test_check_reload_support_on_an_engine(vllm_runner):
         report = runner.llm.check_reload_support()
     assert report["status"] in ("SAFE", "UNVERIFIED")
     assert not [i for i in report["items"] if i["status"] == "UNSAFE"]
+
+
+def test_load_path_is_reported():
+    from vllm.model_executor.model_loader.reload.core import observe_cold_load
+
+    model = _Reloadable()
+    record_metadata_for_reloading(model)
+    assert "legacy" in _items_reasons(verify_reload(model), "6.4")[0]
+    with observe_cold_load(model):
+        pass  # an observed cold load that wrote nothing outside loaders
+    assert "cold load" in _items_reasons(verify_reload(model), "6.4")[0]
+
+
+def _items_reasons(report, check):
+    return [i.reason for i in report.items if i.check == check]
