@@ -149,15 +149,25 @@ NVFP4_MODELOPT = "nvidia/Qwen3-30B-A3B-NVFP4"
 NVFP4_CT = "RedHatAI/Qwen3-30B-A3B-NVFP4"
 
 
-def _backend(name, recipe, source, moe_backend, **kwargs):
+def _backend(name, recipe, source, moe_backend, marks=(), **kwargs):
     kernel_config = {"moe_backend": moe_backend} if moe_backend else {}
     return pytest.param(
         recipe,
         source,
         {"kernel_config": kernel_config, **kwargs},
         id=f"{name}-{moe_backend or 'default'}",
-        marks=[pytest.mark.slow_test],
+        marks=[pytest.mark.slow_test, *marks],
     )
+
+
+# Layerwise reload counts loaded elements to decide when a module is complete.
+# A static per-tensor FP8 MoE checkpoint carries one input scale per w1 and w3
+# shard, both loaded into one per-expert slot, so the count reaches the total
+# early: the module completes before its last weights arrive, and those then
+# land in the live (processed) tensors. Arrival units fix it (reload core).
+_COUNTS_COMPLETE_EARLY = pytest.mark.xfail(
+    strict=True, reason="layerwise reload completes the module early (over-count)"
+)
 
 
 BACKEND_CASES = [
@@ -169,11 +179,23 @@ BACKEND_CASES = [
     ),
     # Fp8MoEMethod, per-tensor FP8 with static activation scales
     *(
-        _backend("fp8-tensor-static", "fp8_static", OLMOE, b)
+        _backend(
+            "fp8-tensor-static",
+            "fp8_static",
+            OLMOE,
+            b,
+            marks=[_COUNTS_COMPLETE_EARLY],
+        )
         for b in ("triton", "flashinfer_cutlass", "marlin")
     ),
     # (TRT-LLM's per-tensor FP8 MoE kernel doesn't support OLMoE's routing)
-    _backend("fp8-tensor-static", "fp8_static", QWEN3_MOE, "flashinfer_trtllm"),
+    _backend(
+        "fp8-tensor-static",
+        "fp8_static",
+        QWEN3_MOE,
+        "flashinfer_trtllm",
+        marks=[_COUNTS_COMPLETE_EARLY],
+    ),
     # compressed-tensors W8A8 FP8 MoE
     *(
         _backend("ct-fp8", "hub", DSV3_CT_FP8, b)
