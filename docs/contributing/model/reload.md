@@ -17,7 +17,10 @@ what was recorded at model init:
   update from the first write.
 - **modulewise**: loaders write a fresh checkpoint-format scratch tensor (e.g.
   online quantization, where the BF16 checkpoint doesn't fit the FP8 live
-  bytes); the live bytes are untouched until the module lands.
+  bytes); the live bytes are untouched until the module lands. Tensors from
+  the CPU (a reload from disk) are buffered in host memory and loaded when
+  the module's last one arrived. The cold load of online-quantized models
+  takes this path too.
 
 `VLLM_RELOAD_DIRECT=0` forces modulewise everywhere. A module completes when
 every unit it expects arrived (see below): its post-load processing runs and

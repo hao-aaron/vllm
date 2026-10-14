@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 
 from . import finish_reload, start_reload
-from .core import run_trace
+from .core import checkpoint_metadata, run_trace
 from .layerwise import (
     abort_reload,
     begin_update,
@@ -199,37 +199,3 @@ def trace_checkpoint(
         return key
     run_trace(model, checkpoint_metadata(files), key)
     return key
-
-
-_SAFETENSORS_DTYPES = {
-    "F64": torch.float64,
-    "F32": torch.float32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "F8_E4M3": torch.float8_e4m3fn,
-    "F8_E5M2": torch.float8_e5m2,
-    "F8_E8M0": torch.float8_e8m0fnu,
-    "I64": torch.int64,
-    "I32": torch.int32,
-    "I16": torch.int16,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "BOOL": torch.bool,
-}
-
-
-def checkpoint_metadata(
-    files: list[str],
-) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-    """Names, shapes and dtypes of safetensors files (headers only)."""
-    from safetensors import safe_open
-
-    meta = []
-    for file in files:
-        with safe_open(file, framework="pt") as f:
-            for name in f.keys():  # noqa: SIM118
-                s = f.get_slice(name)
-                dtype = _SAFETENSORS_DTYPES.get(s.get_dtype())
-                if dtype is not None:  # e.g. F8 variants torch lacks
-                    meta.append((name, tuple(s.get_shape()), dtype))
-    return meta

@@ -22,7 +22,10 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
-from vllm.model_executor.model_loader.reload.core import observe_cold_load
+from vllm.model_executor.model_loader.reload.core import (
+    cold_online_load,
+    observe_cold_load,
+)
 from vllm.model_executor.model_loader.reload.layerwise import record_cold_load
 from vllm.model_executor.model_loader.reload.units import track_names
 from vllm.model_executor.model_loader.weight_utils import (
@@ -498,8 +501,12 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
         # Observed for weight reload: the units each loader call delivers (the
-        # fallback expected set of an update) and any write outside loaders
-        with observe_cold_load(model):
+        # fallback expected set of an update) and any write outside loaders.
+        # Online-quantized modules load on the reload core (MODULEWISE).
+        with (
+            observe_cold_load(model),
+            cold_online_load(model, self._primary_safetensors(model_config, model)),
+        ):
             loaded_weights = model.load_weights(
                 track_names(self.get_all_weights(model_config, model))
             )
@@ -525,6 +532,20 @@ class DefaultModelLoader(BaseModelLoader):
             self.track_weights_loading(
                 model, loaded_weights, quantized=model_config.quantization is not None
             )
+
+    def _primary_safetensors(self, model_config: ModelConfig, model: nn.Module):
+        """The safetensors files of the primary source, when they are all the
+        weights `get_all_weights` yields (else []: nothing to trace)."""
+        if getattr(model, "secondary_weights", ()) or self._encoder_only_lm_prefixes:
+            return []
+        _, files, use_safetensors, _ = self._prepare_weights(
+            model_config.model,
+            None,
+            model_config.revision,
+            getattr(model, "fall_back_to_pt_during_load", True),
+            getattr(model, "allow_patterns_overrides", None),
+        )
+        return files if use_safetensors else []
 
     def track_weights_loading(
         self,

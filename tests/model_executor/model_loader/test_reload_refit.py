@@ -435,3 +435,38 @@ def make_fp8_static(src: str, dst: str) -> str:
         json.dump({"metadata": {}, "weight_map": weight_map}, f)
     open(os.path.join(dst, _DONE), "w").close()
     return dst
+
+
+# The cold load of online-quantized modules runs on the reload core (header
+# trace, buffered per module, quantized as each completes): it must produce
+# the same weights as layerwise online processing (VLLM_RELOAD_LEGACY=1).
+ONLINE_COLD_CASES = [
+    pytest.param(OLMOE, "fp8_per_tensor", id="olmoe-fp8"),
+    pytest.param("Qwen/Qwen3-0.6B", "int8_per_channel_weight_only", id="qwen3-int8"),
+    pytest.param("Qwen/Qwen3-0.6B", "mxfp8", id="qwen3-mxfp8"),
+]
+
+
+@pytest.mark.slow_test
+@pytest.mark.parametrize("model,quantization", ONLINE_COLD_CASES)
+def test_online_cold_start_matches_layerwise(
+    vllm_runner, monkeypatch, model, quantization
+):
+    if not current_platform.is_cuda():
+        pytest.skip("online quantization kernels")
+    common = dict(
+        quantization=quantization,
+        enforce_eager=True,
+        max_model_len=256,
+        gpu_memory_utilization=0.4,
+        worker_extension_cls=HARNESS,
+    )
+    sums = {}
+    for legacy in ("1", "0"):
+        monkeypatch.setenv("VLLM_RELOAD_LEGACY", legacy)
+        with vllm_runner(model, **common) as llm:
+            sums[legacy] = llm.collective_rpc("mw_checksums")
+    assert _diff_checksums(sums["0"][0], sums["1"][0]) == {
+        "registered": [],
+        "off_registry": [],
+    }

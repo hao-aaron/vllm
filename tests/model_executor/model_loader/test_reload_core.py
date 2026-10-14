@@ -3,6 +3,9 @@
 """The reload core: per-module DIRECT / MODULEWISE paths chosen from metadata,
 explicit arrival units, coverage at finish, and routing to the legacy path."""
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -579,6 +582,193 @@ def test_none_params_survive_an_update():
     assert "bias" in model.fused._parameters and model.fused.bias is None
 
 
+class _Wrapped:
+    """Not a tensor: like Triton MXFP4's triton_kernels weight wrapper."""
+
+    def __init__(self, data: torch.Tensor):
+        self.data = data
+
+
+def _wrap_weight(layer):
+    """PWAL deleting the param and keeping a wrapper under its name, refilled
+    in place on later loads (Triton MXFP4)."""
+    w = layer.weight.data.clone()
+    del layer.weight
+    live = layer.__dict__.get("_wrapped_live")
+    if live is None:
+        live = layer._wrapped_live = _Wrapped(w)
+    else:
+        live.data.copy_(w)
+    layer.weight = live
+
+
+def test_param_replaced_by_a_plain_attribute_survives_an_update():
+    model = _Model({"fused": _Fused(method=_Method(_wrap_weight))})
+    _cold(model, _fused_weights(1.0))
+    live = model.fused.weight
+    assert isinstance(live, _Wrapped)
+    _update(model, _fused_weights(2.0))
+    assert model.fused.weight is live and "weight" not in model.fused._parameters
+    assert live.data[0, 0] == 2.0 and live.data[4, 0] == 4.0
+
+
+# ---------------------------------------------------------------------------
+# Attention KV scales as side tensors; CPU incoming buffered for MODULEWISE;
+# cold start of online-quantized modules on the core
+# ---------------------------------------------------------------------------
+
+
+class _KVMethod(QuantizeMethodBase):
+    """Like BaseKVCacheMethod: scale params created at -1, consumed into a
+    live buffer by PWAL and deleted."""
+
+    def create_weights(self, layer, *a, **k):
+        layer.k_scale = _param(torch.tensor(-1.0))
+
+    def apply(self, layer, *a, **k):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        if not hasattr(layer, "k_scale"):
+            return  # nothing arrived (e.g. a weight update without scales)
+        k = layer.k_scale.detach()
+        layer._k_scale.copy_(torch.where(k > 0, k, torch.ones_like(k)))
+        del layer.k_scale
+
+
+class _Attn(torch.nn.Module):
+    def __init__(self):
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
+
+        super().__init__()
+        self.__class__ = type("_AttnLayer", (_Attn, AttentionLayerBase), {})
+        self.quant_method = _KVMethod()
+        self.quant_method.create_weights(self)
+        self.register_buffer("_k_scale", torch.ones(()))
+        self.pwal_calls = 0
+
+    def get_attn_backend(self):
+        raise NotImplementedError
+
+    def get_kv_cache_spec(self, vllm_config):
+        return None
+
+    def process_weights_after_loading(self, act_dtype):
+        self.pwal_calls += 1
+
+
+def test_kv_scales_are_side_tensors_landed_in_the_attention_phase():
+    attn = _Attn()
+    model = _Model({"attn": attn, "fused": _Fused(method=_Method(post="none"))})
+    _cold(model, [("attn.k_scale", torch.tensor(2.0)), *_fused_weights(1.0)])
+    live = model.attn._k_scale
+    assert not hasattr(model.attn, "k_scale") and float(live) == 2.0
+    start_reload(model)
+    state = core._core(model).modules["attn"]
+    assert state.targets["k_scale"].kind in (core.SIDE, core.SCRATCH)
+    model.load_weights(track_names([("attn.k_scale", torch.tensor(3.0))]))
+    model.load_weights(track_names(_fused_weights(2.0)))
+    standin = weakref.ref(state.targets["k_scale"].standin)
+    gc.disable()  # the stand-in is released at finish, not by a later collection
+    try:
+        finish_reload(model, _cfg())
+        assert standin() is None
+    finally:
+        gc.enable()
+    assert model.attn._k_scale is live and float(live) == 3.0
+    assert not hasattr(model.attn, "k_scale")
+    # an update without scales leaves them (and the layer re-runs its PWAL)
+    calls = model.attn.pwal_calls
+    _update(model, _fused_weights(3.0))
+    assert float(live) == 3.0 and model.attn.pwal_calls == calls + 1
+
+
+def test_cpu_incoming_into_a_modulewise_module_is_buffered_and_replayed_once():
+    seen = []
+
+    def quantize(layer):
+        replace_parameter(layer, "weight", layer.weight.to(torch.int8))
+
+    layer = torch.nn.Module()
+    layer.quant_method = _Method(quantize)
+
+    def loader(param, loaded_weight):
+        seen.append(param.device.type)
+        param.data.copy_(loaded_weight)
+
+    layer.weight = _param(torch.zeros(2, 2), loader)
+    model = _Model({"q": layer})
+    _cold(model, [("q.weight", torch.ones(2, 2))])
+    seen.clear()
+    start_reload(model)
+    state = core._core(model).modules["q"]
+    model.load_weights(track_names([("q.weight", torch.full((2, 2), 4.0))]))
+    assert seen == ["cpu"]  # replayed once, into scratch, at completion
+    assert state.completed and not state.buffered
+    finish_reload(model, _cfg())
+    assert torch.equal(model.q.weight, torch.full((2, 2), 4, dtype=torch.int8))
+
+
+def test_cold_start_of_online_quantized_modules(tmp_path):
+    """Online quantization at cold start: the meta (BF16-format) module loads
+    on the core, buffered and credited against a header trace, quantized when
+    its units arrived; layerwise online processing stands down."""
+    from safetensors.torch import save_file
+
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_processing,
+        initialize_online_processing,
+    )
+
+    calls = []
+
+    class _Online(_Method):
+        uses_meta_device = True
+
+        def process_weights_after_loading(self, layer):
+            if getattr(layer, "_already_called_process_weights_after_loading", 0):
+                return
+            calls.append(layer.weight.device.type)
+            replace_parameter(layer, "weight", (layer.weight * 2).to(torch.int8))
+            layer._already_called_process_weights_after_loading = True
+
+    def build():
+        q = torch.nn.Module()
+        q.quant_method = _Online()
+        q.weight = _param(torch.empty(2, 3, device="meta"))
+        return _Model({"q": q, "fused": _Fused(method=_Method(post="none"))})
+
+    weights = {"q.weight": torch.full((2, 3), 3.0)}
+    weights.update(dict(_fused_weights(1.0)))
+    save_file(weights, str(tmp_path / "model.safetensors"))
+    files = [str(tmp_path / "model.safetensors")]
+
+    model = build()
+    record_metadata_for_reloading(model)
+    initialize_online_processing(model.q)
+    with core.observe_cold_load(model), core.cold_online_load(model, files):
+        model.load_weights(track_names([("q.weight", weights["q.weight"])]))
+        # q completed during the load and its BF16 scratch is gone (the PWAL
+        # result is the module's tensor): the peak is one module's scratch
+        q = core._core(model).modules["q"]
+        assert q.completed and q.targets["weight"].standin.numel() == 0
+        model.load_weights(
+            track_names([(n, w) for n, w in weights.items() if n != "q.weight"])
+        )
+    finalize_layerwise_processing(model, _cfg())  # nothing left for layerwise
+    assert calls == ["cpu"]
+    assert torch.equal(model.q.weight, torch.full((2, 3), 6, dtype=torch.int8))
+    assert model.fused.weight[0, 0] == 1.0
+    # its units are known to later updates (from the cold header trace)
+    cold = model.__dict__["_reload_traces"]["cold"].expected.units
+    assert {k[0] for k in cold["q"]} == {"weight"}
+    # and the cold header trace inside the observed cold load routes nothing
+    # to the legacy path
+    assert core.legacy_reason(model) is None
+
+
 class _AttrLoader(torch.nn.Module):
     """A loader that reads a weight attribute (like the MoE scale loaders'
     `quant_method`), and a PWAL that replaces the param with the same layout
@@ -646,3 +836,18 @@ def test_param_re_tied_after_the_cold_load_counts_for_its_first_owner():
     _update(model, [("embed.weight", torch.full((2, 2), 2.0))], partial=False)
     assert model.head.weight is model.embed.weight
     assert torch.equal(model.embed.weight, torch.full((2, 2), 2.0))
+
+
+def _rebind(layer):
+    """PWAL rebinding `.data` (FlashInfer TRT-LLM's per-tensor FP8 shuffle)."""
+    layer.weight.data = layer.weight.data * 2
+
+
+def test_pwal_rebinding_data_keeps_the_live_storage():
+    model = _Model({"fused": _Fused(method=_Method(_rebind))})
+    _cold(model, _fused_weights(1.0))
+    live = model.fused.weight
+    ptr = live.data_ptr()
+    _update(model, _fused_weights(2.0))
+    assert model.fused.weight is live and live.data_ptr() == ptr
+    assert live[0, 0] == 4.0 and live[4, 0] == 8.0

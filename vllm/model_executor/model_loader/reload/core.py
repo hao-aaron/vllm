@@ -7,12 +7,17 @@ Every module that owns loadable tensors takes one path per update:
 
 - DIRECT: loaders write live memory, either the live tensor itself ("as-is":
   same object, shape, stride and dtype as the snapshot taken at model init) or
-  a checkpoint-layout view of its bytes ("view"). Scales whose live form is
-  smaller than their checkpoint form are staged in small side buffers.
-- MODULEWISE: loaders write a fresh checkpoint-format scratch tensor; the live
-  bytes are untouched until the module lands.
-- attention layers keep layerwise reload's buffering: their post-load
-  processing runs in the attention phase at finish.
+  a checkpoint-layout view of its bytes ("view"). Tensors with no room in
+  live memory but a create-time value (scales with a smaller live form, KV
+  scales the attention PWAL deleted) are staged in side tensors.
+- MODULEWISE: scratch for a whole module (checkpoint format, materialized on
+  first touch); CPU incoming is buffered in host memory, credited by
+  checkpoint name and replayed once when the module's units arrived. Live
+  bytes are untouched until the module lands, with a plain copy.
+
+Attention layers complete in the attention phase at finish. The cold load of
+online-quantized modules also runs here (`cold_online_load`): MODULEWISE in
+cold mode, where the quantized results simply stay registered.
 
 The path is chosen from metadata at start; `VLLM_RELOAD_DIRECT=0` forces
 MODULEWISE. A module completes when its expected units arrived (see
@@ -47,11 +52,10 @@ from . import layerwise as lw
 from .meta import (
     SKIP_LOAD_TENSORS,
     SKIP_MODULES,
+    SKIP_TENSORS,
     fill_init_value,
     get_numel_loaded,
-    materialize_layer,
     materialize_meta_tensor,
-    restore_layer_on_meta,
     to_meta_tensor,
 )
 from .observer import OBSERVE_WRITES, WriteObserver, storage_key, suspended
@@ -67,7 +71,7 @@ from .units import (
     current_checkpoint_name,
     infer_shard,
 )
-from .utils import get_layer_params_buffers, get_tensor_load_numel
+from .utils import get_tensor_load_numel
 
 logger = init_logger(__name__)
 
@@ -126,19 +130,32 @@ class Target:
 class ModuleState:
     name: str
     module: torch.nn.Module
-    path: str  # "direct", "modulewise" or "attention"
-    post: str  # "pwal", "pwal_at_finish" or "none"
+    path: str  # "direct" or "modulewise"
+    post: str  # "pwal", "pwal_at_finish", "none", or "attention" (finish phase)
     targets: dict[str, Target] = field(default_factory=dict)
     # every live param / buffer at start (original objects), to put back
     live_params: dict[str, torch.Tensor] = field(default_factory=dict)
     live_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     non_persistent: set[str] = field(default_factory=set)
+    # plain attributes under a gone param's name (e.g. Triton MXFP4's wrapped
+    # weights), set aside while its stand-in is registered
+    live_attrs: dict[str, object] = field(default_factory=dict)
+    # aliases of the live tensors' storage, held across the PWAL: a PWAL that
+    # rebinds a live tensor's `.data` (FlashInfer TRT-LLM's per-tensor FP8
+    # shuffle) would otherwise move it
+    held: dict[str, torch.Tensor] = field(default_factory=dict)
     remaining: Counter = field(default_factory=Counter)
     expected: Counter = field(default_factory=Counter)
     optional: set[tuple[str, Hashable]] = field(default_factory=set)
     arrived: Counter = field(default_factory=Counter)
     touched: bool = False
+    materialized: bool = False
     completed: bool = False
+    # MODULEWISE with CPU incoming: calls buffered until the module completes
+    buffering: bool = False
+    buffered: list[tuple[str, inspect.BoundArguments, Callable]] = field(
+        default_factory=list
+    )
     # units arrived that the expected set doesn't list: completes at finish
     format_mismatch: bool = False
     # R1 shadow counting (VLLM_RELOAD_SHADOW_COUNT=1)
@@ -168,6 +185,8 @@ class CoreSession:
     exact: bool = False
     trace: "TraceState | None" = None
     observer: WriteObserver | None = None
+    # cold start of online-quantized modules: no live tensors to land into
+    cold: bool = False
 
 
 def _core(model: torch.nn.Module) -> CoreSession | None:
@@ -260,7 +279,9 @@ def _loadable(module: torch.nn.Module) -> dict[str, tuple[torch.Tensor, bool]]:
     return out
 
 
-def _snapshot(module: torch.nn.Module, name: str, live: torch.Tensor) -> torch.Tensor:
+def _snapshot(
+    module: torch.nn.Module, name: str, live: torch.Tensor | None
+) -> torch.Tensor:
     """A fresh meta stand-in in checkpoint format: the tensor as recorded at
     model init, with its loader attributes bound to `module`."""
     info = lw.LAYERWISE_INFO.get(module)
@@ -269,6 +290,7 @@ def _snapshot(module: torch.nn.Module, name: str, live: torch.Tensor) -> torch.T
         params, buffers = info.restore_metadata
         meta = params.get(name, buffers.get(name))
     if meta is None:  # registered after init (e.g. `bias`): its live format
+        assert live is not None
         meta = live
     return restore_layer_refs(to_meta_tensor(meta), module)
 
@@ -328,55 +350,70 @@ def _storage_users(model: torch.nn.Module) -> Counter:
 
 
 def _plan_module(
-    name: str, module: torch.nn.Module, users: Counter, trace: bool
+    name: str,
+    module: torch.nn.Module,
+    users: Counter,
+    trace: bool,
+    cold: bool = False,
 ) -> ModuleState | None:
-    tensors = _loadable(module)
-    if not tensors or type(module).__name__ in SKIP_MODULES:
+    if type(module).__name__ in SKIP_MODULES:
         return None
-    if is_deferred_attention_layer(module) and not trace:
-        return ModuleState(name, module, "attention", "attention")
-    post = _post_step(module)
+    tensors = _loadable(module)
+    info = lw.LAYERWISE_INFO.get(module)
+    # params recorded at init that are no longer live: deleted by their PWAL
+    # (attention KV scales) or set to None. Loaders still write them.
+    snap_params = info.restore_metadata[0] if info is not None else {}
+    gone = [n for n in snap_params if n not in tensors and n not in SKIP_TENSORS]
+    if not tensors and not gone:
+        return None
+    if cold and not any(t.is_meta for t, _ in tensors.values()):
+        return None  # cold start: only online-quantized (meta) modules
+    post = "attention" if is_deferred_attention_layer(module) else _post_step(module)
     state = ModuleState(name, module, "direct", post)
     # (None entries too: `register_parameter("bias", None)` must survive)
     state.live_params = dict(module._parameters)
     state.live_buffers = dict(module._buffers)
     state.non_persistent = set(module._non_persistent_buffers_set)
+    state.live_attrs = {n: module.__dict__[n] for n in gone if n in module.__dict__}
+    fills = info.init_fill if info is not None else {}
 
-    kinds = {}
+    kinds: dict[str, tuple[str, torch.Tensor | None, bool, torch.Tensor, float]] = {}
     for tname, (live, is_buffer) in tensors.items():
         snap = _snapshot(module, tname, live)
         fill = _fill(module, tname)
-        if trace:
+        if trace or cold or live.is_meta:
             kinds[tname] = (SCRATCH, live, is_buffer, snap, fill)
             continue
         exclusive = users[storage_key(live)] == 1
-        if (
+        if tname in SKIP_TENSORS or (
             type(live) is type(snap)
             and live.shape == snap.shape
             and live.stride() == snap.stride()
             and live.dtype == snap.dtype
-            and not live.is_meta
             and (live.numel() == 0 or exclusive)
         ):
+            # (`bias` is built after create_weights and never snapshotted: it
+            # is always written in place)
             kinds[tname] = (AS_IS, live, is_buffer, live, fill)
             continue
-        view = (
-            _view_over(live, snap)
-            if _plain(live) and exclusive and live.device != torch.device("meta")
-            else None
-        )
+        view = _view_over(live, snap) if _plain(live) and exclusive else None
         if view is not None:
             kinds[tname] = (VIEW, live, is_buffer, view, fill)
-        elif tname in getattr(lw.LAYERWISE_INFO.get(module), "init_fill", {}):
+        elif tname in fills:
             kinds[tname] = (SIDE, live, is_buffer, snap, fill)
         else:
             kinds[tname] = (SCRATCH, live, is_buffer, snap, fill)
+    for tname in gone:
+        snap = _snapshot(module, tname, None)
+        kind = SIDE if tname in fills else SCRATCH
+        kinds[tname] = (kind, None, False, snap, _fill(module, tname))
 
     # (a module without a post step can only take the direct path as-is: its
     # live layout must be the checkpoint layout)
     direct = (
         DIRECT_ENABLED
         and not trace
+        and not cold
         and all(k[0] in (AS_IS, VIEW, SIDE) for k in kinds.values())
         and any(k[0] in (AS_IS, VIEW) for k in kinds.values())
         and not (post == "none" and any(k[0] != AS_IS for k in kinds.values()))
@@ -384,6 +421,8 @@ def _plan_module(
     if not direct:
         state.path = "modulewise"
         for tname, (kind, live, is_buffer, snap, fill) in kinds.items():
+            if kind == AS_IS and tname in SKIP_TENSORS:
+                continue  # `bias` stays live even in a MODULEWISE module
             if kind in (AS_IS, VIEW):  # a stand-in of the snapshot, not live
                 # (an as-is live tensor has the recorded layout, but may have
                 # lost loader attributes such as `quant_method`)
@@ -396,6 +435,7 @@ def _plan_module(
 
 
 def _register(module: torch.nn.Module, name: str, t: torch.Tensor, buffer: bool):
+    module.__dict__.pop(name, None)  # set aside in `live_attrs`
     if name in module._parameters:
         del module._parameters[name]
     if name in module._buffers:
@@ -434,8 +474,6 @@ def _install(cs: CoreSession, state: ModuleState) -> None:
 
 def _uninstall(state: ModuleState) -> None:
     """Put the original live objects back and unwrap loaders."""
-    if state.path == "attention":
-        return
     for target in state.targets.values():
         if target.kind == AS_IS:
             assert target.live is not None
@@ -460,6 +498,8 @@ def _place_originals(state: ModuleState) -> None:
         module.register_parameter(name, t)  # type: ignore[arg-type]
     for name, b in state.live_buffers.items():
         module.register_buffer(name, b, persistent=name not in state.non_persistent)
+    for name, value in state.live_attrs.items():
+        module.__dict__[name] = value
 
 
 def _expected_for(model: torch.nn.Module, source: str | None) -> ExpectedUnits:
@@ -486,68 +526,58 @@ def start_core(
     partial: bool | None = None,
     modules: list[str] | tuple[str, ...] | None = None,
     source: str | None = None,
+    cold: bool = False,
 ) -> None:
     """Begin an update on the core. `source` names the expected-unit source
     ("trainer" or a checkpoint key); the cold-load observation is the
-    fallback."""
-    lw._check_live_tensors_unchanged(model)
-    lw._check_model_hook_reload_safe(model)
-    lw._check_moe_methods_reload_safe(model)
-    session = lw.begin_update(model, partial=partial, modules=modules)
-    session.coverage_checked = True  # the core checks unit coverage itself
-    cs = CoreSession(model=model, expected=_expected_for(model, source))
+    fallback. `cold`: the cold load of online-quantized modules (no live
+    tensors, no integrity session; see `load_cold_online`)."""
+    if not cold:
+        lw._check_live_tensors_unchanged(model)
+        lw._check_model_hook_reload_safe(model)
+        lw._check_moe_methods_reload_safe(model)
+        session = lw.begin_update(model, partial=partial, modules=modules)
+        session.coverage_checked = True  # the core checks unit coverage itself
+    cs = CoreSession(model=model, expected=_expected_for(model, source), cold=cold)
     cs.exact = cs.expected.exact
     model.__dict__["_reload_core"] = cs
     _ACTIVE.add(model)
     try:
         users = _storage_users(model)
         for name, module in model.named_modules():
-            state = _plan_module(name, module, users, trace=False)
+            state = _plan_module(name, module, users, trace=False, cold=cold)
             if state is None:
                 continue
             cs.modules[name] = state
             cs.by_id[id(module)] = state
-            if state.path == "attention":
-                _start_attention(cs, state)
-                continue
             state.expected = Counter(cs.expected.units.get(name, Counter()))
             state.remaining = Counter(state.expected)
             state.optional = set(cs.expected.optional.get(name, set()))
+            if cold:  # layerwise's online-processing wrappers stand down
+                lw.get_layerwise_info(module).reset()
             _install(cs, state)
-        if OBSERVE_WRITES:
+        if OBSERVE_WRITES and not cold:
             cs.observer = _make_observer(cs)
             cs.observer.__enter__()
     except BaseException:
         abort_core(model)
-        lw.abort_reload(model, dirty=False)
+        if not cold:
+            lw.abort_reload(model, dirty=False)
         raise
     paths = Counter(s.path for s in cs.modules.values())
     kinds = Counter(t.kind for s in cs.modules.values() for t in s.targets.values())
-    model.__dict__["_reload_last_plan"] = {
-        "paths": dict(paths),
-        "targets": dict(kinds),
-        "source": cs.expected.source,
-    }
+    if not cold:
+        model.__dict__["_reload_last_plan"] = {
+            "paths": dict(paths),
+            "targets": dict(kinds),
+            "source": cs.expected.source,
+        }
     logger.debug(
         "reload core: %s modules, targets %s, expected units from %s",
         dict(paths),
         dict(kinds),
         cs.expected.source,
     )
-
-
-def _start_attention(cs: CoreSession, state: ModuleState) -> None:
-    """Attention layers: layerwise reload's buffering, processed at finish."""
-    layer = state.module
-    info = lw.get_layerwise_info(layer)
-    info.kernel_tensors = get_layer_params_buffers(layer)
-    info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
-    restore_layer_on_meta(layer, info)
-    lw.initialize_online_processing(layer)
-    for tname in _loadable(layer):
-        t = getattr(layer, tname)
-        inner = t.weight_loader
-        t.weight_loader = _make_loader(cs, state, tname, inner)
 
 
 def _make_observer(cs: CoreSession) -> WriteObserver:
@@ -581,11 +611,12 @@ def _make_loader(
                 "If this sender sends more than the cold load did, ship its "
                 "metadata at init_weight_transfer_engine."
             )
-        if state.path != "attention":
-            _touch(cs, state)
-            _first_write(cs, state, tname)
-            if first is not None and first in bound.arguments:
-                bound.arguments[first] = getattr(state.module, tname)
+        if cs.trace is None and _buffers(state, bound, first):
+            return _buffer(cs, state, tname, bound, original)
+        _touch(cs, state)
+        _first_write(cs, state, tname)
+        if first is not None and first in bound.arguments:
+            bound.arguments[first] = getattr(state.module, tname)
         call = LoadCall(state.module, tname)
         token = _CURRENT_LOAD.set(call)
         try:
@@ -597,25 +628,89 @@ def _make_loader(
                     ret = original(*bound.args, **bound.kwargs)
         finally:
             _CURRENT_LOAD.reset(token)
-        if state.path == "attention":
-            _mark_touched(cs, state)
         if call.declined:
             return ret
         units = call.units or [(tname, infer_shard(bound))]
         _arrive(cs, state, units, current_checkpoint_name())
         if SHADOW_COUNT and cs.trace is None:
             _shadow(cs, state)
-        if (
-            cs.trace is None
-            and _completes_when_loaded(state)
-            and not state.format_mismatch
-            and not any(n > 0 for n in state.remaining.values())
-        ):
-            _complete(cs, state)
+        _maybe_complete(cs, state)
         return ret
 
     core_loader.__wrapped__ = original  # type: ignore[attr-defined]
     return core_loader
+
+
+def _maybe_complete(cs: CoreSession, state: ModuleState) -> None:
+    if (
+        cs.trace is None
+        and _completes_when_loaded(state)
+        and not state.format_mismatch
+        and not any(n > 0 for n in state.remaining.values())
+    ):
+        _complete(cs, state)
+
+
+def _buffers(
+    state: ModuleState, bound: inspect.BoundArguments, first: str | None
+) -> bool:
+    """CPU incoming into a MODULEWISE module is buffered (host memory) until
+    the module's units arrived: first-touch scratch for every module a
+    checkpoint shard touches would hold the checkpoint format of many modules
+    on the device. Device incoming (weight transfer) loads into scratch."""
+    if state.path != "modulewise" or state.post == "attention":
+        return False
+    if state.buffering:
+        return True
+    if state.materialized:
+        return False
+    incoming = [
+        v
+        for k, v in bound.arguments.items()
+        if k != first and isinstance(v, torch.Tensor)
+    ]
+    return bool(incoming) and all(v.device.type in ("cpu", "meta") for v in incoming)
+
+
+def _buffer(
+    cs: CoreSession,
+    state: ModuleState,
+    tname: str,
+    bound: inspect.BoundArguments,
+    original: Callable,
+):
+    """Keep the call for replay at completion, credited now by the checkpoint
+    name it arrived under: the loader runs once, at replay."""
+    state.buffering = True
+    _mark_touched(cs, state)
+    state.buffered.append((tname, bound, original))
+    name = current_checkpoint_name()
+    shard = infer_shard(bound)
+    credited = True
+    if name is None:
+        _arrive(cs, state, [(tname, shard)], None)
+    else:
+        candidates = [
+            k
+            for k, n in state.remaining.items()
+            if n > 0 and k[0] == tname and k[2] == name
+        ]
+        key = next((k for k in candidates if k[1] == shard), None) or next(
+            iter(candidates), None
+        )
+        if key is not None:
+            state.remaining[key] -= 1
+            state.arrived[key[:2]] += 1
+        else:
+            # (declined at the trace, e.g. a non-local expert, or unexpected)
+            credited = any(k[0] == tname and k[2] == name for k in state.expected)
+            if not credited and not any(k[2] == name for k in state.expected):
+                _arrive(cs, state, [(tname, shard)], name)
+                credited = True
+    _maybe_complete(cs, state)
+    if bound.arguments.get("return_success"):
+        return credited
+    return None
 
 
 def _shadow(cs: CoreSession, state: ModuleState) -> None:
@@ -654,15 +749,13 @@ def _completes_when_loaded(state: ModuleState) -> bool:
     """Modules that complete as soon as their units arrived: PWAL ones, and
     modulewise ones without a post step (their scratch still lands). DIRECT
     modules without a post step have no completion event."""
-    return state.path != "attention" and (
-        state.post == "pwal" or (state.post == "none" and state.path == "modulewise")
-    )
+    return state.post == "pwal" or (state.post == "none" and state.path == "modulewise")
 
 
 def _mark_touched(cs: CoreSession, state: ModuleState) -> None:
     if not state.touched:
         state.touched = True
-    if cs.trace is None:
+    if cs.trace is None and not cs.cold:
         session = lw.get_reload_session(_model_of(cs))
         if session is not None:
             session.touched.add(state.name)
@@ -675,13 +768,13 @@ def _model_of(cs: CoreSession) -> torch.nn.Module:
 
 def _touch(cs: CoreSession, state: ModuleState) -> None:
     """First touch: materialize the module's side and scratch targets, and
-    start every DIRECT target from its create-time value (as a fresh load
-    does). From here on a DIRECT module's live bytes hold this update."""
-    if state.touched:
-        return
+    start DIRECT targets no loader call is expected to write from their
+    create-time value. From here on a DIRECT module's live bytes hold this
+    update."""
     _mark_touched(cs, state)
-    if cs.trace is not None:
+    if state.materialized or cs.trace is not None:
         return
+    state.materialized = True
     module = state.module
     info = lw.LAYERWISE_INFO.get(module)
     default = info.restore_device if info is not None else torch.get_default_device()
@@ -700,13 +793,13 @@ def _touch(cs: CoreSession, state: ModuleState) -> None:
                 target.standin = real
                 _register(module, target.name, real, target.is_buffer)
                 target.filled = True
-            elif target.name not in expected:
+            elif target.name not in expected and state.path == "direct":
                 # no loader call is expected to write it (a sibling's loader
                 # may): it starts from its create-time value, as at a fresh load
                 fill_init_value(target.standin, target.fill)
                 target.filled = True
     FRAMEWORK_WRITES.reset(token)
-    if state.path == "direct":
+    if state.path == "direct" and not cs.cold:
         session = lw.get_reload_session(_model_of(cs))
         if session is not None:
             session.written.add(state.name)
@@ -718,6 +811,11 @@ def _first_write(cs: CoreSession, state: ModuleState, tname: str) -> None:
     target = state.targets[tname]
     if target.filled or cs.trace is not None:
         return
+    if target.kind == AS_IS and not cs.cold:
+        # live bytes change from here on (also `bias` in a MODULEWISE module)
+        session = lw.get_reload_session(_model_of(cs))
+        if session is not None:
+            session.written.add(state.name)
     token = FRAMEWORK_WRITES.set(True)
     with torch.no_grad():
         fill_init_value(target.standin, target.fill)
@@ -783,10 +881,11 @@ def _complete(cs: CoreSession, state: ModuleState) -> None:
 
 def _complete_module(cs: CoreSession, state: ModuleState) -> None:
     module = state.module
-    session = lw.get_reload_session(_model_of(cs))
+    session = None if cs.cold else lw.get_reload_session(_model_of(cs))
     if session is not None:
         session.completed.add(state.name)
         session.written.add(state.name)
+    _replay(cs, state)
     if hasattr(module, "_already_called_process_weights_after_loading"):
         delattr(module, "_already_called_process_weights_after_loading")
     for target in state.targets.values():  # PWAL sees unwrapped loaders
@@ -810,16 +909,56 @@ def _complete_module(cs: CoreSession, state: ModuleState) -> None:
             if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase))
             else nullcontext()
         )
+        if not cs.cold:
+            state.held = {
+                n: t.detach()
+                for n, t in (*state.live_params.items(), *state.live_buffers.items())
+                if t is not None and not t.is_meta
+            }
         with timing:
             method.process_weights_after_loading(module)
         if hasattr(module, "update_param_tp_status"):
             module.update_param_tp_status()
-    _land(state)
     state.completed = True
+    if cs.cold:
+        # the PWAL results are the module's tensors: nothing to land into
+        for t in (*module._parameters.values(), *module._buffers.values()):
+            if t is not None and "weight_loader" in t.__dict__:
+                t.weight_loader = _original_loader(t)  # type: ignore[attr-defined]
+        _release(state)  # the checkpoint-format scratch the PWAL replaced
+        return
+    _land(state)
     _uninstall(state)
+    _release(state)
+
+
+def _release(state: ModuleState) -> None:
+    """Drop scratch and side tensors now: their wrapped loaders reference the
+    session, so a cycle would otherwise keep them until a GC collection."""
     for target in state.targets.values():
         if target.kind in (SIDE, SCRATCH):
-            target.standin = target.standin.new_empty(0)  # release scratch
+            target.standin = target.standin.new_empty(0)
+
+
+def _replay(cs: CoreSession, state: ModuleState) -> None:
+    """Run the module's buffered loader calls on its (now materialized)
+    targets, once."""
+    if not state.buffered:
+        return
+    _touch(cs, state)
+    module = state.module
+    for tname, bound, original in state.buffered:
+        first = next(iter(bound.signature.parameters), None)
+        if first is not None and first in bound.arguments:
+            bound.arguments[first] = getattr(module, tname)
+        token = _CURRENT_LOAD.set(LoadCall(module, tname))
+        try:
+            with suspended():
+                original(*bound.args, **bound.kwargs)
+        finally:
+            _CURRENT_LOAD.reset(token)
+    state.buffered.clear()
+    state.buffering = False
 
 
 def _land(state: ModuleState) -> None:
@@ -840,6 +979,14 @@ def _land(state: ModuleState) -> None:
         if live.is_meta:
             continue
         result = module._parameters.get(name, module._buffers.get(name))
+        held = state.held.get(name)
+        if held is not None and not lw._same_view(live, held):
+            # the PWAL rebound `live.data`: its new bytes are the result, the
+            # live object goes back to its storage
+            rebound = live.data
+            live.data = held
+            if result is live:
+                result = rebound
         if result is None or result is live or lw._same_view(result, live):
             continue
         if (
@@ -850,11 +997,17 @@ def _land(state: ModuleState) -> None:
             # a derived buffer the PWAL recomputed in another layout: the
             # kernel refresh rewrites it
             continue
-        if result.numel() > 0 and lw._storage_ptr(result) in live_storages:
+        # (scratch is a fresh allocation: only a DIRECT result can alias live)
+        if (
+            state.path == "direct"
+            and result.numel() > 0
+            and lw._storage_ptr(result) in live_storages
+        ):
             result = result.clone()
         pending.append((name, live, result))
     for name, live, result in pending:
         lw._land(module, name, live, result)
+    state.held = {}
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +1026,9 @@ def finish_core(model: torch.nn.Module, model_config: ModelConfig | None) -> Non
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
+    if cs.cold:
+        _finish_cold(model, cs)
+        return
     # 1. coverage, before any finish-time transform
     _check_coverage(model, cs, session.partial if session is not None else None)
     order = list(cs.modules.values())
@@ -886,23 +1042,23 @@ def finish_core(model: torch.nn.Module, model_config: ModelConfig | None) -> Non
             _complete(cs, state)
     # 4. original objects back everywhere else
     for state in order:
-        if state.path == "attention" or state.completed:
+        if state.post == "attention" or state.completed:
             continue
         if state.touched and session is not None:  # DIRECT, no post step
             session.completed.add(state.name)
         _uninstall(state)
+        _release(state)
         state.completed = True
     # 5. kernel refresh, every reload-safe quant method, touched or not
     for layer in model.modules():
         refresh_quant_method(layer, getattr(layer, "quant_method", None))
-    # 6. attention phase
-    for state in order:
-        if state.path == "attention":
-            info = lw.get_layerwise_info(state.module)
-            lw._finalize_attention_layer(state.module, info, model_config)  # type: ignore[arg-type]
-            info.reset()
-            if state.touched and session is not None:
-                session.completed.add(state.name)
+    # 6. attention phase, every attention layer: KV scales that arrived sit in
+    # side tensors and land here; MLA derives W_UK_T / W_UV from the landed
+    # kv_b_proj; backends refresh their scale-derived state
+    act_dtype = getattr(model_config, "dtype", None) or torch.get_default_dtype()
+    for layer in model.modules():
+        if is_deferred_attention_layer(layer):
+            _attention_phase(cs, cs.by_id.get(id(layer)), layer, act_dtype)
     # 7. layer and model refreshes
     run_model_refresh(model)
     del model.__dict__["_reload_core"]
@@ -910,6 +1066,46 @@ def finish_core(model: torch.nn.Module, model_config: ModelConfig | None) -> Non
     # 8. integrity
     if session is not None and session.active:
         lw.end_update(model)
+
+
+def _attention_phase(
+    cs: CoreSession,
+    state: ModuleState | None,
+    layer: torch.nn.Module,
+    act_dtype: torch.dtype,
+) -> None:
+    old_floats = lw._kv_scale_floats(layer)
+    if state is not None and not state.completed:
+        if state.touched:
+            # the KV-cache method consumes the arrived scales (side tensors)
+            # into the layer's live scale buffers, then deletes them
+            method = getattr(layer, "quant_method", None)
+            token = FRAMEWORK_WRITES.set(True)
+            try:
+                if isinstance(method, QuantizeMethodBase):
+                    method.process_weights_after_loading(layer)
+                _land(state)
+            finally:
+                FRAMEWORK_WRITES.reset(token)
+            session = lw.get_reload_session(_model_of(cs))
+            if session is not None:
+                session.completed.add(state.name)
+        _uninstall(state)
+        _release(state)
+        state.completed = True
+    lw._rerun_attention_pwal(layer, act_dtype, old_floats)
+
+
+def _finish_cold(model: torch.nn.Module, cs: CoreSession) -> None:
+    """End of an online-quantized cold load: every module completes (one the
+    checkpoint didn't reach starts from its create-time values, as layerwise
+    processing did); the rest of post-load processing runs as usual."""
+    for state in cs.modules.values():
+        if not state.completed:
+            _touch(cs, state)
+            _complete(cs, state)
+    del model.__dict__["_reload_core"]
+    _ACTIVE.discard(model)
 
 
 def _check_coverage(
@@ -921,8 +1117,6 @@ def _check_coverage(
     untouched = []
     aliases = _aliased_modules(cs)
     for state in cs.modules.values():
-        if state.path == "attention":
-            continue
         required = state.required_missing()
         if state.format_mismatch and state.touched:
             # the expected set doesn't describe this sender: every tensor the
@@ -1001,8 +1195,8 @@ def abort_core(model: torch.nn.Module) -> None:
     if cs.observer is not None:
         cs.observer.__exit__(None, None, None)
     for state in cs.modules.values():
-        if state.path == "attention" or state.completed:
-            continue  # layerwise abort puts attention layers back
+        if state.completed:
+            continue
         try:
             _uninstall(state)
         except Exception:  # noqa: BLE001
@@ -1030,7 +1224,10 @@ def trace_loads(model: torch.nn.Module, source: str) -> Iterator[TraceState]:
     """Dry run: every loadable tensor is a meta stand-in, loaders run on them
     and record their units; nothing is written. A write to a model tensor
     outside a loader, or a call to `is_reload_active`, is recorded."""
-    if _core(model) is not None or lw.is_reload_active(model):
+    # not is_reload_active(): that records a query on an enclosing trace (the
+    # cold load's, around the cold header trace)
+    session = lw.get_reload_session(model)
+    if _core(model) is not None or (session is not None and session.active):
         raise RuntimeError("trace_loads: a weight update is active")
     expected = ExpectedUnits(source=source, exact=True)
     state = TraceState(expected=expected)
@@ -1129,6 +1326,12 @@ def observe_cold_load(model: torch.nn.Module) -> Iterator[None]:
             else:
                 t.__dict__.pop("weight_loader", None)
     state.outside_writes |= observer.record.outside_loader
+    # Modules the core loaded at cold start (online quantization) aren't
+    # observed here: the trace over the same checkpoint describes them
+    cold_trace = model.__dict__.get("_reload_traces", {}).get(COLD_CHECKPOINT)
+    if cold_trace is not None:
+        for module_name, units in cold_trace.expected.units.items():
+            expected.units.setdefault(module_name, Counter(units))
     # A unit is optional when its tensor was created with a meaningful value
     # a fresh load keeps if the checkpoint lacks it (ones, scale sentinels,
     # -inf): the cold load's checkpoint may carry it where a sender doesn't
@@ -1195,12 +1398,6 @@ def ensure_materialized(
     cs, state = _state_of(module)
     if state.completed:
         raise RuntimeError(f"{state.name}: already completed in this update")
-    if state.path == "attention":
-        info = lw.get_layerwise_info(module)
-        if not state.touched:
-            materialize_layer(module, info)
-            _mark_touched(cs, state)
-        return dict(lw.get_layer_tensors(module))
     _touch(cs, state)
     for tname in state.targets if tensor_names is None else tensor_names:
         _first_write(cs, state, tname)
@@ -1226,18 +1423,85 @@ def record_units(
 def complete_module(module: torch.nn.Module) -> None:
     """Complete `module` now (PWAL, landing, original objects back), e.g. on an
     engine's post-processing thread once its plan delivered the module.
-    Attention layers land what was written and run their post-load
-    processing in the attention phase at finish."""
+    Attention layers complete in the attention phase at finish."""
     cs, state = _state_of(module)
-    if state.completed:
-        return
-    if state.path == "attention":
-        info = lw.get_layerwise_info(module)
-        lw._copy_and_restore_kernel_tensors(module, info)
-        info.load_numel = 0  # finish: put back (already) and re-run the PWAL
+    if state.completed or not _completes_when_loaded(state):
         return
     _complete(cs, state)
 
 
 # models with an active update, for the per-module API above
 _ACTIVE: "weakref.WeakSet[torch.nn.Module]" = weakref.WeakSet()
+
+
+# ---------------------------------------------------------------------------
+# Cold start of online-quantized modules
+# ---------------------------------------------------------------------------
+
+COLD_CHECKPOINT = "cold-checkpoint"
+
+
+def _has_online_modules(model: torch.nn.Module) -> bool:
+    return any(
+        getattr(getattr(m, "quant_method", None), "uses_meta_device", False)
+        for m in model.modules()
+    )
+
+
+@contextmanager
+def cold_online_load(model: torch.nn.Module, files: list[str]) -> Iterator[None]:
+    """The cold load of online-quantized modules on the core: their BF16
+    checkpoint tensors (CPU incoming) are buffered per module, credited by
+    checkpoint name against a trace over the checkpoint's safetensors headers,
+    and replayed into scratch when the module's units arrived; the module is
+    quantized then (MODULEWISE, no live tensors). Without headers to trace
+    (`.bin`, GGUF), or with VLLM_RELOAD_LEGACY=1, layerwise online processing
+    runs as before."""
+    if LEGACY or not files or not _has_online_modules(model):
+        yield
+        return
+    state = run_trace(model, checkpoint_metadata(files), COLD_CHECKPOINT)
+    if state.error is not None or legacy_reason(model, COLD_CHECKPOINT) is not None:
+        yield
+        return
+    start_core(model, source=COLD_CHECKPOINT, cold=True)
+    try:
+        yield
+    except BaseException:
+        abort_core(model)
+        raise
+    finish_core(model, None)
+
+
+_SAFETENSORS_DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def checkpoint_metadata(
+    files: list[str],
+) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+    """Names, shapes and dtypes of safetensors files (headers only)."""
+    from safetensors import safe_open
+
+    meta = []
+    for file in files:
+        with safe_open(file, framework="pt") as f:
+            for name in f.keys():  # noqa: SIM118
+                s = f.get_slice(name)
+                dtype = _SAFETENSORS_DTYPES.get(s.get_dtype())
+                if dtype is not None:  # e.g. F8 variants torch lacks
+                    meta.append((name, tuple(s.get_shape()), dtype))
+    return meta
