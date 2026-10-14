@@ -1367,3 +1367,20 @@ def test_layerwise_reload_leaves_tensors_meta_at_init():
     assert layer.weight is weight
     assert torch.equal(layer.weight, torch.full((4,), 7.0))
     assert layer.image_start is image_start and layer.image_start.is_meta
+
+
+def test_layerwise_reload_materializes_on_the_live_device():
+    """A tensor living elsewhere than the layer's default device (DeepSeek-V4.1's
+    host-resident engram embeddings) is reloaded on its own device."""
+    layer = torch.nn.Linear(4, 4, bias=False)
+    model = torch.nn.Sequential(layer)
+    weight = layer.weight
+
+    record_metadata_for_reloading(model)
+    # stands in for a CUDA default with a host-resident weight
+    reload_layerwise.LAYERWISE_INFO[layer].restore_device = torch.device("meta")
+    initialize_layerwise_reload(model)
+    layer.weight.weight_loader(layer.weight, torch.full((4, 4), 5.0))
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert layer.weight is weight and torch.equal(weight, torch.full((4, 4), 5.0))

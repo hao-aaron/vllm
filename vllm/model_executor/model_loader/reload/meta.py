@@ -147,9 +147,20 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
     if layer.__class__.__name__ in SKIP_MODULES:
         return
 
-    with info.restore_device:
-        for name, tensor in get_layer_tensors(layer).items():
-            if name not in SKIP_TENSORS and tensor.is_meta:
+    live = {}
+    if info.kernel_tensors is not None:  # (a weight update, not a cold load)
+        live = {**info.kernel_tensors[0], **info.kernel_tensors[1]}
+    for name, tensor in get_layer_tensors(layer).items():
+        if name not in SKIP_TENSORS and tensor.is_meta:
+            # on the live tensor's device: some are host-resident (DeepSeek-V4.1
+            # engram embeddings)
+            kernel = live.get(name)
+            device = (
+                kernel.device
+                if kernel is not None and not kernel.is_meta
+                else info.restore_device
+            )
+            with device:
                 target = materialize_meta_tensor(tensor)
                 # Start from the create-time value: elements no loader writes
                 # (padding, scales a checkpoint lacks) then hold what a fresh
