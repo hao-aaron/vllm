@@ -144,7 +144,9 @@ def _collect_off_registry(
             if (
                 id(obj) not in registered
                 and obj.device.type == "cuda"
-                and "kv_cache" not in path  # runtime KV / Mamba state
+                # runtime state: KV / Mamba caches, engram row staging
+                and "kv_cache" not in path
+                and "staged_rows" not in path
             ):
                 try:  # noqa: SIM105
                     out[path] = (

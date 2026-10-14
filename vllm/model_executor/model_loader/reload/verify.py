@@ -260,6 +260,7 @@ RUNTIME_STATE_ATTRS = frozenset(
         "index_group",
         "diffusion_states",
         "aot_compiled_fn",
+        "staged_rows",
     }
 )
 

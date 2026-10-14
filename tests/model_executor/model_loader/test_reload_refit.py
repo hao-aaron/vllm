@@ -254,6 +254,41 @@ def test_moe_backend_refit_equals_fresh(
 
 
 # ---------------------------------------------------------------------------
+# Model families on tiny real-format checkpoints (random values, the real
+# tensor names and dtypes). Generated out of tree; set
+# VLLM_TEST_RELOAD_TINY_DIR to a directory holding `<name>-A` / `<name>-B`.
+# ---------------------------------------------------------------------------
+
+TINY_DIR = os.environ.get("VLLM_TEST_RELOAD_TINY_DIR")
+_NO_IMAGES = {"limit_mm_per_prompt": {"image": 0}}
+TINY_CASES = [
+    # (block sizes their sparse-attention backends support)
+    pytest.param("tiny-v4", {"block_size": 256, **_NO_IMAGES}, id="deepseek-v4"),
+    pytest.param("tiny-v41", {"block_size": 128, **_NO_IMAGES}, id="deepseek-v4.1"),
+    pytest.param("tiny-k3", {"trust_remote_code": True, **_NO_IMAGES}, id="kimi-k3"),
+    pytest.param("tiny-gptoss-bf16", {}, id="gpt-oss-bf16"),
+]
+
+
+def _tiny(name: str) -> tuple[str, str]:
+    if TINY_DIR is None:
+        pytest.skip("VLLM_TEST_RELOAD_TINY_DIR is not set")
+    a, b = (os.path.join(TINY_DIR, f"{name}-{s}") for s in "AB")
+    if not (os.path.isdir(a) and os.path.isdir(b)):
+        pytest.skip(f"{a} / {b} not found")
+    return a, b
+
+
+@pytest.mark.slow_test
+@pytest.mark.parametrize("name,kwargs", TINY_CASES)
+def test_model_family_refit_equals_fresh(vllm_runner, name, kwargs):
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("the tiny checkpoints' MoE backends are SM100")
+    model_a, model_b = _tiny(name)
+    _check_refit_equals_fresh(vllm_runner, model_a, model_b, kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
