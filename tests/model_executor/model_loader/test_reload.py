@@ -1338,3 +1338,32 @@ def test_reload_attention_scales_use_model_dtype(monkeypatch, dtype):
     )
     reload_layerwise._reload_attention_scales(layer, info, SimpleNamespace(dtype=dtype))
     assert seen["dtype"] == dtype
+
+
+class _SkippedTowerLayer(torch.nn.Module):
+    """A loaded weight next to one that is meta at init (a skipped tower's
+    weights, e.g. with --limit-mm-per-prompt image=0)."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+        self.image_start = torch.nn.Parameter(
+            torch.empty(4, device="meta"), requires_grad=False
+        )
+
+
+def test_layerwise_reload_leaves_tensors_meta_at_init():
+    layer = _SkippedTowerLayer()
+    model = torch.nn.Sequential(layer)
+    weight, image_start = layer.weight, layer.image_start
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    for name, value in (("weight", 7.0), ("image_start", 3.0)):
+        param = getattr(layer, name)
+        param.weight_loader(param, torch.full((4,), value))
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert layer.weight is weight
+    assert torch.equal(layer.weight, torch.full((4,), 7.0))
+    assert layer.image_start is image_start and layer.image_start.is_meta

@@ -541,6 +541,10 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     pending: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     for is_buffer, tensors in ((False, parameters), (True, buffers)):
         for name, live in tensors.items():
+            if live.is_meta:
+                # Never materialized (a skipped tower's weights, e.g. with
+                # --limit-mm-per-prompt image=0): a fresh load leaves it meta
+                continue
             if is_buffer and (
                 layer._buffers.get(name) is None
                 or (name in non_persistent and name not in loaded_tensor_names)
