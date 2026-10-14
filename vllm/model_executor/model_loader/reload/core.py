@@ -145,6 +145,10 @@ class ModuleState:
     # shuffle) would otherwise move it
     held: dict[str, torch.Tensor] = field(default_factory=dict)
     remaining: Counter = field(default_factory=Counter)
+    # the sum of `remaining`, and its keys by (tensor, shard): each loader
+    # call does constant work, not a scan of the module's units
+    pending: int = 0
+    by_unit: dict[tuple[str, Hashable], tuple[tuple, ...]] = field(default_factory=dict)
     expected: Counter = field(default_factory=Counter)
     optional: set[tuple[str, Hashable]] = field(default_factory=set)
     arrived: Counter = field(default_factory=Counter)
@@ -552,6 +556,12 @@ def start_core(
             cs.by_id[id(module)] = state
             state.expected = Counter(cs.expected.units.get(name, Counter()))
             state.remaining = Counter(state.expected)
+            state.pending = sum(state.remaining.values())
+            by_unit: dict[tuple[str, Hashable], list[tuple]] = {}
+            for key in state.remaining:
+                by_unit.setdefault(key[:2], []).append(key)
+            # (tuples of atomics: the garbage collector stops tracking them)
+            state.by_unit = {k: tuple(v) for k, v in by_unit.items()}
             state.optional = set(cs.expected.optional.get(name, set()))
             if cold:  # layerwise's online-processing wrappers stand down
                 lw.get_layerwise_info(module).reset()
@@ -641,12 +651,17 @@ def _make_loader(
     return core_loader
 
 
+def _take(state: ModuleState, key: tuple) -> None:
+    state.remaining[key] -= 1
+    state.pending -= 1
+
+
 def _maybe_complete(cs: CoreSession, state: ModuleState) -> None:
     if (
         cs.trace is None
         and _completes_when_loaded(state)
         and not state.format_mismatch
-        and not any(n > 0 for n in state.remaining.values())
+        and state.pending == 0
     ):
         _complete(cs, state)
 
@@ -690,16 +705,18 @@ def _buffer(
     if name is None:
         _arrive(cs, state, [(tname, shard)], None)
     else:
-        candidates = [
-            k
-            for k, n in state.remaining.items()
-            if n > 0 and k[0] == tname and k[2] == name
-        ]
-        key = next((k for k in candidates if k[1] == shard), None) or next(
-            iter(candidates), None
-        )
+        key: tuple | None = (tname, shard, name)
+        if state.remaining[key] <= 0:  # another shard under this name
+            key = next(
+                (
+                    k
+                    for k, n in state.remaining.items()
+                    if n > 0 and k[0] == tname and k[2] == name
+                ),
+                None,
+            )
         if key is not None:
-            state.remaining[key] -= 1
+            _take(state, key)
             state.arrived[key[:2]] += 1
         else:
             # (declined at the trace, e.g. a non-local expert, or unexpected)
@@ -730,7 +747,7 @@ def _shadow(cs: CoreSession, state: ModuleState) -> None:
             for n, t in state.targets.items()
             if not recorded or n in recorded
         )
-    units_done = not any(n > 0 for n in state.remaining.values())
+    units_done = state.pending == 0
     counter_done = state.count_total > 0 and state.counted >= state.count_total
     if counter_done and not state.counter_completed:
         state.counter_completed = True
@@ -833,18 +850,18 @@ def _arrive(
             continue
         key = (tname, shard, name)
         if state.remaining[key] > 0:
-            state.remaining[key] -= 1
+            _take(state, key)
             continue
         alt = next(
             (
                 k
-                for k, n in state.remaining.items()
-                if n > 0 and k[0] == tname and k[1] == shard
+                for k in state.by_unit.get((tname, shard), ())
+                if state.remaining[k] > 0
             ),
             None,
         )
         if alt is not None:
-            state.remaining[alt] -= 1
+            _take(state, alt)
             continue
         if cs.exact and any(k[:2] == (tname, shard) for k in state.expected):
             raise ReloadUnitError(
@@ -1417,7 +1434,7 @@ def record_units(
     if units is None:
         units = [k[:2] for k, n in state.remaining.items() for _ in range(n)]
     _arrive(cs, state, list(units), name)
-    return not any(n > 0 for n in state.remaining.values())
+    return state.pending == 0
 
 
 def complete_module(module: torch.nn.Module) -> None:
