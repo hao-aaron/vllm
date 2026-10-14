@@ -608,3 +608,21 @@ def test_reload_targets_start_from_create_time_values():
     assert torch.equal(padded[4:], torch.zeros(2, 4))  # padding: create-time 0
     assert torch.equal(scale, torch.tensor([2.0, -1.0, -1.0]))  # sentinel kept
     assert torch.equal(garbage, torch.tensor([7.0, 7.0, 0.0, 0.0]))  # zero-filled
+
+
+def test_one_byte_init_values_are_bit_patterns():
+    """E8M0 / FP8 create-time values are refilled bit for bit (a float round
+    trip overflows E8M0)."""
+    from vllm.model_executor.model_loader.reload.meta import (
+        capture_init_fill,
+        fill_init_value,
+    )
+
+    layer = torch.nn.Module()
+    scale = torch.full((4,), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    layer.register_buffer("scale", scale)
+    fill = capture_init_fill(layer)
+    assert fill["scale"] == 127.0
+    target = torch.zeros(4, dtype=torch.float8_e8m0fnu)
+    fill_init_value(target, fill["scale"])
+    assert torch.equal(target.view(torch.uint8), scale.view(torch.uint8))

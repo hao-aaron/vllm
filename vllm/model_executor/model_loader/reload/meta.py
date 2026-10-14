@@ -154,14 +154,25 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
                 # Start from the create-time value: elements no loader writes
                 # (padding, scales a checkpoint lacks) then hold what a fresh
                 # load holds
-                target.data.fill_(info.init_fill.get(name, 0))
+                fill_init_value(target, info.init_fill.get(name, 0))
                 setattr(layer, name, target)
+
+
+def fill_init_value(t: torch.Tensor, value: float) -> None:
+    """Fill `t` with a value `capture_init_fill` recorded: the bit pattern
+    for 1-byte formats (FP8, E8M0, packed FP4), the value otherwise."""
+    with torch.no_grad():
+        if t.element_size() == 1:
+            t.data.view(torch.uint8).fill_(int(value))
+        else:
+            t.data.fill_(value)
 
 
 def capture_init_fill(layer: torch.nn.Module) -> dict[str, float]:
     """The value of each tensor of `layer` that was created uniform (e.g.
-    zeros, ones, `FP8_SCALE_SENTINEL`). Tensors created with `torch.empty`
-    are generally not uniform and are left out."""
+    zeros, ones, `FP8_SCALE_SENTINEL`); for 1-byte formats, its bit pattern
+    (their values don't all round-trip through a float). Tensors created with
+    `torch.empty` are generally not uniform and are left out."""
     fill = {}
     for name, tensor in get_layer_tensors(layer).items():
         if name in SKIP_TENSORS or tensor.is_meta or tensor.numel() == 0:
@@ -173,7 +184,11 @@ def capture_init_fill(layer: torch.nn.Module) -> dict[str, float]:
                     flat = flat.view(torch.uint8)
                 lo, hi = torch.aminmax(flat)
                 if bool(lo == hi):
-                    fill[name] = tensor.detach().reshape(-1)[0].float().item()
+                    fill[name] = (
+                        float(lo.item())
+                        if flat.dtype == torch.uint8
+                        else tensor.detach().reshape(-1)[0].float().item()
+                    )
         except (RuntimeError, NotImplementedError, TypeError):
             continue  # tensor subclasses, unsupported dtypes
     return fill
