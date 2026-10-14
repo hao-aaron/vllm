@@ -1751,3 +1751,48 @@ class TestBakeOnARealModel:
         # The probe already asserts the plan covers every param load_weights
         # wrote; this just keeps that from being vacuously few.
         assert summary["loaded_params"] > 0.5 * summary["total_params"], summary
+
+
+def test_bake_offsets_relative_to_target():
+    """A scatter baked against a target is recorded relative to it, so the
+    replay lands it in a target at a nonzero storage offset (a view over live
+    storage) as it does in a fresh one."""
+    from vllm.model_executor.model_loader.reload.units import (
+        _CURRENT_LOAD,
+        LoadCall,
+    )
+
+    layer = torch.nn.Module()
+    base = torch.zeros(20)
+    layer.register_parameter(
+        "weight", torch.nn.Parameter(base[4:16].view(3, 4), requires_grad=False)
+    )
+    sink = BakeSink()
+
+    class _Src:
+        _name = "w"
+        shape = (1, 4)
+        dtype = torch.float32
+
+        def numel(self):
+            return 4
+
+        def _key(self):
+            return ("w", ())
+
+    token = _CURRENT_LOAD.set(LoadCall(layer, "weight"))
+    try:
+        dest = layer.weight.data[1:2]
+        rec = sink.copies_by_layer[layer]
+        try:
+            sink.accept_copy(dest, _Src())  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001  (the meta copy of a non-meta dest)
+            pass
+    finally:
+        _CURRENT_LOAD.reset(token)
+    sc = rec[0]
+    assert sc.offset == 4  # relative to the target, not to the storage
+    t = layer.weight.data
+    t.as_strided(sc.shape, sc.stride, t.storage_offset() + sc.offset).fill_(1.0)
+    assert torch.equal(layer.weight[1], torch.ones(4))
+    assert base[:8].sum() == 0 and base[12:].sum() == 0

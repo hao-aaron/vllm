@@ -325,27 +325,28 @@ class M2NWeightTransferEngine(
         self._handle = self._m2n.Handle.create(
             self._m2n.Config(max_cta=init_info.max_cta)
         )
+        # The units each update delivers: a dry run of load_weights over the
+        # declared parameters (direct entries report theirs from the plan)
+        from vllm.model_executor.model_loader.reload.core import run_trace
+
+        run_trace(
+            self.model, [(m.name, tuple(m.shape), m.dtype) for m in self._metas], "m2n"
+        )
 
     def start_weight_update(self) -> None:
-        """Set up layerwise reloading, but only if some parameter needs it.
+        """Start a weight update on the reload core. Directly-resharded
+        parameters are written in place (their modules take the direct path:
+        they are unquantized, with the checkpoint's layout) and report their
+        units from the plan; fallback entries go through `load_weights`."""
+        from vllm.model_executor.model_loader.reload import start_reload
 
-        Directly-resharded parameters are written in place and never go through
-        `load_weights`, so a plan with no fallback entries has nothing to
-        reload.
-        """
-        if not self._uses_load_weights:
-            return
-        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
-
-        initialize_layerwise_reload(self.model)
+        start_reload(self.model, source="m2n")
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading when the plan uses fallback entries."""
-        if not self._uses_load_weights:
-            return
-        from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+        """Finish the update: coverage, completion, refreshes."""
+        from vllm.model_executor.model_loader.reload import finish_reload
 
-        finalize_layerwise_reload(self.model, self.model_config)
+        finish_reload(self.model, self.model_config)
 
     def receive_weights(self, update_info: M2NWeightTransferUpdateInfo) -> None:
         """Receive each requested parameter using its initialization-time plan."""
@@ -375,29 +376,30 @@ class M2NWeightTransferEngine(
         # Reshard lazily so one `load_weights` invocation sees the complete
         # fallback sequence without staging every full tensor at once. Direct
         # destinations still execute in request order as the iterator advances.
-        from vllm.model_executor.model_loader.reload import record_written
+        from vllm.model_executor.model_loader.reload import track_names
+        from vllm.model_executor.model_loader.reload.core import core_active
 
-        # Direct entries write live storage without a loader call
-        record_written(
-            self.model,
-            {
-                self._parameter_destinations[index].name.rpartition(".")[0]
-                for _, index in requested
-                if self._parameter_destinations[index].tensor is not None
-            },
-        )
+        # direct writes are reload-core bookkeeping only inside an update the
+        # core runs (start_weight_update)
+        on_core = core_active(self.model)
 
         def reshard_requested_weights() -> Iterator[tuple[str, torch.Tensor]]:
             for name, index in requested:
                 meta = self._metas[index]
                 destination = self._parameter_destinations[index]
                 buffer = destination.tensor
+                if buffer is not None and on_core:
+                    self._begin_direct_write(destination)
                 if buffer is None:
                     buffer = torch.empty(
                         meta.shape, dtype=meta.dtype, device=self.device
                     )
 
                 self._reshard(comm, stream, meta, destination.placements, buffer)
+                if destination.tensor is not None and on_core:
+                    # written in place, without a loader call: the plan says
+                    # which unit it delivered
+                    self._record_direct_write(destination, name)
 
                 if destination.tensor is None:
                     # `load_weights` reads on the host stream, so the transfer
@@ -413,12 +415,36 @@ class M2NWeightTransferEngine(
             if has_fallback:
                 # Some model loaders keep invocation-local state to combine
                 # related checkpoint tensors, so preserve one iterable scope.
-                self.model.load_weights(received_weights)
+                self.model.load_weights(track_names(received_weights))
             else:
                 # The iterator performs the reshards. With nothing to yield to
                 # `load_weights`, exhaust it here to execute direct transfers.
                 for _ in received_weights:
                     pass
+
+    def _direct_target(self, destination) -> tuple[torch.nn.Module, str]:
+        module_name, _, tensor_name = destination.name.rpartition(".")
+        return self.model.get_submodule(module_name), tensor_name
+
+    def _begin_direct_write(self, destination) -> None:
+        from vllm.model_executor.model_loader.reload.core import ensure_materialized
+
+        module, tensor_name = self._direct_target(destination)
+        target = ensure_materialized(module, [tensor_name])[tensor_name]
+        if target.untyped_storage().data_ptr() != (
+            destination.tensor.untyped_storage().data_ptr()
+        ):
+            raise RuntimeError(
+                f"nccl_m2n: {destination.name} is planned as a direct write into "
+                "its live storage, but this update loads that module into "
+                "scratch (it is not on the reload core's direct path)."
+            )
+
+    def _record_direct_write(self, destination, name: str) -> None:
+        from vllm.model_executor.model_loader.reload.core import record_units
+
+        module, tensor_name = self._direct_target(destination)
+        record_units(module, [(tensor_name, "*")], name)
 
     def _reshard(
         self,

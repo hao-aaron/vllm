@@ -93,10 +93,10 @@ class BakeSink:
     """``copy_`` sink for the dry-run bake: record how each slice would be fetched
     and where it would land, and move nothing.
 
-    ``_install_recording_stamps`` sets ``current = (leaf_module, param_name)``
-    around each loader so ``accept_copy`` can attribute the copy. An unstamped
-    ``copy_`` cannot be attributed and stays unrecorded, so its module fails the
-    coverage gate and takes the plain load. ``copies_by_layer`` is keyed by module
+    Each copy is attributed to the (leaf module, param) whose wrapped loader is
+    running (the reload core's ``current_load()`` during the bake's trace), or
+    to ``current`` when a caller sets it. A ``copy_`` outside any loader cannot
+    be attributed and stays unrecorded, so its module fails the coverage gate. ``copies_by_layer`` is keyed by module
     object, so iterating it yields each leaf module once.
     """
 
@@ -111,8 +111,14 @@ class BakeSink:
 
     def accept_copy(self, dest: torch.Tensor, src: "FakeRDTTensor") -> torch.Tensor:
         self.copied_names.add(src._name)
-        if self.current is not None:
-            layer, param_name = self.current
+        current = self.current
+        if current is None:
+            from vllm.model_executor.model_loader.reload.units import current_load
+
+            call = current_load()
+            current = None if call is None else (call.module, call.tensor_name)
+        if current is not None:
+            layer, param_name = current
             if dest.numel() != src.numel():
                 # The packed layout sizes each slice from the DESTINATION shape,
                 # while the producer packs what the replayed chain produces. A
@@ -127,12 +133,16 @@ class BakeSink:
                     "backend sends exactly the slice the loader asks for, so "
                     "the source and destination must have equal numel."
                 )
+            # relative to the target, which may sit mid-storage (the replay's
+            # load target can be a view over live bytes)
+            target = getattr(layer, param_name, None)
+            base = target.storage_offset() if isinstance(target, torch.Tensor) else 0
             self.copies_by_layer[layer].append(
                 _Scatter(
                     layer=layer,
                     param_name=param_name,
                     src=src._key(),
-                    offset=dest.storage_offset(),
+                    offset=dest.storage_offset() - base,
                     shape=tuple(dest.shape),
                     stride=tuple(dest.stride()),
                     dtype=src.dtype,
