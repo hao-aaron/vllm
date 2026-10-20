@@ -30,6 +30,7 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
     CompletionStreamResponse,
 )
+from vllm.entrypoints.serve.engine.packed_logprobs import PackedTopK
 from vllm.entrypoints.serve.engine.protocol import UsageInfo
 from vllm.logprobs import Logprob
 from vllm.outputs import WeightVersionSpan
@@ -405,21 +406,6 @@ class GenerateLogProbsContent(GenerateLogProb):
     """
 
     top_logprobs: list[GenerateLogProb] = []
-
-
-class PackedTopK(BaseModel):
-    """The top-k candidates of every generated position, packed.
-
-    ``token_ids`` is base64 of little-endian int32 and ``logprobs`` base64 of
-    little-endian float32 (raw engine values, not clamped), each
-    ``num_positions x k`` in row-major order, candidates in the engine's rank
-    order (the sampled token is not included).
-    """
-
-    num_positions: int
-    k: int
-    token_ids: str
-    logprobs: str
 
 
 class GenerateLogProbs(BaseModel):

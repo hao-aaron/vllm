@@ -19,9 +19,8 @@ from typing import Any
 
 import msgspec
 import numpy as np
-import pybase64
 
-from vllm.exceptions import GenerationError
+from vllm.entrypoints.serve.engine.packed_logprobs import pack_top_k_logprobs
 from vllm.logprobs import FlatLogprobs
 
 # Rows rendered per batch; bounds the per-entry lists and index arrays.
@@ -297,20 +296,14 @@ def render_top_k_logprobs(
     packed (irregular widths or ranks, ids beyond int32, or a row count that
     differs from the tokens).
     """
-    rows = container.rows() if isinstance(container, FlatLogprobs) else None
-    if rows is None:
-        raise GenerationError("Top-k logprobs are unavailable for this request")
-    token_ids, logprobs, _ = rows
-    k = num_output_top_logprobs
-    if len(token_ids) != num_tokens or (num_tokens and token_ids.shape[1] != k + 1):
-        raise GenerationError("Top-k logprobs are unavailable for this request")
-    top_ids = np.ascontiguousarray(token_ids[:, 1:]).reshape(-1)
-    top_logprobs = np.ascontiguousarray(logprobs[:, 1:]).reshape(-1)
+    top_ids, top_logprobs = pack_top_k_logprobs(
+        container, num_tokens, num_output_top_logprobs
+    )
     return [
         b'{"content":null,"top_k":{"num_positions":%d,"k":%d,"token_ids":"'
-        % (num_tokens, k),
-        pybase64.b64encode(top_ids.tobytes()),
+        % (num_tokens, num_output_top_logprobs),
+        top_ids,
         b'","logprobs":"',
-        pybase64.b64encode(top_logprobs.tobytes()),
+        top_logprobs,
         b'"}}',
     ]
