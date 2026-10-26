@@ -6,7 +6,6 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from copy import copy
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -579,9 +578,9 @@ class RequestRegistry:
         tracing_enabled: bool,
         admission_stats: "SharedAdmissionStats | None",
     ):
-        self._states: dict[str, RequestState] = {}
-        self._parents: dict[str, ParentRequest] = {}
-        self._external_ids: defaultdict[str, list[str]] = defaultdict(list)
+        self.states: dict[str, RequestState] = {}
+        self.parents: dict[str, ParentRequest] = {}
+        self.external_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
         self.admission_stats = admission_stats
@@ -589,22 +588,18 @@ class RequestRegistry:
         # stats and spans go into the next step's IterationStats.
         self._pending_finished: list[tuple[RequestState, FinishReason]] = []
 
-        self.states = MappingProxyType(self._states)
-        self.parents = MappingProxyType(self._parents)
-        self.external_ids = MappingProxyType(self._external_ids)
-
     def __len__(self) -> int:
-        return len(self._states)
+        return len(self.states)
 
     def get(self, request_id: str) -> RequestState | None:
-        return self._states.get(request_id)
+        return self.states.get(request_id)
 
     def register(self, state: RequestState) -> None:
-        assert state.request_id not in self._states
-        self._states[state.request_id] = state
+        assert state.request_id not in self.states
+        self.states[state.request_id] = state
         if parent_req := state.parent_req:
-            self._parents[parent_req.request_id] = parent_req
-        self._external_ids[state.external_req_id].append(state.request_id)
+            self.parents[parent_req.request_id] = parent_req
+        self.external_ids[state.external_req_id].append(state.request_id)
         self._update_admission_stats()
 
     def sibling_queue(
@@ -613,7 +608,7 @@ class RequestRegistry:
         """The collector shared by the registered children of a parent."""
         if parent_req is not None:
             for child_id in parent_req.child_requests:
-                if (state := self._states.get(child_id)) is not None:
+                if (state := self.states.get(child_id)) is not None:
                     return state.queue
         return None
 
@@ -627,13 +622,13 @@ class RequestRegistry:
         states: dict[str, RequestState] = {}
         for request_id in request_ids:
             if not internal:
-                internal_ids = self._external_ids.get(request_id, ())
-            elif parent := self._parents.get(request_id):
+                internal_ids = self.external_ids.get(request_id, ())
+            elif parent := self.parents.get(request_id):
                 internal_ids = parent.child_requests
             else:
                 internal_ids = (request_id,)
             for internal_id in internal_ids:
-                if state := self._states.get(internal_id):
+                if state := self.states.get(internal_id):
                     states[internal_id] = state
         return list(states.values())
 
@@ -649,15 +644,15 @@ class RequestRegistry:
         finished-request record, e.g. ones the engine rejected on arrival.
         """
         request_id = state.request_id
-        del self._states[request_id]
-        internal_ids = self._external_ids[state.external_req_id]
+        del self.states[request_id]
+        internal_ids = self.external_ids[state.external_req_id]
         internal_ids.remove(request_id)
         if not internal_ids:
-            del self._external_ids[state.external_req_id]
+            del self.external_ids[state.external_req_id]
         if parent_req := state.parent_req:
             parent_req.child_requests.discard(request_id)
             if not parent_req.child_requests:
-                self._parents.pop(parent_req.request_id, None)
+                self.parents.pop(parent_req.request_id, None)
 
         self.lora_states.request_finished(request_id, state.lora_name)
         if finish_reason is not None and state.stats is not None:
@@ -674,7 +669,7 @@ class RequestRegistry:
 
     def _update_admission_stats(self) -> None:
         if self.admission_stats is not None:
-            self.admission_stats.set_num_requests(len(self._states))
+            self.admission_stats.set_num_requests(len(self.states))
 
     def _record_finished(
         self,
@@ -765,22 +760,11 @@ class OutputProcessor:
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
         self._registry = RequestRegistry(log_stats, tracing_enabled, admission_stats)
-
-    @property
-    def request_states(self) -> Mapping[str, RequestState]:
-        return self._registry.states
-
-    @property
-    def parent_requests(self) -> Mapping[str, ParentRequest]:
-        return self._registry.parents
-
-    @property
-    def external_req_ids(self) -> Mapping[str, list[str]]:
-        return self._registry.external_ids
-
-    @property
-    def lora_states(self) -> LoRARequestStates:
-        return self._registry.lora_states
+        # Read-only aliases; add and remove requests through _registry.
+        self.request_states = self._registry.states
+        self.parent_requests = self._registry.parents
+        self.external_req_ids = self._registry.external_ids
+        self.lora_states = self._registry.lora_states
 
     def get_num_unfinished_requests(self):
         return len(self._registry)

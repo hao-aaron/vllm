@@ -116,7 +116,7 @@ def _admission_rejection_count(reason: str) -> float:
 
 def _make_output_processor(**request_states) -> OutputProcessor:
     op = OutputProcessor(tokenizer=None, log_stats=False)
-    op._registry._states.update(request_states)
+    op.request_states.update(request_states)
     return op
 
 
