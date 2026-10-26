@@ -50,7 +50,7 @@ async def test_generate_normal_flow(mock_async_llm):
     sampling_params = SamplingParams(max_tokens=10)
 
     # Create a mock queue with outputs
-    queue = RequestOutputCollector(RequestOutputKind.FINAL_ONLY, request_id)
+    queue = RequestOutputCollector(RequestOutputKind.DELTA, request_id)
     output1 = RequestOutput(
         request_id=request_id,
         prompt="Tell me about Paris",

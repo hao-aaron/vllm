@@ -39,6 +39,9 @@ class IncrementalDetokenizer:
     def num_output_tokens(self) -> int:
         return len(self.token_ids)
 
+    def output_token_ids_since(self, start: int) -> list[int]:
+        return self.token_ids[start:]
+
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         self.token_ids.extend(new_token_ids)
         return None
@@ -299,6 +302,9 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def num_output_tokens(self) -> int:
         return len(self.token_ids) - self.prompt_len
+
+    def output_token_ids_since(self, start: int) -> list[int]:
+        return self.token_ids[self.prompt_len + start :]
 
     def decode_next(self, next_token_id: int) -> str:
         new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(

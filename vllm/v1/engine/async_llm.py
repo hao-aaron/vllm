@@ -525,11 +525,13 @@ class AsyncLLM(EngineClient):
         # to handle startup failure gracefully in the OpenAI server.
         self._run_output_handler()
 
-        # Create a new output collector for the request.
-        queue = RequestOutputCollector(params.output_kind, request.request_id)
-
         # Use cloned params that may have been updated in process_inputs()
         params = request.params
+
+        # Create a new output collector for the request.
+        queue = RequestOutputCollector(
+            params.output_kind, request.request_id, n=1 if is_pooling else params.n
+        )
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_text, None, 0, queue)

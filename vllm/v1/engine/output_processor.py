@@ -4,6 +4,7 @@
 import asyncio
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
+from copy import copy
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -52,32 +53,79 @@ EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
 
 
 class RequestOutputCollector:
-    """Collects streamed RequestOutputs per individual request,
-    for hand-off to the consuming asyncio generate task.
+    """Turns the deltas the output processor produces for one request into
+    what its consumer asked for, for hand-off to the generate task.
 
-    When streaming deltas, RequestOutputs are merged if the
-    producer gets ahead of the consumer.
+    DELTA passes deltas through, CUMULATIVE yields the running total, and
+    FINAL_ONLY yields once, when every sequence has finished. Unread outputs
+    are merged if the producer gets ahead of the consumer.
     """
 
-    def __init__(self, output_kind: RequestOutputKind, request_id: str):
+    def __init__(self, output_kind: RequestOutputKind, request_id: str, n: int = 1):
+        self.kind = output_kind
         self.aggregate = output_kind == RequestOutputKind.DELTA
         self.request_id = request_id
+        self.n = n
         self.output: RequestOutput | PoolingRequestOutput | Exception | None = None
         self.ready = asyncio.Event()
+
+        self._finished_indexes: set[int] = set()
+        # Running total for CUMULATIVE, and for FINAL_ONLY with n > 1.
+        self._accum: RequestOutput | None = None
 
         self._input_stream_task: asyncio.Task | None = None
 
     def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
         """Non-blocking put operation."""
+        if isinstance(output, RequestOutput) and output is not STREAM_FINISHED:
+            output = self._collect(output)
+            if output is None:
+                return
+        self._deliver(output)
+
+    def _collect(self, delta: RequestOutput) -> RequestOutput | None:
+        if delta.finished and delta.outputs:
+            for completion in delta.outputs:
+                if completion.finish_reason is not None:
+                    self._finished_indexes.add(completion.index)
+            delta.finished = len(self._finished_indexes) >= self.n
+
+        if self.kind == RequestOutputKind.DELTA:
+            return delta
+        if self._accum is None:
+            self._accum = delta
+        else:
+            self._accum.add(delta)
+            self._accum.finished = delta.finished
+        if self.kind == RequestOutputKind.FINAL_ONLY:
+            if not delta.finished:
+                return None  # n > 1: wait for every sequence
+            self._accum.outputs.sort(key=lambda completion: completion.index)
+            return self._accum
+        # New objects; the token lists are shared with the accumulator.
+        snapshot = copy(self._accum)
+        snapshot.outputs = [copy(completion) for completion in self._accum.outputs]
+        return snapshot
+
+    def _merge_unread(
+        self, unread: RequestOutput, output: RequestOutput
+    ) -> RequestOutput:
+        """DELTA: concatenate unread deltas. Otherwise the newest replaces."""
+        if not self.aggregate:
+            return output
+        unread.add(output)
+        return unread
+
+    def _deliver(
+        self, output: RequestOutput | PoolingRequestOutput | Exception
+    ) -> None:
         if self.output is None or isinstance(output, Exception):
             self.output = output
             self.ready.set()
         elif isinstance(self.output, RequestOutput) and isinstance(
             output, RequestOutput
         ):
-            # This ensures that request outputs with different request indexes
-            # (if n > 1) do not override each other.
-            self.output.add(output, aggregate=self.aggregate)
+            self.output = self._merge_unread(self.output, output)
         elif isinstance(self.output, PoolingRequestOutput) and isinstance(
             output, PoolingRequestOutput
         ):
@@ -134,17 +182,19 @@ class StreamingInputOutputCollector(RequestOutputCollector):
         super().__init__(output_kind, request_id)
         self._backlog: deque[RequestOutput] = deque()
 
-    def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
+    def _deliver(
+        self, output: RequestOutput | PoolingRequestOutput | Exception
+    ) -> None:
         if isinstance(output, Exception):
             self._backlog.clear()
         elif self._backlog or _is_chunk_boundary(self.output):
             assert isinstance(output, RequestOutput)
             if self._backlog and not _is_chunk_boundary(self._backlog[-1]):
-                self._backlog[-1].add(output, aggregate=self.aggregate)
+                self._backlog[-1] = self._merge_unread(self._backlog[-1], output)
             else:
                 self._backlog.append(output)
             return
-        super().put(output)
+        super()._deliver(output)
 
     async def get(self) -> RequestOutput | PoolingRequestOutput:
         output = await super().get()
@@ -206,6 +256,7 @@ class RequestState:
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
         trace_headers: Mapping[str, str] | None = None,
+        drain_queue: bool = False,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -228,6 +279,9 @@ class RequestState:
         self.temperature = temperature
         self.is_prefilling = True
         self.queue = queue
+        # The queue was created by the output processor, which drains it and
+        # returns the outputs (LLMEngine).
+        self.drain_queue = drain_queue
         self.num_cached_tokens = 0
         self.num_cache_creation_tokens = 0
         self.remote_prefill_cached_tokens = remote_prefill_cached_tokens
@@ -285,6 +339,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        drain_queue: bool = False,
     ) -> "RequestState":
         remote_prefill_cached_tokens = None
         if sampling_params := request.sampling_params:
@@ -350,6 +405,7 @@ class RequestState:
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
             trace_headers=request.trace_headers,
+            drain_queue=drain_queue,
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -358,7 +414,6 @@ class RequestState:
 
     def make_request_output(
         self,
-        new_token_ids: list[int],
         pooling_output: torch.Tensor | None,
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
@@ -366,67 +421,43 @@ class RequestState:
         ec_transfer_params: dict[str, Any] | None = None,
         error: RequestError | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
-        finished = finish_reason is not None
-        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
+        """Everything new since the previous output, if an output is due.
 
-        if not finished and final_only:
-            # Only the final output is required in FINAL_ONLY mode.
-            return None
+        The output kind only decides when an output is due; the collector
+        turns deltas into what the consumer asked for.
+        """
+        finished = finish_reason is not None
 
         if pooling_output is not None:
+            if not finished and self.output_kind == RequestOutputKind.FINAL_ONLY:
+                return None
             return self._new_request_output(
-                self.external_req_id,
-                [self._new_pooling_output(pooling_output)],
-                finished,
-                error=error,
+                [self._new_pooling_output(pooling_output)], finished, error=error
             )
 
-        if self.stream_interval > 1:
-            assert self.detokenizer is not None
-
-            # Send output request only when
-            # 1. It has finished, or
-            # 2. It is the first token, or
-            # 3. It has reached the stream interval number of tokens
-            if not (
-                finished
-                or self.sent_tokens_offset == 0
-                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset
-                >= self.stream_interval
-            ):
-                return None
-
-            if self.output_kind == RequestOutputKind.DELTA:
-                # Send tokens from the offset in DELTA mode, otherwise all
-                # tokens are sent.
-                new_token_ids = self.detokenizer.output_token_ids[
-                    self.sent_tokens_offset :
-                ]
-                self.sent_tokens_offset = self.detokenizer.num_output_tokens()
-
-        external_req_id = self.external_req_id
-
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
-
-        if self.parent_req is None:
-            outputs = [output]
-        else:
-            outputs, finished = self.parent_req.get_outputs(self.request_id, output)
-            if not outputs:
-                return None
-            external_req_id = self.parent_req.external_req_id
-
+        if not self._should_emit(finished):
+            return None
         return self._new_request_output(
-            external_req_id,
-            outputs,
+            [self._new_completion_output(finish_reason, stop_reason)],
             finished,
             kv_transfer_params,
             ec_transfer_params,
         )
 
+    def _should_emit(self, finished: bool) -> bool:
+        if finished:
+            return True
+        if self.output_kind == RequestOutputKind.FINAL_ONLY:
+            return False
+        if self.stream_interval <= 1:
+            return True
+        assert self.detokenizer is not None
+        # The first output, then every stream_interval tokens.
+        unsent = self.detokenizer.num_output_tokens() - self.sent_tokens_offset
+        return self.sent_tokens_offset == 0 or unsent >= self.stream_interval
+
     def _new_request_output(
         self,
-        external_req_id: str,
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
@@ -443,7 +474,7 @@ class RequestState:
         if isinstance(first_output, PoolingOutput):
             assert len(outputs) == 1
             return PoolingRequestOutput(
-                request_id=external_req_id,
+                request_id=self.external_req_id,
                 outputs=first_output,
                 num_cached_tokens=self.num_cached_tokens,
                 prompt_token_ids=prompt_token_ids,
@@ -451,23 +482,16 @@ class RequestState:
                 error=error,
             )
         assert self.logprobs_processor is not None
-        if self.output_kind == RequestOutputKind.DELTA:
-            # Side effect: logprobs processor forgets prompt logprobs
-            prompt_logprobs = self.logprobs_processor.pop_prompt_logprobs()
-            prompt_token_id_logprobs = (
-                self.logprobs_processor.pop_prompt_token_id_logprobs()
-            )
-        else:
-            prompt_logprobs = self.logprobs_processor.prompt_logprobs
-            prompt_token_id_logprobs = self.logprobs_processor.prompt_token_id_logprobs
-
         return RequestOutput(
-            request_id=external_req_id,  # request_id is what was provided externally
+            request_id=self.external_req_id,
             lora_request=self.lora_request,
             prompt=self.prompt,
             prompt_token_ids=prompt_token_ids,
-            prompt_logprobs=prompt_logprobs,
-            prompt_token_id_logprobs=prompt_token_id_logprobs,
+            # Sent once: the logprobs processor forgets them.
+            prompt_logprobs=self.logprobs_processor.pop_prompt_logprobs(),
+            prompt_token_id_logprobs=(
+                self.logprobs_processor.pop_prompt_token_id_logprobs()
+            ),
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             kv_transfer_params=kv_transfer_params,
@@ -479,31 +503,23 @@ class RequestState:
 
     def _new_completion_output(
         self,
-        token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
     ) -> CompletionOutput:
+        """Per-token fields are sliced by offset since the previous output, so
+        an output with no new tokens has empty slices."""
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
         finished = finish_reason is not None
-        delta = self.output_kind == RequestOutputKind.DELTA
+        start = self.sent_tokens_offset
+        self.sent_tokens_offset = self.detokenizer.num_output_tokens()
 
-        # Prepare text and token_ids, based on delta mode
-        text = self.detokenizer.get_next_output_text(finished, delta)
-        if not delta:
-            token_ids = self.detokenizer.output_token_ids
-
-        # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
-        if delta and logprobs:
-            num_new_tokens = len(token_ids)
-            # Avoid [-0:], which returns the full accumulated history when a
-            # delta contains no new token IDs. [:0] preserves the concrete
-            # list or FlatLogprobs representation while returning no entries.
-            logprobs = logprobs[-num_new_tokens:] if num_new_tokens else logprobs[:0]
+        if logprobs is not None:
+            logprobs = logprobs[start:]
 
         sampling_mask = None
-        if (delta or finished) and self.sampling_mask_chunks:
+        if self.sampling_mask_chunks:
             sampling_mask = SamplingMask(
                 [
                     position
@@ -511,8 +527,7 @@ class RequestState:
                     for position in chunk.to_nested_list()
                 ]
             )
-            if delta:
-                self.sampling_mask_chunks.clear()
+            self.sampling_mask_chunks.clear()
 
         # Concatenate routed experts on finish
         routed_experts = None
@@ -521,8 +536,8 @@ class RequestState:
 
         return CompletionOutput(
             index=self.request_index,
-            text=text,
-            token_ids=token_ids,
+            text=self.detokenizer.get_next_output_text(finished, delta=True),
+            token_ids=self.detokenizer.output_token_ids_since(start),
             routed_experts=routed_experts,
             sampling_mask=sampling_mask,
             logprobs=logprobs,
@@ -591,6 +606,16 @@ class RequestRegistry:
             self._parents[parent_req.request_id] = parent_req
         self._external_ids[state.external_req_id].append(state.request_id)
         self._update_admission_stats()
+
+    def sibling_queue(
+        self, parent_req: ParentRequest | None
+    ) -> RequestOutputCollector | None:
+        """The collector shared by the registered children of a parent."""
+        if parent_req is not None:
+            for child_id in parent_req.child_requests:
+                if (state := self._states.get(child_id)) is not None:
+                    return state.queue
+        return None
 
     def resolve(self, request_ids: Iterable[str], internal: bool) -> list[RequestState]:
         """Map request IDs to the registered requests they refer to.
@@ -802,9 +827,8 @@ class OutputProcessor:
         for req_state in self._registry.resolve(request_ids, internal):
             request_ids_to_abort.append(req_state.request_id)
             # Produce final abort output.
-            if req_state.queue is not None and (
+            if not req_state.drain_queue and (
                 request_output := req_state.make_request_output(
-                    new_token_ids=[],
                     # Set pooling_output is not None to
                     # correctly enter the abort pooling branch
                     pooling_output=EMPTY_CPU_TENSOR
@@ -836,6 +860,17 @@ class OutputProcessor:
             self._update_streaming_request_state(req_state, request, prompt)
             return
 
+        drain_queue = queue is None
+        if queue is not None:
+            assert parent_req is None or queue.n == parent_req.n, (
+                "children of an n>1 request must share a collector created with n"
+            )
+        else:
+            queue = self._registry.sibling_queue(parent_req) or RequestOutputCollector(
+                request.params.output_kind,
+                request_id,
+                n=parent_req.n if parent_req is not None else 1,
+            )
         req_state = RequestState.from_new_request(
             tokenizer=self.tokenizer,
             request=request,
@@ -845,6 +880,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            drain_queue=drain_queue,
         )
         self._registry.register(req_state)
 
@@ -891,13 +927,12 @@ class OutputProcessor:
         """Process the EngineCoreOutputs:
         1) Compute stats for logging
         2) Detokenize
-        3) Create and handle RequestOutput objects:
-            * If there is a queue (for usage with AsyncLLM),
-              put the RequestOutput objects into the queue for
-              handling by the per-request generate() tasks.
+        3) Put each request's delta into its RequestOutputCollector:
+            * AsyncLLM passes the collectors, and the per-request
+              generate() tasks read them.
 
-            * If there is no queue (for usage with LLMEngine),
-              return a list of RequestOutput objects.
+            * Collectors created here (for LLMEngine) are drained into
+              the returned list of RequestOutput objects.
 
         NOTE FOR DEVELOPERS
 
@@ -911,7 +946,7 @@ class OutputProcessor:
         if iteration_stats is not None:
             self._registry.flush_pending(iteration_stats)
 
-        request_outputs: list[RequestOutput | PoolingRequestOutput] = []
+        to_drain: dict[RequestOutputCollector, None] = {}
         reqs_to_abort: list[str] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
@@ -921,7 +956,7 @@ class OutputProcessor:
                 continue
 
             error = engine_core_output.error
-            if error is not None and req_state.queue is not None:
+            if error is not None and not req_state.drain_queue:
                 # Rejected on arrival, e.g. by a paused engine; nothing was run.
                 req_state.queue.put(error.to_exception())
                 self._registry.unregister(req_state, None)
@@ -1006,7 +1041,6 @@ class OutputProcessor:
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
-                new_token_ids,
                 pooling_output,
                 finish_reason,
                 stop_reason,
@@ -1017,12 +1051,10 @@ class OutputProcessor:
                 if streaming_chunk_boundary:
                     request_output.finished = False
 
-                if req_state.queue is not None:
-                    # AsyncLLM: put into queue for handling by generate().
-                    req_state.queue.put(request_output)
-                else:
-                    # LLMEngine: return list of RequestOutputs.
-                    request_outputs.append(request_output)
+                assert req_state.queue is not None
+                req_state.queue.put(request_output)
+                if req_state.drain_queue:
+                    to_drain[req_state.queue] = None
 
             # Free completed requests.
             if finish_reason is not None:
@@ -1041,7 +1073,11 @@ class OutputProcessor:
                         reqs_to_abort.append(req_id)
 
         return OutputProcessorOutput(
-            request_outputs=request_outputs,
+            request_outputs=[
+                output
+                for queue in to_drain
+                if (output := queue.get_nowait()) is not None
+            ],
             reqs_to_abort=reqs_to_abort,
         )
 

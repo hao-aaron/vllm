@@ -3,6 +3,8 @@
 """What a client assembles from OutputProcessor, across output kinds,
 stream intervals, reader speeds and n, must match the FINAL_ONLY result."""
 
+import dataclasses
+import inspect
 import itertools
 from dataclasses import dataclass, field
 from unittest.mock import patch
@@ -21,7 +23,12 @@ from tests.v1.engine.utils import (
     generate_dummy_prompt_logprobs_tensors,
     generate_dummy_sample_logprobs,
 )
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import (
+    COMPLETION_OUTPUT_MERGE,
+    REQUEST_OUTPUT_MERGE,
+    CompletionOutput,
+    RequestOutput,
+)
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tracing import SpanAttributes
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -178,7 +185,7 @@ def _drive(
         cache_salt=None,
         data_parallel_rank=None,
     )
-    queue = RequestOutputCollector(kind, request.request_id)
+    queue = RequestOutputCollector(kind, request.request_id, n=n)
     if n == 1:
         child_ids = [request.request_id]
         processor.add_request(request, None, None, 0, queue)
@@ -329,24 +336,29 @@ def test_client_view_matches_final_only(vectors, kind, interval, reader, n, fini
 
 @pytest.mark.parametrize(
     "kind,interval,n,finish_by",
-    [
-        pytest.param(
-            *p,
-            marks=pytest.mark.xfail(
-                p[0] == CUMULATIVE and p[1] > 1,
-                reason="CUMULATIVE ignores stream_interval",
-                strict=True,
-            ),
-        )
-        for p in itertools.product(
+    list(
+        itertools.product(
             list(RequestOutputKind), [1, 2, 3], [1, 2], ["length", "abort"]
         )
-    ],
+    ),
 )
 def test_fast_reader_wakeups(vectors, kind, interval, n, finish_by):
     expected = _expected_fast_reader_yields(vectors, kind, interval, n, finish_by)
     run = _drive(vectors, kind, interval, 1, n, finish_by)
     assert run.num_yields == expected
+
+
+def test_every_output_field_has_a_merge_rule():
+    """A field without a rule in RequestOutput.add() is lost when outputs are
+    combined: by a slow DELTA reader, and always for CUMULATIVE and n>1."""
+    completion_fields = {f.name for f in dataclasses.fields(CompletionOutput)}
+    request_fields = {
+        name
+        for name, param in inspect.signature(RequestOutput).parameters.items()
+        if param.kind is not inspect.Parameter.VAR_KEYWORD
+    }
+    assert completion_fields == set(COMPLETION_OUTPUT_MERGE)
+    assert request_fields == set(REQUEST_OUTPUT_MERGE)
 
 
 def _make_request(
