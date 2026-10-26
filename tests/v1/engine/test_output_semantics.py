@@ -370,7 +370,6 @@ def _make_request(
     )
 
 
-@pytest.mark.xfail(reason="B1: aborts skip finished-request stats", strict=True)
 def test_abort_records_finished_request_stats():
     """B1: a client abort produces a finished-request record."""
     processor = OutputProcessor(None, log_stats=True)
@@ -399,7 +398,21 @@ def test_abort_records_finished_request_stats():
     assert finished["req-0"].num_generation_tokens == 1
 
 
-@pytest.mark.xfail(reason="B1: aborts skip tracing", strict=True)
+def test_abort_while_queued_has_no_negative_phase_times():
+    processor = OutputProcessor(None, log_stats=True)
+    processor.add_request(_make_request(), None)
+    processor.request_states["req-int"].stats.queued_ts = 5.0
+
+    processor.abort_requests(["req"], internal=False)
+    iteration_stats = IterationStats()
+    processor.process_outputs([], iteration_stats=iteration_stats)
+
+    (record,) = iteration_stats.finished_requests
+    assert record.finish_reason == FinishReason.ABORT
+    assert record.queued_time == record.prefill_time == 0.0
+    assert record.decode_time == record.inference_time == 0.0
+
+
 def test_abort_emits_tracing_span():
     """B1: a client abort ends the request's tracing span."""
     processor = OutputProcessor(None, log_stats=True, tracing_enabled=True)
@@ -460,7 +473,6 @@ def _assert_maps_consistent(processor: OutputProcessor) -> None:
         assert any(s.parent_req is parent for s in states.values()), parent_id
 
 
-@pytest.mark.xfail(reason="aborting children without a queue leaks the parent")
 @pytest.mark.parametrize("seed", range(5))
 def test_request_maps_stay_consistent(seed):
     """Request maps agree after any sequence of add, finish and abort."""

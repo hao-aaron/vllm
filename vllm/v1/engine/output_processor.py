@@ -3,8 +3,9 @@
 
 import asyncio
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -204,6 +205,7 @@ class RequestState:
         temperature: float | None = None,
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
+        trace_headers: Mapping[str, str] | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -234,6 +236,7 @@ class RequestState:
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        self.trace_headers = trace_headers
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
@@ -346,6 +349,7 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
+            trace_headers=request.trace_headers,
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -549,6 +553,177 @@ class RequestState:
         return PoolingOutput(data=pooling_output)
 
 
+class RequestRegistry:
+    """Owns the request maps, and is the only code that adds or removes
+    requests. Every removal goes through unregister(), so finished, aborted
+    and rejected requests run the same side effects."""
+
+    def __init__(
+        self,
+        log_stats: bool,
+        tracing_enabled: bool,
+        admission_stats: "SharedAdmissionStats | None",
+    ):
+        self._states: dict[str, RequestState] = {}
+        self._parents: dict[str, ParentRequest] = {}
+        self._external_ids: defaultdict[str, list[str]] = defaultdict(list)
+        self.lora_states = LoRARequestStates(log_stats)
+        self.tracing_enabled = tracing_enabled
+        self.admission_stats = admission_stats
+        # Requests removed outside an engine step (client aborts). Their
+        # stats and spans go into the next step's IterationStats.
+        self._pending_finished: list[tuple[RequestState, FinishReason]] = []
+
+        self.states = MappingProxyType(self._states)
+        self.parents = MappingProxyType(self._parents)
+        self.external_ids = MappingProxyType(self._external_ids)
+
+    def __len__(self) -> int:
+        return len(self._states)
+
+    def get(self, request_id: str) -> RequestState | None:
+        return self._states.get(request_id)
+
+    def register(self, state: RequestState) -> None:
+        assert state.request_id not in self._states
+        self._states[state.request_id] = state
+        if parent_req := state.parent_req:
+            self._parents[parent_req.request_id] = parent_req
+        self._external_ids[state.external_req_id].append(state.request_id)
+        self._update_admission_stats()
+
+    def resolve(self, request_ids: Iterable[str], internal: bool) -> list[RequestState]:
+        """Map request IDs to the registered requests they refer to.
+
+        External IDs map to every request registered under them. Internal
+        IDs are request IDs or parallel-sampling parent IDs, which map to the
+        parent's registered children.
+        """
+        states: dict[str, RequestState] = {}
+        for request_id in request_ids:
+            if not internal:
+                internal_ids = self._external_ids.get(request_id, ())
+            elif parent := self._parents.get(request_id):
+                internal_ids = parent.child_requests
+            else:
+                internal_ids = (request_id,)
+            for internal_id in internal_ids:
+                if state := self._states.get(internal_id):
+                    states[internal_id] = state
+        return list(states.values())
+
+    def unregister(
+        self,
+        state: RequestState,
+        finish_reason: FinishReason | None,
+        iteration_stats: IterationStats | None = None,
+    ) -> None:
+        """Remove a request and run every removal side effect.
+
+        finish_reason is None for requests that should leave no
+        finished-request record, e.g. ones the engine rejected on arrival.
+        """
+        request_id = state.request_id
+        del self._states[request_id]
+        internal_ids = self._external_ids[state.external_req_id]
+        internal_ids.remove(request_id)
+        if not internal_ids:
+            del self._external_ids[state.external_req_id]
+        if parent_req := state.parent_req:
+            parent_req.child_requests.discard(request_id)
+            if not parent_req.child_requests:
+                self._parents.pop(parent_req.request_id, None)
+
+        self.lora_states.request_finished(request_id, state.lora_name)
+        if finish_reason is not None and state.stats is not None:
+            if iteration_stats is None:
+                self._pending_finished.append((state, finish_reason))
+            else:
+                self._record_finished(state, finish_reason, iteration_stats)
+        self._update_admission_stats()
+
+    def flush_pending(self, iteration_stats: IterationStats) -> None:
+        for state, finish_reason in self._pending_finished:
+            self._record_finished(state, finish_reason, iteration_stats)
+        self._pending_finished.clear()
+
+    def _update_admission_stats(self) -> None:
+        if self.admission_stats is not None:
+            self.admission_stats.set_num_requests(len(self._states))
+
+    def _record_finished(
+        self,
+        state: RequestState,
+        finish_reason: FinishReason,
+        iteration_stats: IterationStats,
+    ) -> None:
+        assert state.stats is not None
+        iteration_stats.update_from_finished_request(
+            finish_reason=finish_reason,
+            request_id=state.external_req_id,
+            num_prompt_tokens=state.prompt_len,
+            max_tokens_param=state.max_tokens_param,
+            req_stats=state.stats,
+            num_cached_tokens=state.num_cached_tokens,
+        )
+        ParentRequest.observe_finished_request(
+            state.parent_req, iteration_stats, state.stats.num_generation_tokens
+        )
+        if self.tracing_enabled:
+            self._do_tracing(state, iteration_stats)
+
+    @staticmethod
+    def _do_tracing(state: RequestState, iteration_stats: IterationStats) -> None:
+        assert state.stats is not None
+        metrics = state.stats
+        arrival_time_ns = int(metrics.arrival_time * 1e9)
+        trace_context = extract_trace_context(state.trace_headers)
+        prompt_length = length_from_prompt_token_ids_or_embeds(
+            state.prompt_token_ids, state.prompt_embeds
+        )
+
+        # Calculate timing metrics
+        e2e_time = iteration_stats.iteration_timestamp - metrics.arrival_time
+        queued_time, prefill_time, decode_time, inference_time = metrics.phase_times()
+
+        # Build attributes dict
+        attributes: dict[str, Any] = {
+            SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN: (
+                metrics.first_token_latency
+            ),
+            SpanAttributes.GEN_AI_LATENCY_E2E: e2e_time,
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE: queued_time,
+            SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS: prompt_length,
+            SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS: (
+                metrics.num_generation_tokens
+            ),
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL: prefill_time,
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE: decode_time,
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: inference_time,
+            SpanAttributes.GEN_AI_REQUEST_ID: state.external_req_id,
+        }
+
+        # Add optional request parameters
+        if state.top_p:
+            attributes[SpanAttributes.GEN_AI_REQUEST_TOP_P] = state.top_p
+        if state.max_tokens_param:
+            attributes[SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS] = (
+                state.max_tokens_param
+            )
+        if state.temperature:
+            attributes[SpanAttributes.GEN_AI_REQUEST_TEMPERATURE] = state.temperature
+        if state.n:
+            attributes[SpanAttributes.GEN_AI_REQUEST_N] = state.n
+
+        instrument_manual(
+            span_name="llm_request",
+            start_time=arrival_time_ns,
+            attributes=attributes,
+            context=trace_context,
+            kind=SpanKind.SERVER,
+        )
+
+
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
@@ -564,15 +739,26 @@ class OutputProcessor:
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
-        self.request_states: dict[str, RequestState] = {}
-        self.parent_requests: dict[str, ParentRequest] = {}
-        self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
-        self.lora_states = LoRARequestStates(log_stats)
-        self.tracing_enabled = tracing_enabled
-        self.admission_stats = admission_stats
+        self._registry = RequestRegistry(log_stats, tracing_enabled, admission_stats)
+
+    @property
+    def request_states(self) -> Mapping[str, RequestState]:
+        return self._registry.states
+
+    @property
+    def parent_requests(self) -> Mapping[str, ParentRequest]:
+        return self._registry.parents
+
+    @property
+    def external_req_ids(self) -> Mapping[str, list[str]]:
+        return self._registry.external_ids
+
+    @property
+    def lora_states(self) -> LoRARequestStates:
+        return self._registry.lora_states
 
     def get_num_unfinished_requests(self):
-        return len(self.request_states)
+        return len(self._registry)
 
     def has_request(self, request_id: str) -> bool:
         return request_id in self.request_states
@@ -589,7 +775,7 @@ class OutputProcessor:
         )
 
     def has_unfinished_requests(self) -> bool:
-        return len(self.request_states) > 0
+        return len(self._registry) > 0
 
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
@@ -612,53 +798,26 @@ class OutputProcessor:
         a parent request, in which case the associated child requests are aborted
         also.
         """
-        internal_req_ids = []
-        for request_id in request_ids:
-            if internal:
-                # Internal ID - this may be a parent request
-                internal_req_ids.append(request_id)
-
-                # Remove internal ID from the external->internal mapping
-                if req_state := self.request_states.get(request_id):
-                    external_req_id = req_state.external_req_id
-                    internal_ids = self.external_req_ids[external_req_id]
-                    internal_ids.remove(request_id)
-                    if not internal_ids:
-                        del self.external_req_ids[external_req_id]
-            elif internal_ids := self.external_req_ids.pop(request_id, []):
-                # External ID - abort all requests in the external->internal mapping
-                internal_req_ids.extend(internal_ids)
-
         request_ids_to_abort = []
-        for request_id in internal_req_ids:
-            req_state = self.request_states.pop(request_id, None)
-            if req_state is not None:
-                self.lora_states.request_finished(request_id, req_state.lora_name)
-                request_ids_to_abort.append(request_id)
-                # Produce final abort output.
-                if req_state.queue is not None and (
-                    request_output := req_state.make_request_output(
-                        new_token_ids=[],
-                        # Set pooling_output is not None to
-                        # correctly enter the abort pooling branch
-                        pooling_output=EMPTY_CPU_TENSOR
-                        if req_state.detokenizer is None
-                        else None,
-                        finish_reason=FinishReason.ABORT,
-                        stop_reason=None,
-                        kv_transfer_params=None,
-                        ec_transfer_params=None,
-                    )
-                ):
-                    req_state.queue.put(request_output)
-            elif parent := self.parent_requests.get(request_id):
-                # Abort children prior to removing the parent.
-                if parent.child_requests:
-                    child_reqs = list(parent.child_requests)
-                    child_reqs = self.abort_requests(child_reqs, internal=True)
-                    request_ids_to_abort.extend(child_reqs)
-                self.parent_requests.pop(request_id, None)
-        self._update_admission_stats()
+        for req_state in self._registry.resolve(request_ids, internal):
+            request_ids_to_abort.append(req_state.request_id)
+            # Produce final abort output.
+            if req_state.queue is not None and (
+                request_output := req_state.make_request_output(
+                    new_token_ids=[],
+                    # Set pooling_output is not None to
+                    # correctly enter the abort pooling branch
+                    pooling_output=EMPTY_CPU_TENSOR
+                    if req_state.detokenizer is None
+                    else None,
+                    finish_reason=FinishReason.ABORT,
+                    stop_reason=None,
+                    kv_transfer_params=None,
+                    ec_transfer_params=None,
+                )
+            ):
+                req_state.queue.put(request_output)
+            self._registry.unregister(req_state, FinishReason.ABORT)
         return request_ids_to_abort
 
     def add_request(
@@ -670,7 +829,7 @@ class OutputProcessor:
         queue: RequestOutputCollector | None = None,
     ) -> None:
         request_id = request.request_id
-        req_state = self.request_states.get(request_id)
+        req_state = self._registry.get(request_id)
         if req_state is not None:
             if not req_state.is_resumable_session:
                 raise ValueError(f"Request id {request_id} already running.")
@@ -687,13 +846,7 @@ class OutputProcessor:
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
         )
-        self.request_states[request_id] = req_state
-        if parent_req:
-            self.parent_requests[parent_req.request_id] = parent_req
-
-        # Track the external_req_id -> [internal_req_id, ...] mapping
-        self.external_req_ids[req_state.external_req_id].append(request_id)
-        self._update_admission_stats()
+        self._registry.register(req_state)
 
     def _update_streaming_request_state(
         self, req_state: RequestState, request: EngineCoreRequest, prompt: str | None
@@ -703,7 +856,7 @@ class OutputProcessor:
             # Final request - just mark completion, don't add its dummy tokens.
             if req_state.input_chunk_queue is None:
                 # Engine already finished - emit final output and clean up.
-                self._finish_request(req_state)
+                self._registry.unregister(req_state, None)
                 if req_state.queue is not None:
                     # Emit a final output with finished=True
                     # to unblock the generate() loop.
@@ -755,11 +908,14 @@ class OutputProcessor:
         If you need to touch every element of the batch, do it from
         within the loop below.
         """
+        if iteration_stats is not None:
+            self._registry.flush_pending(iteration_stats)
+
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
-            req_state = self.request_states.get(req_id)
+            req_state = self._registry.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
@@ -768,7 +924,7 @@ class OutputProcessor:
             if error is not None and req_state.queue is not None:
                 # Rejected on arrival, e.g. by a paused engine; nothing was run.
                 req_state.queue.put(error.to_exception())
-                self._finish_request(req_state)
+                self._registry.unregister(req_state, None)
                 if req_state.streaming_input:
                     # Input chunks sent since may re-create the session.
                     reqs_to_abort.append(req_id)
@@ -877,19 +1033,12 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
-                    self._finish_request(req_state)
+                    self._registry.unregister(req_state, finish_reason, iteration_stats)
                     if req_state.streaming_input or not engine_core_output.finished:
                         # EngineCore may still have the request: a stop string
                         # was detected here, or an in-flight streaming-input
                         # chunk may re-create the session.
                         reqs_to_abort.append(req_id)
-
-                    # Track per-request stats
-                    self._update_stats_from_finished(
-                        req_state, finish_reason, iteration_stats
-                    )
-                    if self.tracing_enabled:
-                        self.do_tracing(engine_core_output, req_state, iteration_stats)
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,
@@ -917,91 +1066,8 @@ class OutputProcessor:
         if output.routed_experts is not None:
             req_state.routed_experts_chunks[-1] = output.routed_experts[:-num_dropped]
 
-    def _finish_request(self, req_state: RequestState) -> None:
-        req_id = req_state.request_id
-        self.request_states.pop(req_id)
-
-        internal_ids = self.external_req_ids[req_state.external_req_id]
-        internal_ids.remove(req_id)
-        if not internal_ids:
-            del self.external_req_ids[req_state.external_req_id]
-
-        # Remove parent request if applicable.
-        parent_req = req_state.parent_req
-        if parent_req:
-            parent_req.child_requests.discard(req_id)
-            if not parent_req.child_requests:
-                self.parent_requests.pop(parent_req.request_id, None)
-        self._update_admission_stats()
-
-    def _update_admission_stats(self) -> None:
-        if self.admission_stats is not None:
-            self.admission_stats.set_num_requests(self.get_num_unfinished_requests())
-
     def update_scheduler_stats(self, scheduler_stats: SchedulerStats | None):
         self.lora_states.update_scheduler_stats(scheduler_stats)
-
-    def do_tracing(
-        self,
-        engine_core_output: EngineCoreOutput,
-        req_state: RequestState,
-        iteration_stats: IterationStats | None,
-    ) -> None:
-        assert req_state.stats is not None
-        assert iteration_stats is not None
-
-        metrics = req_state.stats
-        arrival_time_ns = int(metrics.arrival_time * 1e9)
-        trace_context = extract_trace_context(engine_core_output.trace_headers)
-        prompt_length = length_from_prompt_token_ids_or_embeds(
-            req_state.prompt_token_ids, req_state.prompt_embeds
-        )
-
-        # Calculate timing metrics
-        e2e_time = iteration_stats.iteration_timestamp - metrics.arrival_time
-        queued_time = metrics.scheduled_ts - metrics.queued_ts
-        prefill_time = metrics.first_token_ts - metrics.scheduled_ts
-        decode_time = metrics.last_token_ts - metrics.first_token_ts
-        inference_time = metrics.last_token_ts - metrics.scheduled_ts
-
-        # Build attributes dict
-        attributes: dict[str, Any] = {
-            SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN: (
-                metrics.first_token_latency
-            ),
-            SpanAttributes.GEN_AI_LATENCY_E2E: e2e_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE: queued_time,
-            SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS: prompt_length,
-            SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS: (
-                metrics.num_generation_tokens
-            ),
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL: prefill_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE: decode_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: inference_time,
-            SpanAttributes.GEN_AI_REQUEST_ID: req_state.external_req_id,
-        }
-
-        # Add optional request parameters
-        if req_state.top_p:
-            attributes[SpanAttributes.GEN_AI_REQUEST_TOP_P] = req_state.top_p
-        if req_state.max_tokens_param:
-            attributes[SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS] = (
-                req_state.max_tokens_param
-            )
-        if req_state.temperature:
-            attributes[SpanAttributes.GEN_AI_REQUEST_TEMPERATURE] = (
-                req_state.temperature
-            )
-        if req_state.n:
-            attributes[SpanAttributes.GEN_AI_REQUEST_N] = req_state.n
-
-        instrument_manual(
-            span_name="llm_request",
-            start_time=arrival_time_ns,
-            attributes=attributes,
-            context=trace_context,
-            kind=SpanKind.SERVER,
-        )
 
     def _update_stats_from_output(
         self,
@@ -1022,29 +1088,4 @@ class OutputProcessor:
             req_state.stats,
             self.lora_states,
             req_state.lora_name,
-        )
-
-    def _update_stats_from_finished(
-        self,
-        req_state: RequestState,
-        finish_reason: FinishReason | None,
-        iteration_stats: IterationStats | None,
-    ):
-        if iteration_stats is None:
-            return
-
-        assert finish_reason is not None
-        assert req_state.stats is not None
-        iteration_stats.update_from_finished_request(
-            finish_reason=finish_reason,
-            request_id=req_state.external_req_id,
-            num_prompt_tokens=req_state.prompt_len,
-            max_tokens_param=req_state.max_tokens_param,
-            req_stats=req_state.stats,
-            num_cached_tokens=req_state.num_cached_tokens,
-        )
-        self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
-
-        ParentRequest.observe_finished_request(
-            req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
         )
