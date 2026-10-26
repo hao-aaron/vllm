@@ -549,18 +549,22 @@ class AsyncLLM(EngineClient):
             child_requests.append(child_request)
 
         self.check_admission(parent_params.n, parent_request.request_id)
+        added_ids: list[str] = []
         try:
             for idx, child_request in enumerate(child_requests):
                 self.output_processor.add_request(
                     child_request, prompt_text, parent_request, idx, queue
                 )
+                added_ids.append(child_request.request_id)
 
             for child_request in child_requests:
                 await self.engine_core.add_request_async(child_request)
                 if self.log_requests:
                     logger.info("Added request %s.", child_request.request_id)
         except BaseException:
-            await self.abort(parent_request.request_id, internal=True)
+            # Abort only our children: the parent ID may belong to another
+            # running request if it was a duplicate.
+            await self.abort(added_ids, internal=True)
             raise
         return queue
 

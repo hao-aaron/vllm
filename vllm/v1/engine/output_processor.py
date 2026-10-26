@@ -246,6 +246,7 @@ class RequestState:
         self.sent_tokens_offset = 0  # Offset of sent tokens
 
         # Streaming input queue
+        self.is_resumable_session = stream_input
         self.streaming_input = stream_input
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
@@ -671,6 +672,8 @@ class OutputProcessor:
         request_id = request.request_id
         req_state = self.request_states.get(request_id)
         if req_state is not None:
+            if not req_state.is_resumable_session:
+                raise ValueError(f"Request id {request_id} already running.")
             self._update_streaming_request_state(req_state, request, prompt)
             return
 

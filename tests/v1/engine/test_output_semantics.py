@@ -425,7 +425,6 @@ def test_abort_emits_tracing_span():
     assert attributes[SpanAttributes.GEN_AI_REQUEST_ID] == "req"
 
 
-@pytest.mark.xfail(reason="B2: duplicate IDs are taken as continuations", strict=True)
 def test_duplicate_request_id_is_rejected():
     """B2: with request ID randomization disabled, a second request reusing a
     running ID is rejected and the original completes normally."""
