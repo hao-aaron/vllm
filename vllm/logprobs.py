@@ -93,6 +93,16 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
     def extend(self, logprobs_multi_positions) -> None:
         """Extends the container with logprobs for the next multiple positions."""
+        if isinstance(logprobs_multi_positions, FlatLogprobs):
+            other = logprobs_multi_positions
+            offset = len(self.logprobs)
+            self.start_indices.extend([i + offset for i in other.start_indices])
+            self.end_indices.extend([i + offset for i in other.end_indices])
+            self.token_ids.extend(other.token_ids)
+            self.logprobs.extend(other.logprobs)
+            self.ranks.extend(other.ranks)
+            self.decoded_tokens.extend(other.decoded_tokens)
+            return
         for logprobs_one_position in logprobs_multi_positions:
             self.append(logprobs_one_position)
 

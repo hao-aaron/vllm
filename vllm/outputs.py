@@ -208,28 +208,14 @@ class RequestOutput:
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
 
-    def add(self, next_output: "RequestOutput", aggregate: bool = True) -> None:
-        """Merge the next output of the same request into this one.
-
-        With aggregate=True, fields combine per REQUEST_OUTPUT_MERGE and
-        COMPLETION_OUTPUT_MERGE; otherwise completions are replaced.
-        """
-        if aggregate:
-            _merge_fields(REQUEST_OUTPUT_MERGE, self, next_output)
-        else:
-            self.finished |= next_output.finished
-            self.kv_transfer_params = next_output.kv_transfer_params
-            self.ec_transfer_params = next_output.ec_transfer_params
-
+    def add(self, next_output: "RequestOutput") -> None:
+        """Merge the next output of the same request into this one, per
+        REQUEST_OUTPUT_MERGE and COMPLETION_OUTPUT_MERGE."""
+        _merge_fields(REQUEST_OUTPUT_MERGE, self, next_output)
         for next_completion in next_output.outputs:
-            for i, completion in enumerate(self.outputs):
+            for completion in self.outputs:
                 if completion.index == next_completion.index:
-                    if aggregate:
-                        _merge_fields(
-                            COMPLETION_OUTPUT_MERGE, completion, next_completion
-                        )
-                    else:
-                        self.outputs[i] = next_completion
+                    _merge_fields(COMPLETION_OUTPUT_MERGE, completion, next_completion)
                     break
             else:
                 self.outputs.append(next_completion)
@@ -305,8 +291,7 @@ COMPLETION_OUTPUT_MERGE: dict[str, MergeFn | None] = {
     "lora_request": None,
     "sampling_mask": _append,
     "spec_decode_metrics": _on_finish,
-    # Like finish_reason, spans come only with the final output.
-    "weight_versions": _latest,
+    "weight_versions": _on_finish,
 }
 
 REQUEST_OUTPUT_MERGE: dict[str, MergeFn | None] = {

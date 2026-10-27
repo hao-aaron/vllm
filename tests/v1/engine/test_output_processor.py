@@ -1573,7 +1573,7 @@ def test_routed_experts_are_accumulated_until_finish():
 async def test_cumulative_output_collector_n():
     """CUMULATIVE collector accumulates deltas from several sequences by index."""
     collector = RequestOutputCollector(
-        RequestOutputKind.CUMULATIVE, request_id="my-request-id-int", n=3
+        RequestOutputKind.CUMULATIVE, request_id="my-request-id-int"
     )
 
     def delta(index: int, text: str, token_id: int) -> RequestOutput:
@@ -1878,8 +1878,8 @@ def test_request_output_add_merges_delta_sampling_masks():
         )
 
     merged = delta([], None)
-    merged.add(delta([10], SamplingMask([[10, 11]])), aggregate=True)
-    merged.add(delta([20], SamplingMask([[20]])), aggregate=True)
+    merged.add(delta([10], SamplingMask([[10, 11]])))
+    merged.add(delta([20], SamplingMask([[20]])))
 
     assert merged.outputs[0].token_ids == [10, 20]
     assert merged.outputs[0].sampling_mask.token_ids == [[10, 11], [20]]

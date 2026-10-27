@@ -66,7 +66,7 @@ def test_request_output_add_propagates_ec_transfer_params():
         )
 
     accumulated = _out(None)
-    accumulated.add(_out(EC_PARAMS), aggregate=True)
+    accumulated.add(_out(EC_PARAMS))
     assert accumulated.ec_transfer_params == EC_PARAMS
 
 

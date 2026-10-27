@@ -60,15 +60,16 @@ class RequestOutputCollector:
     are merged if the producer gets ahead of the consumer.
     """
 
-    def __init__(self, output_kind: RequestOutputKind, request_id: str, n: int = 1):
+    def __init__(
+        self, output_kind: RequestOutputKind, request_id: str, drain: bool = False
+    ):
         self.kind = output_kind
-        self.aggregate = output_kind == RequestOutputKind.DELTA
         self.request_id = request_id
-        self.n = n
+        # Created and drained by the OutputProcessor (LLMEngine).
+        self.drain = drain
         self.output: RequestOutput | PoolingRequestOutput | Exception | None = None
         self.ready = asyncio.Event()
 
-        self._finished_indexes: set[int] = set()
         # Running total for CUMULATIVE, and for FINAL_ONLY with n > 1.
         self._accum: RequestOutput | None = None
 
@@ -83,12 +84,6 @@ class RequestOutputCollector:
         self._deliver(output)
 
     def _collect(self, delta: RequestOutput) -> RequestOutput | None:
-        if delta.finished and delta.outputs:
-            for completion in delta.outputs:
-                if completion.finish_reason is not None:
-                    self._finished_indexes.add(completion.index)
-            delta.finished = len(self._finished_indexes) >= self.n
-
         if self.kind == RequestOutputKind.DELTA:
             return delta
         if self._accum is None:
@@ -110,7 +105,7 @@ class RequestOutputCollector:
         self, unread: RequestOutput, output: RequestOutput
     ) -> RequestOutput:
         """DELTA: concatenate unread deltas. Otherwise the newest replaces."""
-        if not self.aggregate:
+        if self.kind != RequestOutputKind.DELTA:
             return output
         unread.add(output)
         return unread
@@ -246,7 +241,7 @@ class RequestState:
         detokenizer: IncrementalDetokenizer | None,
         max_tokens_param: int | None,
         arrival_time: float,
-        queue: RequestOutputCollector | None,
+        queue: RequestOutputCollector,
         log_stats: bool,
         stream_interval: int,
         top_p: float | None = None,
@@ -255,7 +250,6 @@ class RequestState:
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
         trace_headers: Mapping[str, str] | None = None,
-        drain_queue: bool = False,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -278,9 +272,6 @@ class RequestState:
         self.temperature = temperature
         self.is_prefilling = True
         self.queue = queue
-        # The queue was created by the output processor, which drains it and
-        # returns the outputs (LLMEngine).
-        self.drain_queue = drain_queue
         self.num_cached_tokens = 0
         self.num_cache_creation_tokens = 0
         self.remote_prefill_cached_tokens = remote_prefill_cached_tokens
@@ -297,12 +288,12 @@ class RequestState:
         # (weight version, first output-token index) for each span.
         self.weight_version_starts: list[tuple[str, int]] = []
 
-        # Stream Interval
         self.stream_interval = stream_interval
-        self.sent_tokens_offset = 0  # Offset of sent tokens
+        self.sent_tokens_offset = 0  # Output tokens already sent.
 
-        # Streaming input queue
-        self.is_resumable_session = stream_input
+        # Streaming input: resumable is fixed, streaming_input turns False
+        # once the final input chunk arrives.
+        self.resumable = stream_input
         self.streaming_input = stream_input
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
@@ -335,10 +326,9 @@ class RequestState:
         prompt: str | None,
         parent_req: ParentRequest | None,
         request_index: int,
-        queue: RequestOutputCollector | None,
+        queue: RequestOutputCollector,
         log_stats: bool,
         stream_interval: int,
-        drain_queue: bool = False,
     ) -> "RequestState":
         remote_prefill_cached_tokens = None
         if sampling_params := request.sampling_params:
@@ -404,7 +394,6 @@ class RequestState:
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
             trace_headers=request.trace_headers,
-            drain_queue=drain_queue,
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -436,9 +425,11 @@ class RequestState:
 
         if not self._should_emit(finished):
             return None
+        # With n > 1, the request finishes with its last running child.
+        parent = self.parent_req
         return self._new_request_output(
             [self._new_completion_output(finish_reason, stop_reason)],
-            finished,
+            finished and (parent is None or parent.child_requests <= {self.request_id}),
             kv_transfer_params,
             ec_transfer_params,
         )
@@ -535,7 +526,7 @@ class RequestState:
 
         return CompletionOutput(
             index=self.request_index,
-            text=self.detokenizer.get_next_output_text(finished, delta=True),
+            text=self.detokenizer.get_next_output_text(finished),
             token_ids=self.detokenizer.output_token_ids_since(start),
             routed_experts=routed_experts,
             sampling_mask=sampling_mask,
@@ -587,12 +578,6 @@ class RequestRegistry:
         # Requests removed outside an engine step (client aborts). Their
         # stats and spans go into the next step's IterationStats.
         self._pending_finished: list[tuple[RequestState, FinishReason]] = []
-
-    def __len__(self) -> int:
-        return len(self.states)
-
-    def get(self, request_id: str) -> RequestState | None:
-        return self.states.get(request_id)
 
     def register(self, state: RequestState) -> None:
         assert state.request_id not in self.states
@@ -767,7 +752,7 @@ class OutputProcessor:
         self.lora_states = self._registry.lora_states
 
     def get_num_unfinished_requests(self):
-        return len(self._registry)
+        return len(self.request_states)
 
     def has_request(self, request_id: str) -> bool:
         return request_id in self.request_states
@@ -784,12 +769,11 @@ class OutputProcessor:
         )
 
     def has_unfinished_requests(self) -> bool:
-        return len(self._registry) > 0
+        return len(self.request_states) > 0
 
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
-        for _, state in self.request_states.items():
-            assert state.queue is not None
+        for state in self.request_states.values():
             state.queue.put(e)
 
     def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
@@ -811,7 +795,7 @@ class OutputProcessor:
         for req_state in self._registry.resolve(request_ids, internal):
             request_ids_to_abort.append(req_state.request_id)
             # Produce final abort output.
-            if not req_state.drain_queue and (
+            if not req_state.queue.drain and (
                 request_output := req_state.make_request_output(
                     # Set pooling_output is not None to
                     # correctly enter the abort pooling branch
@@ -837,23 +821,16 @@ class OutputProcessor:
         queue: RequestOutputCollector | None = None,
     ) -> None:
         request_id = request.request_id
-        req_state = self._registry.get(request_id)
+        req_state = self.request_states.get(request_id)
         if req_state is not None:
-            if not req_state.is_resumable_session:
+            if not req_state.resumable:
                 raise ValueError(f"Request id {request_id} already running.")
             self._update_streaming_request_state(req_state, request, prompt)
             return
 
-        drain_queue = queue is None
-        if queue is not None:
-            assert parent_req is None or queue.n == parent_req.n, (
-                "children of an n>1 request must share a collector created with n"
-            )
-        else:
+        if queue is None:
             queue = self._registry.sibling_queue(parent_req) or RequestOutputCollector(
-                request.params.output_kind,
-                request_id,
-                n=parent_req.n if parent_req is not None else 1,
+                request.params.output_kind, request_id, drain=True
             )
         req_state = RequestState.from_new_request(
             tokenizer=self.tokenizer,
@@ -864,7 +841,6 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
-            drain_queue=drain_queue,
         )
         self._registry.register(req_state)
 
@@ -877,10 +853,8 @@ class OutputProcessor:
             if req_state.input_chunk_queue is None:
                 # Engine already finished - emit final output and clean up.
                 self._registry.unregister(req_state, None)
-                if req_state.queue is not None:
-                    # Emit a final output with finished=True
-                    # to unblock the generate() loop.
-                    req_state.queue.put(STREAM_FINISHED)
+                # Unblock the generate() loop.
+                req_state.queue.put(STREAM_FINISHED)
             elif req_state.input_chunk_queue:
                 req_state.input_chunk_queue[-1].final = True
             else:
@@ -934,13 +908,13 @@ class OutputProcessor:
         reqs_to_abort: list[str] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
-            req_state = self._registry.get(req_id)
+            req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
 
             error = engine_core_output.error
-            if error is not None and not req_state.drain_queue:
+            if error is not None and not req_state.queue.drain:
                 # Rejected on arrival, e.g. by a paused engine; nothing was run.
                 req_state.queue.put(error.to_exception())
                 self._registry.unregister(req_state, None)
@@ -1035,9 +1009,8 @@ class OutputProcessor:
                 if streaming_chunk_boundary:
                     request_output.finished = False
 
-                assert req_state.queue is not None
                 req_state.queue.put(request_output)
-                if req_state.drain_queue:
+                if req_state.queue.drain:
                     to_drain[req_state.queue] = None
 
             # Free completed requests.

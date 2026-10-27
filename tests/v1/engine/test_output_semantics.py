@@ -6,22 +6,18 @@ stream intervals, reader speeds and n, must match the FINAL_ONLY result."""
 import dataclasses
 import inspect
 import itertools
+from copy import copy
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
 import numpy as np
 import pytest
-from transformers import AutoTokenizer
 
 from tests.v1.engine.utils import (
-    FULL_STRINGS,
     NUM_PROMPT_LOGPROBS_UNDER_TEST,
     NUM_SAMPLE_LOGPROBS_UNDER_TEST,
-    PROMPT_LEN,
     STOP_STRINGS,
-    TOKENIZER_NAME,
-    generate_dummy_prompt_logprobs_tensors,
-    generate_dummy_sample_logprobs,
+    DummyOutputProcessorTestVectors,
 )
 from vllm.outputs import (
     COMPLETION_OUTPUT_MERGE,
@@ -42,47 +38,48 @@ CUMULATIVE = RequestOutputKind.CUMULATIVE
 FINAL_ONLY = RequestOutputKind.FINAL_ONLY
 
 ABORT_AFTER_STEP = 4
+SLOW_READER_PERIOD = 3
 
 
-@dataclass
-class Vectors:
-    tokenizer: object
-    prompt_tokens: list[list[int]]
-    generation_tokens: list[list[int]]
-    generation_logprobs: list
-    prompt_logprobs: list
-
-
-@pytest.fixture(scope="module")
-def vectors() -> Vectors:
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    full = [tokenizer(text).input_ids for text in FULL_STRINGS[:2]]
-    prompt_tokens = [ids[:PROMPT_LEN] for ids in full]
-    generation_tokens = [ids[PROMPT_LEN:] for ids in full]
-    return Vectors(
-        tokenizer=tokenizer,
-        prompt_tokens=prompt_tokens,
-        generation_tokens=generation_tokens,
-        generation_logprobs=[
-            generate_dummy_sample_logprobs(
-                sampled_tokens_list=tokens,
-                num_logprobs=NUM_SAMPLE_LOGPROBS_UNDER_TEST,
-                tokenizer=tokenizer,
-            )
-            for tokens in generation_tokens
-        ],
-        prompt_logprobs=[
-            generate_dummy_prompt_logprobs_tensors(
-                prompt_tokens_list=tokens,
-                num_logprobs=NUM_PROMPT_LOGPROBS_UNDER_TEST,
-                tokenizer=tokenizer,
-            )
-            for tokens in prompt_tokens
-        ],
+def _make_request(
+    request_id: str = "req-int",
+    external_req_id: str = "req",
+    output_kind: RequestOutputKind = DELTA,
+    *,
+    prompt_token_ids: list[int] | None = None,
+    sampling_params: SamplingParams | None = None,
+    **kwargs,
+) -> EngineCoreRequest:
+    return EngineCoreRequest(
+        request_id=request_id,
+        external_req_id=external_req_id,
+        prompt_token_ids=prompt_token_ids or [1, 2, 3],
+        mm_features=None,
+        sampling_params=sampling_params
+        or SamplingParams(output_kind=output_kind, max_tokens=8),
+        pooling_params=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        **kwargs,
     )
 
 
-SLOW_READER_PERIOD = 3
+def _add_children(
+    processor: OutputProcessor,
+    request: EngineCoreRequest,
+    queue: RequestOutputCollector | None = None,
+) -> list[str]:
+    """Add the n child requests of request, as AsyncLLM and LLMEngine do."""
+    parent = ParentRequest(request)
+    child_ids = []
+    for idx in range(parent.n):
+        child = copy(request)
+        child.request_id, child.sampling_params = parent.get_child_info(idx)
+        processor.add_request(child, None, parent, idx, queue)
+        child_ids.append(child.request_id)
+    return child_ids
 
 
 @dataclass
@@ -154,7 +151,7 @@ class Run:
 
 
 def _drive(
-    vectors,
+    vectors: DummyOutputProcessorTestVectors,
     kind: RequestOutputKind,
     stream_interval: int,
     reader_period: int,
@@ -173,41 +170,15 @@ def _drive(
         prompt_logprobs=NUM_PROMPT_LOGPROBS_UNDER_TEST,
         stop=STOP_STRINGS[:2] if finish_by == "stop_string" else None,
     )
-    request = EngineCoreRequest(
-        request_id="req-int",
-        external_req_id="req",
-        prompt_token_ids=vectors.prompt_tokens[0],
-        mm_features=None,
-        sampling_params=params,
-        pooling_params=None,
-        arrival_time=0,
-        lora_request=None,
-        cache_salt=None,
-        data_parallel_rank=None,
+    request = _make_request(
+        prompt_token_ids=vectors.prompt_tokens[0], sampling_params=params
     )
-    queue = RequestOutputCollector(kind, request.request_id, n=n)
+    queue = RequestOutputCollector(kind, request.request_id)
     if n == 1:
         child_ids = [request.request_id]
         processor.add_request(request, None, None, 0, queue)
     else:
-        parent = ParentRequest(request)
-        child_ids = []
-        for idx in range(n):
-            child_id, child_params = parent.get_child_info(idx)
-            child = EngineCoreRequest(
-                request_id=child_id,
-                external_req_id=request.external_req_id,
-                prompt_token_ids=request.prompt_token_ids,
-                mm_features=None,
-                sampling_params=child_params,
-                pooling_params=None,
-                arrival_time=0,
-                lora_request=None,
-                cache_salt=None,
-                data_parallel_rank=None,
-            )
-            processor.add_request(child, None, parent, idx, queue)
-            child_ids.append(child_id)
+        child_ids = _add_children(processor, request, queue)
 
     # Sequence i samples generation_tokens[i]; they differ in length, so with
     # n=2 the children finish at different steps.
@@ -279,7 +250,11 @@ def _drive(
 
 
 def _expected_fast_reader_yields(
-    vectors, kind: RequestOutputKind, stream_interval: int, n: int, finish_by: str
+    vectors: DummyOutputProcessorTestVectors,
+    kind: RequestOutputKind,
+    stream_interval: int,
+    n: int,
+    finish_by: str,
 ) -> int | None:
     """Number of generate() wakeups for a reader that keeps up."""
     if kind == FINAL_ONLY:
@@ -320,7 +295,10 @@ MATRIX = list(
 
 
 @pytest.mark.parametrize("kind,interval,reader,n,finish_by", MATRIX)
-def test_client_view_matches_final_only(vectors, kind, interval, reader, n, finish_by):
+def test_client_view_matches_final_only(
+    module_test_vectors, kind, interval, reader, n, finish_by
+):
+    vectors = module_test_vectors
     reference = _drive(vectors, FINAL_ONLY, 1, 1, n, finish_by)
     run = _drive(vectors, kind, interval, reader, n, finish_by)
 
@@ -342,7 +320,8 @@ def test_client_view_matches_final_only(vectors, kind, interval, reader, n, fini
         )
     ),
 )
-def test_fast_reader_wakeups(vectors, kind, interval, n, finish_by):
+def test_fast_reader_wakeups(module_test_vectors, kind, interval, n, finish_by):
+    vectors = module_test_vectors
     expected = _expected_fast_reader_yields(vectors, kind, interval, n, finish_by)
     run = _drive(vectors, kind, interval, 1, n, finish_by)
     assert run.num_yields == expected
@@ -361,29 +340,8 @@ def test_every_output_field_has_a_merge_rule():
     assert request_fields == set(REQUEST_OUTPUT_MERGE)
 
 
-def _make_request(
-    request_id: str = "req-int",
-    external_req_id: str = "req",
-    output_kind: RequestOutputKind = DELTA,
-    **kwargs,
-) -> EngineCoreRequest:
-    return EngineCoreRequest(
-        request_id=request_id,
-        external_req_id=external_req_id,
-        prompt_token_ids=[1, 2, 3],
-        mm_features=None,
-        sampling_params=SamplingParams(output_kind=output_kind, max_tokens=8),
-        pooling_params=None,
-        arrival_time=0,
-        lora_request=None,
-        cache_salt=None,
-        data_parallel_rank=None,
-        **kwargs,
-    )
-
-
 def test_abort_records_finished_request_stats():
-    """B1: a client abort produces a finished-request record."""
+    """A client abort produces a finished-request record."""
     processor = OutputProcessor(None, log_stats=True)
     for i in range(2):
         processor.add_request(
@@ -426,7 +384,7 @@ def test_abort_while_queued_has_no_negative_phase_times():
 
 
 def test_abort_emits_tracing_span():
-    """B1: a client abort ends the request's tracing span."""
+    """A client abort ends the request's tracing span."""
     processor = OutputProcessor(None, log_stats=True, tracing_enabled=True)
     processor.add_request(
         _make_request(trace_headers={"traceparent": "x"}),
@@ -451,7 +409,7 @@ def test_abort_emits_tracing_span():
 
 
 def test_duplicate_request_id_is_rejected():
-    """B2: with request ID randomization disabled, a second request reusing a
+    """With request ID randomization disabled, a second request reusing a
     running ID is rejected and the original completes normally."""
     processor = OutputProcessor(None, log_stats=False)
     queue = RequestOutputCollector(FINAL_ONLY, "req")
@@ -500,13 +458,7 @@ def test_request_maps_stay_consistent(seed):
         elif action == "add_n":
             parent_req = _make_request(f"p{i}-int", f"p{i}")
             parent_req.sampling_params.n = 2
-            parent = ParentRequest(parent_req)
-            for idx in range(2):
-                child_id, child_params = parent.get_child_info(idx)
-                child = _make_request(child_id, f"p{i}")
-                child.sampling_params = child_params
-                processor.add_request(child, None, parent, idx)
-                live.append(child_id)
+            live.extend(_add_children(processor, parent_req))
         elif live:
             target = live.pop(int(rng.integers(len(live))))
             if action == "finish":
