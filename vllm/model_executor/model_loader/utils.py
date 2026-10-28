@@ -38,7 +38,7 @@ from vllm.model_executor.model_loader.weight_cache.utils import (
 )
 from vllm.model_executor.model_loader.weight_tying import maybe_retie_word_embeddings
 from vllm.model_executor.models.interfaces import SupportsQuant
-from vllm.model_executor.utils import is_weights_pre_processed
+from vllm.model_executor.utils import fill_padding, is_weights_pre_processed
 from vllm.tracing import instrument
 from vllm.utils.mem_utils import release_device_memory_under_pressure
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -160,6 +160,7 @@ def process_weights_after_loading(
     record_checkpoint_layout(model)
 
     for name, module in model.named_modules():
+        fill_padding(module)
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             if (
