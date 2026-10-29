@@ -56,8 +56,7 @@ def _build_test_vectors_no_logprobs() -> DummyOutputProcessorTestVectors:
     )
 
 
-@pytest.fixture
-def dummy_test_vectors() -> DummyOutputProcessorTestVectors:
+def _build_test_vectors() -> DummyOutputProcessorTestVectors:
     """Generate output processor dummy test vectors, with logprobs.
 
     Returns:
@@ -85,3 +84,14 @@ def dummy_test_vectors() -> DummyOutputProcessorTestVectors:
         for tokens_list in dtv.prompt_tokens
     ]
     return dtv
+
+
+@pytest.fixture
+def dummy_test_vectors() -> DummyOutputProcessorTestVectors:
+    return _build_test_vectors()
+
+
+@pytest.fixture(scope="module")
+def module_test_vectors() -> DummyOutputProcessorTestVectors:
+    """dummy_test_vectors, built once for tests that only read them."""
+    return _build_test_vectors()

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import MutableSequence
+from collections.abc import Callable, MutableSequence
 from collections.abc import Sequence as GenericSequence
 from dataclasses import dataclass
 from typing import Any, Generic
@@ -208,48 +208,14 @@ class RequestOutput:
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
 
-    def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
-        """Merge subsequent RequestOutput into this one"""
-        self.finished |= next_output.finished
-        self.kv_transfer_params = next_output.kv_transfer_params
-        self.ec_transfer_params = next_output.ec_transfer_params
-
+    def add(self, next_output: "RequestOutput") -> None:
+        """Merge the next output of the same request into this one, per
+        REQUEST_OUTPUT_MERGE and COMPLETION_OUTPUT_MERGE."""
+        _merge_fields(REQUEST_OUTPUT_MERGE, self, next_output)
         for next_completion in next_output.outputs:
-            for i, completion in enumerate(self.outputs):
+            for completion in self.outputs:
                 if completion.index == next_completion.index:
-                    if aggregate:
-                        # Merge outputs with same index
-                        completion.text += next_completion.text
-                        if not isinstance(completion.token_ids, MutableSequence):
-                            completion.token_ids = list(completion.token_ids)
-                        completion.token_ids.extend(next_completion.token_ids)
-                        if next_completion.logprobs:
-                            assert completion.logprobs is not None
-                            completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]
-                        if next_completion.sampling_mask is not None:
-                            if completion.sampling_mask is None:
-                                completion.sampling_mask = SamplingMask([])
-                            completion.sampling_mask.token_ids.extend(
-                                next_completion.sampling_mask.token_ids
-                            )
-                        if next_completion.spec_decode_metrics is not None:
-                            completion.spec_decode_metrics = (
-                                next_completion.spec_decode_metrics
-                            )
-                        completion.cumulative_logprob = (
-                            next_completion.cumulative_logprob
-                        )
-                        # R3 is returned on the terminal output and must survive
-                        # aggregation with earlier chunks that have no R3.
-                        if next_completion.routed_experts is not None:
-                            completion.routed_experts = next_completion.routed_experts
-                        # Like finish_reason, spans come only with the terminal output.
-                        completion.weight_versions = next_completion.weight_versions
-                        completion.finish_reason = next_completion.finish_reason
-                        completion.stop_reason = next_completion.stop_reason
-                    else:
-                        # Replace the output with the new one
-                        self.outputs[i] = next_completion
+                    _merge_fields(COMPLETION_OUTPUT_MERGE, completion, next_completion)
                     break
             else:
                 self.outputs.append(next_completion)
@@ -270,6 +236,88 @@ class RequestOutput:
             f"num_cached_tokens={self.num_cached_tokens}, "
             f"num_cache_creation_tokens={self.num_cache_creation_tokens})"
         )
+
+
+def _append(current: Any, new: Any) -> Any:
+    """Per-token data: concatenate."""
+    if new is None:
+        return current
+    if current is None:
+        return new
+    if isinstance(current, str):
+        return current + new
+    if isinstance(current, SamplingMask):
+        current.token_ids.extend(new.token_ids)
+        return current
+    if not isinstance(current, MutableSequence):
+        current = list(current)
+    current.extend(new)
+    return current
+
+
+def _latest(current: Any, new: Any) -> Any:
+    return new
+
+
+def _on_finish(current: Any, new: Any) -> Any:
+    """Sent once, on the final output."""
+    return current if new is None else new
+
+
+def _once(current: Any, new: Any) -> Any:
+    """Sent once, on the first output."""
+    return new if current is None else current
+
+
+def _any(current: Any, new: Any) -> Any:
+    return current or new
+
+
+MergeFn = Callable[[Any, Any], Any]
+
+# How RequestOutput.add() combines each field; None means the field is the
+# same for every output of a request and is kept. Every CompletionOutput field
+# and RequestOutput constructor argument must have an entry;
+# tests/v1/engine/test_output_semantics.py checks this.
+COMPLETION_OUTPUT_MERGE: dict[str, MergeFn | None] = {
+    "index": None,
+    "text": _append,
+    "token_ids": _append,
+    "cumulative_logprob": _latest,
+    "logprobs": _append,
+    "routed_experts": _on_finish,
+    "finish_reason": _latest,
+    "stop_reason": _latest,
+    "lora_request": None,
+    "sampling_mask": _append,
+    "spec_decode_metrics": _on_finish,
+    "weight_versions": _on_finish,
+}
+
+REQUEST_OUTPUT_MERGE: dict[str, MergeFn | None] = {
+    "request_id": None,
+    "prompt": None,
+    "prompt_token_ids": None,
+    "prompt_logprobs": _once,
+    # Matched by index in RequestOutput.add().
+    "outputs": None,
+    "finished": _any,
+    "metrics": None,
+    "lora_request": None,
+    "encoder_prompt": None,
+    "encoder_prompt_token_ids": None,
+    "num_cached_tokens": _once,
+    "num_cache_creation_tokens": _once,
+    "prompt_token_id_logprobs": _once,
+    "kv_transfer_params": _latest,
+    "ec_transfer_params": _latest,
+}
+
+
+def _merge_fields(rules: dict[str, MergeFn | None], current: Any, new: Any) -> None:
+    for name, merge in rules.items():
+        if merge is not None:
+            setattr(current, name, merge(getattr(current, name), getattr(new, name)))
 
 
 # Sentinel to indicate request is finished, used with streaming inputs.

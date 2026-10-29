@@ -103,7 +103,7 @@ def test_request_output_add_preserves_terminal_spec_decode_metrics():
         finished=True,
     )
 
-    accumulated.add(terminal, aggregate=True)
+    accumulated.add(terminal)
 
     output = accumulated.outputs[0]
     assert output.token_ids == [1, 2]

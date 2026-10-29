@@ -63,16 +63,18 @@ def test_delta_output_without_new_tokens_returns_empty_logprobs(
     state = RequestState.__new__(RequestState)
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
+    # The one token so far was already sent.
+    state.detokenizer.num_output_tokens.return_value = 1
+    state.sent_tokens_offset = 1
     state.logprobs_processor = MagicMock()
     state.logprobs_processor.logprobs = accumulated
     state.logprobs_processor.cumulative_logprob = -0.5
-    state.output_kind = RequestOutputKind.DELTA
     state.request_index = 0
     state.sampling_mask_chunks = []
     state.routed_experts_chunks = []
     state.spec_decode_metrics = None
 
-    output = state._new_completion_output([], None, None)
+    output = state._new_completion_output(None, None)
 
     assert isinstance(output.logprobs, FlatLogprobs if flat_logprobs else list)
     assert len(output.logprobs) == 0
@@ -83,9 +85,10 @@ def test_completion_output_preserves_each_sampling_mask_position() -> None:
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
     state.logprobs_processor = MagicMock()
+    state.detokenizer.num_output_tokens.return_value = 3
+    state.sent_tokens_offset = 0
     state.logprobs_processor.logprobs = None
     state.logprobs_processor.cumulative_logprob = None
-    state.output_kind = RequestOutputKind.DELTA
     state.request_index = 0
     state.sampling_mask_chunks = [
         SamplingMaskLists(
@@ -98,7 +101,7 @@ def test_completion_output_preserves_each_sampling_mask_position() -> None:
     state.spec_decode_metrics = None
     state.weight_version_starts = []
 
-    output = state._new_completion_output([1, 2, 3], FinishReason.LENGTH, None)
+    output = state._new_completion_output(FinishReason.LENGTH, None)
 
     assert output.sampling_mask is not None
     assert output.sampling_mask.token_ids == [[10, 11], [20], [30, 31, 32]]
@@ -1538,7 +1541,11 @@ def test_routed_experts_are_accumulated_until_finish():
             cumulative_logprob=0.0,
             pop_prompt_logprobs=Mock(return_value=None),
         ),
-        detokenizer=Mock(get_next_output_text=Mock(return_value="")),
+        detokenizer=Mock(
+            get_next_output_text=Mock(return_value=""),
+            num_output_tokens=Mock(return_value=0),
+            output_token_ids_since=Mock(return_value=[]),
+        ),
         max_tokens_param=2,
         arrival_time=0.0,
         queue=None,
@@ -1549,12 +1556,12 @@ def test_routed_experts_are_accumulated_until_finish():
     decode_chunk = np.arange(12, dtype=np.uint8).reshape(2, 3, 2) + 24
     state.routed_experts_chunks.append(prompt_chunk)
 
-    partial = state.make_request_output([5], None, None, None)
+    partial = state.make_request_output(None, None, None)
     assert partial is not None
     assert partial.outputs[0].routed_experts is None
 
     state.routed_experts_chunks.append(decode_chunk)
-    finished = state.make_request_output([6], None, FinishReason.LENGTH, None)
+    finished = state.make_request_output(None, FinishReason.LENGTH, None)
     assert finished is not None
     np.testing.assert_array_equal(
         finished.outputs[0].routed_experts,
@@ -1564,85 +1571,41 @@ def test_routed_experts_are_accumulated_until_finish():
 
 @pytest.mark.asyncio
 async def test_cumulative_output_collector_n():
-    """Test collector correctly handles multiple outputs by index."""
+    """CUMULATIVE collector accumulates deltas from several sequences by index."""
     collector = RequestOutputCollector(
         RequestOutputKind.CUMULATIVE, request_id="my-request-id-int"
     )
-    outputs = [
-        RequestOutput(
-            request_id="my-request-id",
-            prompt=None,
-            prompt_token_ids=[1, 2, 3],
-            prompt_logprobs=None,
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text="a",
-                    token_ids=[0],
-                    cumulative_logprob=None,
-                    logprobs=None,
-                    finish_reason=None,
-                ),
-                CompletionOutput(
-                    index=1,
-                    text="b",
-                    token_ids=[1],
-                    cumulative_logprob=None,
-                    logprobs=None,
-                    finish_reason=None,
-                ),
-            ],
-            finished=False,
-        ),
-        RequestOutput(
-            request_id="my-request-id",
-            prompt=None,
-            prompt_token_ids=[1, 2, 3],
-            prompt_logprobs=None,
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text="ab",
-                    token_ids=[0, 1],
-                    cumulative_logprob=None,
-                    logprobs=None,
-                    finish_reason=None,
-                ),
-                CompletionOutput(
-                    index=2,
-                    text="c",
-                    token_ids=[2],
-                    cumulative_logprob=None,
-                    logprobs=None,
-                    finish_reason=None,
-                ),
-            ],
-            finished=False,
-        ),
-    ]
-    for output in outputs:
-        collector.put(output)
 
-    # Get the output and check that the text and token_ids are correct.
+    def delta(index: int, text: str, token_id: int) -> RequestOutput:
+        return RequestOutput(
+            request_id="my-request-id",
+            prompt=None,
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=index,
+                    text=text,
+                    token_ids=[token_id],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                )
+            ],
+            finished=False,
+        )
+
+    for index, text, token_id in [(0, "a", 0), (1, "b", 1), (0, "b", 1), (2, "c", 2)]:
+        collector.put(delta(index, text, token_id))
+
     result = await collector.get()
-    # We are expecting
-    # [{index: 0, text: "ab"}, {index: 1, text: "b"}, {index: 2, text: "c"}]
-    assert len(result.outputs) == 3
-    # First is the one where index is 0
-    first = [k for k in result.outputs if k.index == 0]
-    assert len(first) == 1
-    assert first[0].text == "ab"
-
-    # Second is the one where index is 1
-    second = [k for k in result.outputs if k.index == 1]
-    assert len(second) == 1
-    assert second[0].text == "b"
-    assert second[0].token_ids == [1]
-
-    # Third is the one where index is 2
-    third = [k for k in result.outputs if k.index == 2]
-    assert len(third) == 1
-    assert third[0].text == "c"
+    by_index = {c.index: c for c in result.outputs}
+    assert sorted(by_index) == [0, 1, 2]
+    assert by_index[0].text == "ab"
+    assert by_index[0].token_ids == [0, 1]
+    assert by_index[1].text == "b"
+    assert by_index[1].token_ids == [1]
+    assert by_index[2].text == "c"
+    assert not result.finished
 
 
 def _make_boundary_output(
@@ -1867,16 +1830,18 @@ def test_request_rejected_by_engine(runner: str, error, exception_type):
         queue.get_nowait()
 
 
-@pytest.mark.parametrize("output_kind", list(RequestOutputKind))
-def test_sampling_masks_follow_output_kind(output_kind):
+def test_sampling_masks_are_sent_once_per_position():
+    """Each output carries the masks of the positions since the previous one;
+    the collector accumulates them for CUMULATIVE and FINAL_ONLY."""
     state = RequestState.__new__(RequestState)
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
+    state.detokenizer.num_output_tokens.return_value = 0
     state.logprobs_processor = MagicMock()
     state.logprobs_processor.logprobs = None
     state.logprobs_processor.cumulative_logprob = None
-    state.output_kind = output_kind
     state.request_index = 0
+    state.sent_tokens_offset = 0
     state.sampling_mask_chunks = []
     state.routed_experts_chunks = []
     state.spec_decode_metrics = None
@@ -1887,13 +1852,10 @@ def test_sampling_masks_follow_output_kind(output_kind):
     for position, support in enumerate(supports):
         state.sampling_mask_chunks.append(SamplingMaskLists(np.asarray(support)))
         finish = FinishReason.LENGTH if position == len(supports) - 1 else None
-        mask = state._new_completion_output([support[0]], finish, None).sampling_mask
+        mask = state._new_completion_output(finish, None).sampling_mask
         masks.append(mask.token_ids if mask is not None else None)
 
-    if output_kind == RequestOutputKind.DELTA:
-        assert masks == [[support] for support in supports]
-    else:
-        assert masks == [None, None, supports]
+    assert masks == [[support] for support in supports]
 
 
 def test_request_output_add_merges_delta_sampling_masks():
@@ -1916,8 +1878,8 @@ def test_request_output_add_merges_delta_sampling_masks():
         )
 
     merged = delta([], None)
-    merged.add(delta([10], SamplingMask([[10, 11]])), aggregate=True)
-    merged.add(delta([20], SamplingMask([[20]])), aggregate=True)
+    merged.add(delta([10], SamplingMask([[10, 11]])))
+    merged.add(delta([20], SamplingMask([[20]])))
 
     assert merged.outputs[0].token_ids == [10, 20]
     assert merged.outputs[0].sampling_mask.token_ids == [[10, 11], [20]]

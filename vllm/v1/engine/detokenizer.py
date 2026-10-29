@@ -39,11 +39,14 @@ class IncrementalDetokenizer:
     def num_output_tokens(self) -> int:
         return len(self.token_ids)
 
+    def output_token_ids_since(self, start: int) -> list[int]:
+        return self.token_ids[start:]
+
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         self.token_ids.extend(new_token_ids)
         return None
 
-    def get_next_output_text(self, finished: bool, delta: bool) -> str:
+    def get_next_output_text(self, finished: bool) -> str:
         return ""
 
     @classmethod
@@ -158,16 +161,10 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
     def decode_next(self, next_token_id: int) -> str:
         raise NotImplementedError
 
-    def get_next_output_text(self, finished: bool, delta: bool) -> str:
-        """If delta is True, only new text since the last call to
-        this method is returned"""
-        # We return the full output text if the sequence is finished.
+    def get_next_output_text(self, finished: bool) -> str:
+        """New text since the previous call. Text that may still become part
+        of a stop string is held back until finished."""
         buffer_length = 0 if finished else self.stop_buffer_length
-        if not delta:
-            if not buffer_length:
-                return self.output_text
-            return self.output_text[:-buffer_length]
-
         length = len(self.output_text) - buffer_length
         last_offset = self._last_output_text_offset
         if last_offset < length:
@@ -299,6 +296,9 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def num_output_tokens(self) -> int:
         return len(self.token_ids) - self.prompt_len
+
+    def output_token_ids_since(self, start: int) -> list[int]:
+        return self.token_ids[self.prompt_len + start :]
 
     def decode_next(self, next_token_id: int) -> str:
         new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(

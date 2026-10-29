@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from copy import copy
-from typing import cast
 
-from vllm.outputs import CompletionOutput
-from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.metrics.stats import IterationStats
 
@@ -24,9 +22,6 @@ class ParentRequest:
     # To track the completion of child requests
     child_requests: set[str]
 
-    # To aggregate child completions when not streaming
-    output_aggregator: list[CompletionOutput]
-
     # To find the max number of generated tokens across all children
     max_num_generation_tokens: int
 
@@ -41,11 +36,6 @@ class ParentRequest:
         self.sampling_params = sampling_params
 
         self.child_requests = set()
-        self.output_aggregator = (
-            [cast(CompletionOutput, None)] * sampling_params.n
-            if (sampling_params.output_kind == RequestOutputKind.FINAL_ONLY)
-            else []
-        )
         self.max_num_generation_tokens = 0
         self.cached_child_sampling_params = None
 
@@ -98,34 +88,6 @@ class ParentRequest:
     @property
     def n(self) -> int:
         return self.sampling_params.n
-
-    def get_outputs(
-        self,
-        child_request_id: str,
-        completion_output: CompletionOutput,
-    ) -> tuple[list[CompletionOutput], bool]:
-        already_finished_and_returned: bool = False
-        if completion_output.finished():
-            if child_request_id in self.child_requests:
-                self.child_requests.remove(child_request_id)
-            else:
-                # child request ID is not available in child_requests
-                # which means the request had finished in previous
-                # batch step and returned to the client earlier
-                already_finished_and_returned = True
-
-        if self.sampling_params.output_kind != RequestOutputKind.FINAL_ONLY:
-            # If streaming, just return the current output
-            #
-            # DO NOT output finished and already returned child request to client again
-            outputs = [] if already_finished_and_returned else [completion_output]
-        else:
-            # If not streaming, aggregate the n final outputs.
-            self.output_aggregator[completion_output.index] = completion_output
-            outputs = [] if self.child_requests else self.output_aggregator
-
-        finished = not self.child_requests
-        return outputs, finished
 
     def observe_num_generation_tokens(self, num_generation_tokens: int):
         self.max_num_generation_tokens = max(

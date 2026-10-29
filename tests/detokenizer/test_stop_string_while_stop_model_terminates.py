@@ -99,7 +99,7 @@ def test_stop_string_while_stop_token_terminates(include_stop_str_in_output: boo
 
     # get_next_output_text should return the full text when finished=True.
     # (Buffering only applies during streaming when finished=False.)
-    assert detok.get_next_output_text(finished=True, delta=False) == expected_text
+    assert detok.get_next_output_text(finished=True) == expected_text
 
 
 @pytest.mark.parametrize(
