@@ -1098,10 +1098,12 @@ def _m2n_worker_receive(
     num_trainers, num_workers, params = _CASES[case]
     tp = num_workers if case == "tp2" else 1
 
+    # Outside the module: a loader that changes module state is a fallback.
+    loaded: list[str] = []
+
     class Tiny(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.fallbacks = 0
             for name, shape, *_ in params:
                 local = (shape[0] // tp, *shape[1:])
                 self.register_parameter(
@@ -1113,7 +1115,7 @@ def _m2n_worker_receive(
 
         def load_weights(self, weights):
             for name, tensor in weights:
-                self.fallbacks += 1
+                loaded.append(name)
                 getattr(self, name).copy_(tensor.chunk(tp)[worker_rank % tp])
 
     model_config = SimpleNamespace(
@@ -1177,13 +1179,13 @@ def _m2n_worker_receive(
             params=[param.to_dict() for param in wire],
         )
     )
-    model.fallbacks = 0  # planning traced load_weights
+    loaded.clear()  # planning traced load_weights
     engine.start_weight_update()
     engine.receive_weights(M2NWeightTransferUpdateInfo(names=[p[0] for p in params]))
     engine.finish_weight_update()
     torch.accelerator.synchronize()
     result = {
-        "fallbacks": model.fallbacks,
+        "fallbacks": len(loaded),
         "exact": {
             name: torch.equal(
                 getattr(model, name).cpu(),
