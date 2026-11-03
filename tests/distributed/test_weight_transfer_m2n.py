@@ -1126,7 +1126,6 @@ def _m2n_worker_receive(
         (name, torch.zeros(shape, device=device)) for name, shape, *_ in params
     )
     process_weights_after_loading(model, model_config, device)
-    model.fallbacks = 0
 
     parallel_config = MagicMock(spec=ParallelConfig)
     parallel_config.rank = worker_rank
@@ -1178,6 +1177,7 @@ def _m2n_worker_receive(
             params=[param.to_dict() for param in wire],
         )
     )
+    model.fallbacks = 0  # planning traced load_weights
     engine.start_weight_update()
     engine.receive_weights(M2NWeightTransferUpdateInfo(names=[p[0] for p in params]))
     engine.finish_weight_update()
