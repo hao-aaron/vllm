@@ -230,15 +230,22 @@ def plan_step(
     boxes: tuple[Box, ...] | None,
     dest: list[tuple[Box, torch.Tensor]] | None,
     shape: tuple[int, ...],
+    dtype: torch.dtype,
     worker: int,
 ) -> _Step:
-    """This worker's step under the agreed `layout`."""
+    """This worker's step under the agreed `layout`. A destination in another
+    dtype (the loader's `copy_` casts) is staged, so the copy casts too."""
     box = layout_box(layout, shape, worker)
     if dest is None and boxes is not None:
         return _Step("fallback", layout, box)
     dest = dest or []
     box_shape = tuple(b - a for a, b in box)
-    if len(dest) == 1 and dest[0][0] == box and dest[0][1].is_contiguous():
+    if (
+        len(dest) == 1
+        and dest[0][0] == box
+        and dest[0][1].is_contiguous()
+        and dest[0][1].dtype == dtype
+    ):
         return _Step("direct", layout, box, target=dest[0][1].view(box_shape))
     copies = tuple(
         (tuple(slice(c - a, d - a) for (a, _), (c, d) in zip(box, part)), tensor)
@@ -377,6 +384,7 @@ class M2NWeightTransferEngine(
                 plan.get_boxes(meta.name),
                 plan.get_dest(meta.name),
                 meta.shape,
+                meta.dtype,
                 worker,
             )
             for meta, cands, index in zip(self._metas, candidates, chosen)

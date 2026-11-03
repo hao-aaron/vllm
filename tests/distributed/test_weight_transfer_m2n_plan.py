@@ -117,6 +117,7 @@ def _sync(makes, shapes):
                 plan.get_boxes(meta.name),
                 plan.get_dest(meta.name),
                 meta.shape,
+                meta.dtype,
                 w,
             )
             kinds[w][meta.name] = step.kind
@@ -248,22 +249,50 @@ def test_fused_experts_under_ep_and_expert_tp():
     assert layouts["experts.down_proj"] == ((1, 2), (R, 2))
 
 
-def _replicated_model(skipped=frozenset(), cast=False):
+def _replicated_model(skipped=frozenset(), loader=default_weight_loader):
     def make():
         model = _Toy()
-        dtype = torch.float32 if cast else BF16
-        model.norm = torch.nn.Parameter(torch.zeros(4, dtype=dtype), False)
-        model.norm.weight_loader = default_weight_loader
+        model.norm = torch.nn.Parameter(torch.zeros(4, dtype=BF16), False)
+        model.norm.weight_loader = loader
         model.skipped = skipped
         return model
 
     return make
 
 
+def _row_shard_model(worker, dtype=BF16):
+    """A [2, 3] parameter loading rows [2w, 2w+2) of a [4, 3] checkpoint
+    tensor, as a TP2 row shard does."""
+
+    def make():
+        model = _Toy()
+        model.w = torch.nn.Parameter(torch.zeros(2, 3, dtype=dtype), False)
+        model.w.weight_loader = lambda p, t: p.copy_(t[2 * worker : 2 * worker + 2])
+        return model
+
+    return make
+
+
+def test_casting_copy_is_staged_and_sharded():
+    # an FP32 checkpoint tensor into BF16 row shards: each worker receives its
+    # rows in FP32 and the staging copy casts, as the loader's copy_ did
+    shapes = {"w": ((4, 3), torch.float32)}
+    layouts, kinds = _sync([_row_shard_model(w) for w in range(2)], shapes)
+    assert layouts["w"] == ((1, 2), (R, 0))
+    assert {k["w"] for k in kinds} == {"staged"}
+    # the same dtype is direct
+    layouts, kinds = _sync(
+        [_row_shard_model(w, torch.float32) for w in range(2)], shapes
+    )
+    assert {k["w"] for k in kinds} == {"direct"}
+
+
 def test_fallback_and_skip():
     shapes = {"norm": ((4,), BF16)}
-    # BF16 into an FP32 param casts: load_weights on every worker, in full
-    layouts, kinds = _sync([_replicated_model(cast=True)] * 2, shapes)
+    # a loader that computes: load_weights on every worker, in full
+    layouts, kinds = _sync(
+        [_replicated_model(loader=lambda p, t: p.copy_(t * 2))] * 2, shapes
+    )
     assert layouts["norm"] is None
     assert {k["norm"] for k in kinds} == {"fallback"}
     # a name every worker skips is not sent
