@@ -272,7 +272,7 @@ def _toy_model():
 def test_toy_loaders():
     """One model for transpose, tied alias, cast and step slice, so that their
     targets share a model (and, for the tied pair, a storage)."""
-    _, plan = _check_plan_equals_cold_start(_toy_model, _TOY_SHAPES)
+    model, plan = _check_plan_equals_cold_start(_toy_model, _TOY_SHAPES)
     entries = plan.entries
 
     # P.copy_(W.t()): the transpose lives in the destination's strides
@@ -284,9 +284,11 @@ def test_toy_loaders():
     assert plan.get_boxes("lm_head.weight") is None
     assert plan.get_dest("lm_head.weight") == []
 
-    assert plan.get_dest("router.bias") is None
-    assert "casts torch.bfloat16 to torch.float32" in entries["router.bias"].reason
-    assert plan.get_boxes("router.bias") == (((0, 5),),)
+    # copy_ casts BF16 to the FP32 parameter: direct, destination in FP32
+    ((box, dest),) = plan.get_dest("router.bias")
+    assert box == ((0, 5),)
+    assert dest.dtype == torch.float32
+    assert dest.data_ptr() == model.router.bias.data_ptr()
 
     assert plan.get_dest("strided.weight") is None
     assert "step" in entries["strided.weight"].reason
@@ -396,6 +398,38 @@ def test_fallbacks(loader, reason):
     _, plan = _check_plan_equals_cold_start(make, shapes)
     assert plan.get_dest("layer.weight") is None
     assert reason in (plan.entries["layer.weight"].reason or "")
+
+
+def test_cast_at_copy_is_direct():
+    """An FP32 checkpoint tensor into a BF16 parameter, of which this rank
+    loads rows 2:6 (a TP shard): direct, only the shard, in BF16."""
+    make, shapes = _single(
+        lambda p, w: p.copy_(w[2:6]),
+        shape=(8, 3),
+        dtype=torch.float32,
+        param_shape=(4, 3),
+    )
+
+    def make_bf16():
+        model = make()
+        model.layer.weight.data = model.layer.weight.data.to(BF16)
+        return model
+
+    model, plan = _check_plan_equals_cold_start(make_bf16, shapes)
+    assert plan.get_boxes("layer.weight") == (((2, 6), (0, 3)),)
+    ((box, dest),) = plan.get_dest("layer.weight")
+    assert box == ((2, 6), (0, 3))
+    assert (tuple(dest.shape), dest.dtype) == ((4, 3), BF16)
+    assert dest.data_ptr() == model.layer.weight.data_ptr()
+
+
+def test_cast_of_a_reinterpreted_view_falls_back():
+    make, shapes = _single(
+        lambda p, w: p.copy_(w.view(torch.int16)), dtype=torch.float32
+    )
+    _, plan = _check_plan_equals_cold_start(make, {"layer.weight": ((4,), BF16)})
+    assert plan.get_dest("layer.weight") is None
+    assert "view of a" in plan.entries["layer.weight"].reason
 
 
 def test_noop_to_and_constant_fill_stay_direct():

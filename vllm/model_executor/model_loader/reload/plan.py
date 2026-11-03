@@ -6,8 +6,9 @@ in live memory those bytes go.
 ``plan_loads`` traces the model's ``load_weights`` once at init (``bake.py``)
 and reduces each traced ``copy_`` to a box of the checkpoint tensor and a
 strided region of the target's storage (``geometry.py``). A name is direct
-only if every byte it writes is a copy of one incoming byte; anything else is
-a fallback, which the engine sends in full through ``load_weights``.
+only if every element it writes is a ``copy_`` of one incoming element (a
+byte copy, or a cast from the checkpoint dtype to the target's dtype); anything
+else is a fallback, which the engine sends in full through ``load_weights``.
 
 Engines call only ``LoadPlan.get_boxes`` and ``LoadPlan.get_dest``.
 """
@@ -69,7 +70,8 @@ class LoadPlan:
     def get_dest(self, name: str) -> list[tuple[Box, torch.Tensor]] | None:
         """(part of a box, live tensor) pairs: copying each part, reshaped to
         its tensor's shape, into that tensor is exactly what the loader would
-        have written. ``None``: fallback, send the full tensor through
+        have written (``copy_`` casts where the tensor's dtype is not the
+        checkpoint's). ``None``: fallback, send the full tensor through
         ``load_weights``. Write only between ``start_reload`` and
         ``finish_reload``; never read."""
         if self.entries[name].writes is None:
@@ -182,15 +184,17 @@ def _write(
     src = copy.src
     if src._geom is None:
         raise Fallback(src._lost or "not a view of the checkpoint tensor")
-    if src.dtype != copy.dtype:
-        raise Fallback(
-            f"casts {src.dtype} to {copy.dtype} at copy_ "
-            f"(send it as {copy.dtype} to make it direct)"
-        )
     target = stand_ins.by_storage.get(copy.storage)
     if target is None:
         raise Fallback("copies into a tensor that is not a checkpoint tensor")
-    size = dtype.itemsize
+    # copy_ may cast; the engine then copy_s from a staging buffer, which casts
+    # the same way. Only from the checkpoint dtype into the target's own dtype.
+    cast = src.dtype != copy.dtype
+    if cast and (src.dtype != dtype or copy.dtype != target.real.dtype):
+        raise Fallback(
+            f"casts a {src.dtype} view of a {dtype} tensor to {copy.dtype} at copy_"
+        )
+    size = copy.dtype.itemsize if cast else dtype.itemsize
     rel = copy.byte_offset - target.byte_offset
     if rel % size or target.byte_offset % size:
         raise Fallback("copies into a destination viewed with another element size")
@@ -207,13 +211,20 @@ def _write(
     dims = list(zip(copy.shape, geom.stride(), copy.stride))
     box, dst_shape, dst_stride = box_and_region(shape, geom.storage_offset(), dims)
     return Write(
-        box, target.module, target.tensor, Region(rel // size, dst_shape, dst_stride)
+        box,
+        target.module,
+        target.tensor,
+        Region(rel // size, dst_shape, dst_stride),
+        cast,
     )
 
 
 def _dest(stand_ins: StandIns, write: Write, dtype: torch.dtype) -> torch.Tensor:
-    """The live tensor of ``write``, in the checkpoint dtype."""
+    """The live tensor of ``write``, in the checkpoint dtype, or in its own
+    dtype if the loader's copy_ casts."""
     target = stand_ins.by_name[(write.module, write.tensor)]
+    if write.cast:
+        dtype = target.real.dtype
     r = write.dst
     offset = target.byte_offset // dtype.itemsize + r.offset
     storage = target.real.untyped_storage()

@@ -115,9 +115,6 @@ class FSDPTrainWorker:
                 nccl_unique_id_b64=nccl_unique_id_b64,
                 world_size=world_size,
                 num_trainer_ranks=FSDP_WORLD_SIZE,
-                # One DP group of TP=2 workers; declared so both sides
-                # describe the destination the same way.
-                dst_mesh_dims=(num_workers // INFERENCE_TP_SIZE, INFERENCE_TP_SIZE),
                 rank=self.rank,  # FSDP rank; sender is 0
             ),
             client=RayVLLMWeightSyncClient(llm_handle),
@@ -147,7 +144,12 @@ def main():
     ray.get([w.ready.remote() for w in fsdp_workers])
     print(f"[init] {FSDP_WORLD_SIZE} FSDP workers ready.")
 
-    llm = ray.remote(num_cpus=0, num_gpus=0)(MyLLM).remote(
+    # nccl_m2n writes through a load plan, which needs direct reload.
+    llm = ray.remote(
+        num_cpus=0,
+        num_gpus=0,
+        runtime_env={"env_vars": {"VLLM_RELOAD_MODE": "direct"}},
+    )(MyLLM).remote(
         model=local_model_path,
         enforce_eager=True,
         tensor_parallel_size=INFERENCE_TP_SIZE,
