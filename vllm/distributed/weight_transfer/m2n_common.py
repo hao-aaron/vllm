@@ -12,7 +12,7 @@ so the engine module stays about the transfer itself.
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -33,11 +33,6 @@ MAX_TENSOR_DIMS = 3
 
 MESH_NDIMS = 2
 
-# Destination mesh convention. Keeping these roles named avoids scattering
-# positional axis assumptions through the worker-side planner.
-DESTINATION_REPLICA_AXIS = 0
-DESTINATION_SHARD_AXIS = 1
-
 # Conservative capacities accepted by the supported nccl_m2n algorithms. They
 # are not exposed by its Python API yet; remove these mirrors once nccl_m2n
 # provides communication-free plan validation.
@@ -45,7 +40,7 @@ MAX_SOURCE_SHARDS = 16
 MAX_DEST_SHARDS = 64
 
 # Increment when the JSON init payload changes incompatibly.
-M2N_WIRE_SCHEMA_VERSION = 2
+M2N_WIRE_SCHEMA_VERSION = 3
 
 SUPPORTED_DTYPES: frozenset[torch.dtype] = frozenset(
     dtype
@@ -88,45 +83,69 @@ def prepare_m2n_local_runtime(m2n: Any, max_cta: int | None) -> tuple[Any, int, 
     return nccl, device, handle
 
 
-def create_m2n_communicator(
+def create_m2n_communicators(
     nccl: Any,
     group: "StatelessProcessGroup",
     unique_id_bytes: bytes | None,
-) -> Any:
-    """Create the M2N data-plane communicator through NCCL4Py."""
-    if unique_id_bytes is None:
-        envelope: dict[str, bytes | str | None] | None = None
+    source_groups: Sequence[tuple[int, ...]],
+    num_trainer_ranks: int,
+) -> list[Any]:
+    """Create one NCCL4Py communicator per source group: the group's trainer
+    ranks, in order, then every inference worker. Returns this rank's
+    communicator per group, None where it is not a member. Every rank joins its
+    groups in the same order, so the blocking inits cannot cross."""
+    if unique_id_bytes is not None:
+        if len(source_groups) != 1:
+            raise ValueError(
+                "a pre-shared NCCL unique id serves one communicator, but the "
+                f"source declares {len(source_groups)} owner groups"
+            )
+        unique_ids = [unique_id_bytes]
+    else:
+        envelope: dict[str, Any] | None = None
         if group.rank == 0:
             try:
                 envelope = {
-                    "unique_id": bytes(nccl.get_unique_id().as_bytes),
+                    "unique_ids": [
+                        bytes(nccl.get_unique_id().as_bytes) for _ in source_groups
+                    ],
                     "error": None,
                 }
             except Exception as exc:
-                envelope = {
-                    "unique_id": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+                envelope = {"unique_ids": None, "error": f"{type(exc).__name__}: {exc}"}
         envelope = group.broadcast_obj(envelope, src=0)
-        if not isinstance(envelope, Mapping) or set(envelope) != {"unique_id", "error"}:
+        if not isinstance(envelope, Mapping) or set(envelope) != {
+            "unique_ids",
+            "error",
+        }:
             raise RuntimeError("invalid NCCL4Py unique-id envelope")
-        error = envelope["error"]
-        received_unique_id = envelope["unique_id"]
-        if error is not None:
-            if not isinstance(error, str) or not error:
-                raise RuntimeError("invalid NCCL4Py unique-id error")
-            raise RuntimeError(f"NCCL4Py unique-id generation failed: {error}")
-        if not isinstance(received_unique_id, bytes):
-            raise RuntimeError("NCCL4Py unique-id broadcast did not return bytes")
-        unique_id_bytes = received_unique_id
+        if envelope["error"] is not None:
+            raise RuntimeError(
+                f"NCCL4Py unique-id generation failed: {envelope['error']}"
+            )
+        unique_ids = envelope["unique_ids"]
+        if not isinstance(unique_ids, list) or len(unique_ids) != len(source_groups):
+            raise RuntimeError("NCCL4Py unique-id broadcast returned a bad list")
 
-    unique_id = nccl.UniqueId.from_bytes(unique_id_bytes)
-    with unpinned_nccl_env():
-        return nccl.Communicator.init(
-            nranks=group.world_size,
-            rank=group.rank,
-            unique_id=unique_id,
-        )
+    num_workers = group.world_size - num_trainer_ranks
+    comms: list[Any] = []
+    for owners, uid in zip(source_groups, unique_ids):
+        if group.rank >= num_trainer_ranks:
+            rank = len(owners) + group.rank - num_trainer_ranks
+        elif group.rank in owners:
+            rank = owners.index(group.rank)
+        else:
+            comms.append(None)
+            continue
+        with unpinned_nccl_env():
+            comms.append(
+                nccl.Communicator.init(
+                    nranks=len(owners) + num_workers,
+                    rank=rank,
+                    unique_id=nccl.UniqueId.from_bytes(uid),
+                )
+            )
+    return comms
 
 
 def import_m2n() -> Any:
@@ -358,63 +377,47 @@ def check_plan_limits(
         )
 
 
-def validate_transfer_plan(
-    metas: Sequence["M2NParamMeta"],
-    dst_mesh: M2NMesh,
-    dst_placements: Sequence[Placements | None],
-) -> None:
-    """Validate the complete ordered source-to-destination transfer plan."""
-    if len(dst_placements) != len(metas):
-        raise ValueError(
-            f"destination plan has {len(dst_placements)} parameters, expected "
-            f"{len(metas)}"
-        )
-    for meta, placement in zip(metas, dst_placements):
-        check_transferable(meta.name, meta.dtype, meta.shape)
-        src = resolve_layout(
-            meta.source_layout.mesh,
-            meta.source_layout.placements,
-            f"parameter '{meta.name}' source placements",
-        )
-        validate_layout(*src, meta.shape, f"parameter '{meta.name}' source layout")
-        dst = resolve_layout(
-            dst_mesh,
-            placement,
-            f"parameter '{meta.name}' destination placements",
-        )
-        validate_layout(*dst, meta.shape, f"parameter '{meta.name}' destination layout")
-        check_plan_limits(src, dst, meta.name, meta.shape)
-
-
 @dataclass(frozen=True)
 class M2NParamMeta(ParamMeta):
     """`ParamMeta` with its m2n source layout spelled out, as the engines plan
     reshards from it. Built from a source's `ParamMeta` by `m2n_param_meta`.
+    `owners` is always set: the trainer ranks of this parameter's source group,
+    whose communicator carries it.
     """
 
     source_layout: M2NLayout
+    allow_full_fallback: bool = True
+    owners: tuple[int, ...] = field(default=(), kw_only=True)
+    """Whether a worker may receive the full tensor for `load_weights`."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_layout, M2NLayout):
             raise TypeError("source_layout must be an M2NLayout")
+        if not self.owners or self.source_layout.mesh.size != len(self.owners):
+            raise ValueError(
+                f"parameter '{self.name}' source mesh covers "
+                f"{self.source_layout.mesh.size} ranks, but it has owners "
+                f"{self.owners}"
+            )
 
 
-def m2n_param_meta(meta: ParamMeta, num_trainer_ranks: int) -> M2NParamMeta:
-    """The m2n source layout of `meta`, which must be owned by every trainer
-    rank in rank order (or by default).
+def m2n_param_meta(
+    meta: ParamMeta, num_trainer_ranks: int, allow_full_fallback: bool = True
+) -> M2NParamMeta:
+    """The m2n source layout of `meta` over its owners (every trainer rank by
+    default), which form its source group.
 
     A 1-D mesh gains a size-1 second axis; a replicated parameter keeps
     `REPLICATED`. Placements m2n cannot express (both axes sharded, more than
-    two axes) are left for `validate_transfer_plan` to reject.
+    two axes) are rejected by `expected_local_shape`.
     """
-    everyone = tuple(range(num_trainer_ranks))
-    if meta.owners is not None and meta.owners != everyone:
+    owners = meta.owners or tuple(range(num_trainer_ranks))
+    if max(owners) >= num_trainer_ranks:
         raise ValueError(
-            f"parameter '{meta.name}' is owned by trainer ranks {meta.owners}, "
-            f"but nccl_m2n needs every parameter owned by ranks {everyone}, in "
-            "order"
+            f"parameter '{meta.name}' is owned by trainer ranks {owners}, but "
+            f"there are {num_trainer_ranks} trainer ranks"
         )
-    mesh_shape = meta.mesh_shape or (num_trainer_ranks,)
+    mesh_shape = meta.mesh_shape or (len(owners),)
     if len(mesh_shape) > MESH_NDIMS:
         raise ValueError(
             f"parameter '{meta.name}' has a {len(mesh_shape)}-D source mesh; "
@@ -431,6 +434,8 @@ def m2n_param_meta(meta: ParamMeta, num_trainer_ranks: int) -> M2NParamMeta:
         meta.dtype,
         meta.shape,
         M2NLayout(M2NMesh(dims, 0), placements),
+        allow_full_fallback,
+        owners=tuple(owners),
     )
 
 
@@ -443,8 +448,11 @@ class M2NWireParam:
     shape: tuple[int, ...]
     src_mesh_dims: tuple[int, int]
     src_placements: Placements | None
+    owners: tuple[int, ...]
+    allow_full_fallback: bool
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "owners", tuple(self.owners))
         shape = tuple(self.shape)
         dims = tuple(self.src_mesh_dims)
         placements = None if self.src_placements is None else tuple(self.src_placements)
@@ -478,6 +486,8 @@ class M2NWireParam:
             "shape",
             "src_mesh_dims",
             "src_placements",
+            "owners",
+            "allow_full_fallback",
         }
         missing = fields - value.keys()
         extra = value.keys() - fields
@@ -500,6 +510,8 @@ class M2NWireParam:
             "src_placements": (
                 None if self.src_placements is None else list(self.src_placements)
             ),
+            "owners": list(self.owners),
+            "allow_full_fallback": self.allow_full_fallback,
         }
 
 
@@ -509,33 +521,6 @@ def source_plan_digest(params: Sequence[M2NWireParam]) -> str:
         {
             "schema_version": M2N_WIRE_SCHEMA_VERSION,
             "params": [param.to_dict() for param in params],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def complete_plan_digest(
-    source_digest: str,
-    dst_mesh: M2NMesh,
-    dst_placements: Sequence[Placements | None],
-) -> str:
-    """Return a digest of the agreed source and destination plan."""
-    if not isinstance(source_digest, str) or not source_digest:
-        raise ValueError("source digest must be a non-empty string")
-    payload = json.dumps(
-        {
-            "schema_version": M2N_WIRE_SCHEMA_VERSION,
-            "source_digest": source_digest,
-            "destination_mesh": {
-                "dims": list(dst_mesh.dims),
-                "start_rank": dst_mesh.start_rank,
-            },
-            "destination_placements": [
-                None if placement is None else list(placement)
-                for placement in dst_placements
-            ],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -624,70 +609,6 @@ def check_source_plan_agreement(
             "nccl_m2n source preflight rejected before NCCL init: " + "; ".join(errors)
         )
     return canonical
-
-
-def check_complete_plan_agreement(
-    group: "StatelessProcessGroup",
-    source_digest: str,
-    dst_mesh: M2NMesh,
-    dst_placements: Sequence[Placements | None],
-    local_error: str | None = None,
-) -> str:
-    """Require every rank to accept the same complete transfer plan."""
-    prepared_error = local_error
-    digest: str | None = None
-    if prepared_error is None:
-        try:
-            digest = complete_plan_digest(source_digest, dst_mesh, dst_placements)
-        except Exception as exc:
-            prepared_error = f"{type(exc).__name__}: {exc}"
-    elif not isinstance(prepared_error, str) or not prepared_error:
-        prepared_error = "TypeError: local plan error must be a non-empty string"
-
-    gathered = group.all_gather_obj(
-        {"phase": "complete_plan", "digest": digest, "error": prepared_error}
-    )
-    errors: list[str] = []
-    valid: list[tuple[int, str]] = []
-    expected_fields = {"phase", "digest", "error"}
-    if len(gathered) != group.world_size:
-        errors.append(
-            "control-plane all-gather returned "
-            f"{len(gathered)} records for world size {group.world_size}"
-        )
-    for rank, item in enumerate(gathered):
-        if (
-            not isinstance(item, Mapping)
-            or set(item) != expected_fields
-            or item.get("phase") != "complete_plan"
-        ):
-            errors.append(f"rank {rank}: invalid complete-plan envelope")
-            continue
-        error = item["error"]
-        if error is not None:
-            if not isinstance(error, str) or not error:
-                errors.append(f"rank {rank}: invalid complete-plan error")
-            else:
-                errors.append(f"rank {rank}: {error}")
-            continue
-        rank_digest = item["digest"]
-        if not isinstance(rank_digest, str) or not rank_digest:
-            errors.append(f"rank {rank}: invalid complete-plan digest")
-            continue
-        valid.append((rank, rank_digest))
-    if not errors:
-        canonical = valid[0][1]
-        for rank, rank_digest in valid[1:]:
-            if rank_digest != canonical:
-                errors.append(
-                    f"rank {rank}: complete-plan digest disagrees with rank 0"
-                )
-    if errors:
-        raise RuntimeError(
-            "nccl_m2n complete-plan preflight rejected before first reshard: "
-            + "; ".join(errors)
-        )
-    return valid[0][1]
 
 
 def check_runtime_ready_agreement(
@@ -800,6 +721,112 @@ def check_data_plane_agreement(
         )
 
 
+# ---------------------------------------------------------------------------
+# Destination layouts (load plan, RFC #64418 §9)
+# ---------------------------------------------------------------------------
+
+# A destination layout: mesh dims over the N workers and their placements, or
+# REPLICATED. Destination meshes start right after the source group's ranks.
+DstLayout = tuple[tuple[int, int], Placements] | None
+Box = tuple[tuple[int, int], ...]
+# Agreed layout index for a name no worker needs: nothing is sent.
+SKIP = -1
+
+
+def candidate_layouts(meta: M2NParamMeta, num_workers: int) -> list[DstLayout]:
+    """Every destination layout `meta` could take, the same list on every rank:
+    each 2-D factorization of the workers with one axis `Shard(d)` (evenly) and
+    the other `Replicate`, most shards first, then `REPLICATED`. Layouts over
+    M2N's fan-in/out limits for `meta`'s source layout are left out."""
+    found: list[tuple[int, DstLayout]] = []
+    for a in range(1, num_workers + 1):
+        if num_workers % a:
+            continue
+        dims = (a, num_workers // a)
+        for dim, size in enumerate(meta.shape):
+            for axis in range(MESH_NDIMS):
+                if dims[axis] > 1 and size % dims[axis] == 0:
+                    placements = [REPLICATE] * MESH_NDIMS
+                    placements[axis] = dim
+                    layout: DstLayout = (dims, cast(Placements, tuple(placements)))
+                    found.append((dims[axis], layout))
+    found.sort(key=lambda item: -item[0])  # stable: ties keep enumeration order
+    src = resolve_layout(meta.source_layout.mesh, meta.source_layout.placements)
+    layouts: list[DstLayout] = []
+    candidates: list[DstLayout] = [item[1] for item in found] + [None]  # REPLICATED
+    for candidate in candidates:
+        dst = resolve_layout(*_mesh_and_placements(candidate, num_workers))
+        try:
+            check_plan_limits(src, dst, meta.name, meta.shape)
+        except ValueError:
+            continue
+        layouts.append(candidate)
+    return layouts
+
+
+def _mesh_and_placements(
+    layout: DstLayout, num_workers: int, start_rank: int = 0
+) -> tuple[M2NMesh, Placements | None]:
+    if layout is None:
+        return M2NMesh((num_workers, 1), start_rank), REPLICATED
+    return M2NMesh(layout[0], start_rank), layout[1]
+
+
+def layout_box(layout: DstLayout, shape: Sequence[int], worker: int) -> Box:
+    """The part of a `shape` tensor that `worker` receives under `layout`."""
+    box = [(0, size) for size in shape]
+    if layout is not None:
+        dims, placements = layout
+        for code, index, count in zip(placements, divmod(worker, dims[1]), dims):
+            if code != REPLICATE:
+                step = shape[code] // count
+                box[code] = (index * step, (index + 1) * step)
+    return tuple(box)
+
+
+def agree_destination_layouts(
+    group: "StatelessProcessGroup",
+    metas: Sequence[M2NParamMeta],
+    num_trainer_ranks: int,
+    masks: Sequence[int] | None,
+    local_error: str | None = None,
+) -> list[int]:
+    """AND every worker's per-name candidate masks and pick, per name, the first
+    candidate all workers accept: an index into `candidate_layouts`, or `SKIP`.
+
+    A worker's mask for a name has bit `i` set if it accepts candidate `i`, and
+    bit `len(candidates)` if it needs nothing of the name. Trainer ranks pass
+    `masks=None`. A local error on any rank fails every rank."""
+    gathered = group.all_gather_obj({"masks": masks, "error": local_error})
+    errors = [
+        f"rank {rank}: {item['error']}"
+        for rank, item in enumerate(gathered)
+        if item["error"] is not None
+    ]
+    if errors:
+        raise RuntimeError(
+            "nccl_m2n destination agreement failed: " + "; ".join(errors)
+        )
+    workers = [item["masks"] for item in gathered[num_trainer_ranks:]]
+    num_workers = len(workers)
+    chosen = []
+    for i, meta in enumerate(metas):
+        common = -1
+        for worker_masks in workers:
+            common &= worker_masks[i]
+        num_candidates = len(candidate_layouts(meta, num_workers))
+        if common >> num_candidates & 1:
+            chosen.append(SKIP)
+        elif common & ((1 << num_candidates) - 1):
+            chosen.append((common & -common).bit_length() - 1)
+        else:
+            raise RuntimeError(
+                f"nccl_m2n: no destination layout of '{meta.name}' fits every "
+                "worker within the M2N limits"
+            )
+    return chosen
+
+
 def to_mesh(m2n: Any, mesh: M2NMesh) -> Any:
     return m2n.Mesh(mesh.dims, start_rank=mesh.start_rank)
 
@@ -810,50 +837,39 @@ def to_placements(m2n: Any, placements: Placements) -> list[Any]:
     ]
 
 
-def publish_destination_placements(
+def reshard(
+    m2n: Any,
+    handle: Any,
     comm: Any,
-    device: torch.device,
     stream: torch.cuda.Stream,
-    first_worker_rank: int,
-    placements: "Sequence[Placements | None] | None",
-    num_parameters: int,
-) -> list[Placements | None]:
-    """Share the worker-side destination plan with every rank in the group.
-
-    The trainer must issue each reshard with the same destination the workers
-    use, but once destinations are per-parameter they depend on the inference
-    model, which only the workers can see. The first worker publishes them here,
-    over the shared NCCL communicator; trainer ranks pass `None` and receive
-    them, and the other workers pass their own so a disagreement is caught
-    rather than deadlocking later.
-
-    Only placements travel: the destination *mesh* is still derived from the
-    rank split, identically on both sides. The plan is published on the data
-    plane before any M2N reshard collective.
-    """
-    replicated_sentinel = REPLICATE - 1
-    encoded = torch.full(
-        (num_parameters, MESH_NDIMS),
-        replicated_sentinel,
-        dtype=torch.int8,
-        device=device,
+    meta: M2NParamMeta,
+    layout: DstLayout,
+    num_workers: int,
+    src: torch.Tensor | None,
+    dst: torch.Tensor | None,
+) -> None:
+    """One `m2n.reshard` of `meta` over its source group's communicator, from
+    its source layout into `layout` over the workers."""
+    src_mesh, src_placements = resolve_layout(
+        meta.source_layout.mesh, meta.source_layout.placements
     )
-    if comm.rank == first_worker_rank:
-        if placements is None or len(placements) != num_parameters:
-            raise ValueError(
-                f"publishing rank needs {num_parameters} destination placements"
-            )
-        rows = [
-            [replicated_sentinel] * MESH_NDIMS if placement is REPLICATED else placement
-            for placement in placements
-        ]
-        if rows:
-            encoded.copy_(torch.tensor(rows, dtype=torch.int8, device=device))
+    dst_mesh, dst_placements = resolve_layout(
+        *_mesh_and_placements(layout, num_workers, len(meta.owners))
+    )
+    m2n.reshard(
+        src,
+        dst,
+        comm,
+        stream,
+        src_mesh=to_mesh(m2n, src_mesh),
+        src_placements=to_placements(m2n, src_placements),
+        dst_mesh=to_mesh(m2n, dst_mesh),
+        dst_placements=to_placements(m2n, dst_placements),
+        handle=handle,
+    )
 
-    comm.broadcast(encoded, encoded, root=first_worker_rank, stream=stream)
-    return [
-        REPLICATED
-        if all(code == replicated_sentinel for code in row)
-        else cast(Placements, tuple(row))
-        for row in encoded.tolist()
-    ]
+
+def source_groups(metas: Sequence[M2NParamMeta]) -> list[tuple[int, ...]]:
+    """The distinct owner groups of `metas`, in order of first appearance; one
+    communicator each."""
+    return list(dict.fromkeys(meta.owners for meta in metas))

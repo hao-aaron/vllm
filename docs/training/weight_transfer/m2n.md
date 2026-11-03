@@ -16,21 +16,12 @@ The backend imports the runtime lazily, so vLLM is unaffected unless you select 
 
 ## How It Works
 
-1. A `StatelessProcessGroup` exchanges metadata and the NCCL unique ID. The trainer ranks and all inference workers then create **one** `nccl.core.Communicator`: trainer ranks occupy `[0, T)` and workers `[T, T + N)`. The communicator is passed directly to each M2N collective.
-2. At the init handshake the trainer ships the full transfer plan: the session-wide destination mesh, then each parameter's name, dtype, shape, source mesh, and source placements. The workers resolve the matching **destination placements** and publish them over the data-plane communicator; the meshes themselves are declared, not negotiated.
-3. Each round, both sides issue one `reshard` per parameter in the same order. Every rank in the communicator participates in every reshard, so — as with the NCCL engine — the worker must be inside `update_weights` while the trainer sends. The trainer engine handles that concurrency itself.
+1. A `StatelessProcessGroup` exchanges metadata and the NCCL unique IDs. Each parameter belongs to a **source group**, its `ParamMeta.owners` (every trainer rank by default). Every distinct source group gets one `nccl.core.Communicator`: the group's trainer ranks, in order, then all inference workers. A pipeline-parallel trainer declares one group per stage.
+2. At the init handshake the trainer ships each parameter's name, dtype, shape, owners, source mesh and source placements. Each worker builds a **load plan** (`plan_loads`, [RFC #64418](https://github.com/vllm-project/vllm/issues/64418)) of its model: which boxes of each checkpoint tensor it needs, and where they land in live memory.
+3. The workers agree on one **destination layout** per parameter: they test a fixed list of candidates (every 2-D factorization of the workers, one axis `Shard(d)`, the other `Replicate`, most shards first, then fully replicated) against their own boxes, AND the results over the metadata group, and take the first layout that gives every worker everything it needs. A parameter no worker needs is not sent.
+4. Each round, both sides issue one `reshard` per parameter in the same order. A worker reshards straight into the live tensor when its destination is one contiguous box, otherwise into a staging buffer whose box it copies into the plan's destinations. A parameter the plan cannot write directly (a cast, a computed loader) arrives in full and goes through `load_weights`.
 
-### Destination resolution
-
-A parameter is resharded **directly into the live vLLM parameter** when its checkpoint name maps 1:1 onto a model parameter whose shape is either identical to the checkpoint shape (replicated) or differs on exactly one dim by the tensor-parallel factor. That rank then only ever receives its own shard.
-
-Anything else falls back to receiving the full tensor and letting `load_weights` do the sharding, exactly as the NCCL engine does for every parameter. The fallback covers:
-
-- fused parameters (`qkv_proj`, `gate_up_proj`, MoE `w13`/`w2`), whose checkpoint names do not name a model parameter
-- quantized models, where the weight loader does more than a sharded copy
-- pipeline-parallel deployments
-
-Correctness never depends on a parameter resolving. The engine logs how many parameters took each path at init.
+The engine requires `VLLM_RELOAD_MODE=direct`, and logs, per worker, how many parameters take each path and how many bytes it receives per update.
 
 ## Configuration
 
@@ -87,16 +78,17 @@ in stream order until its reshard completes.
 
 See [`examples/rl/rlhf_m2n.py`](../../../examples/rl/rlhf_m2n.py) for a runnable FSDP → TP example.
 
+`M2NTrainerInitInfo.forbid_full_fallback` names parameters that must never arrive in full for `load_weights`; init fails if a worker's plan cannot write one of them directly.
+
 ## Limitations
 
-- vLLM validates tensor-rank and dtype support while agreeing on the complete
-  plan; the installed M2N runtime validates them again for each reshard.
-- **No pipeline-parallel trainers.** Every parameter must be owned by all trainer ranks, in rank order (`owners` unset or `(0, ..., T-1)`), with a 1-D or 2-D mesh. Partitioned owners, such as one group per pipeline stage, are rejected at init.
+- vLLM validates tensor-rank and dtype support while agreeing on the plan; the
+  installed M2N runtime validates them again for each reshard.
+- Source groups run one after another, in metadata order; their transfers do not overlap yet.
+- No pipeline-parallel inference workers, no draft-model updates.
 - `Partial` placements cannot be sent as shards. `ModuleSource` declares such a parameter replicated and gathers it in `iter_local()`.
-- Models with known model-level checkpoint preprocessing use the full-tensor
-  fallback for the affected module.
 - A reshard cannot be issued from inside a CUDA graph capture (weight updates run outside capture, so this only matters for custom callers).
-- vLLM checks every parameter's shard overlap against conservative 16-source
-  and 64-target capacities before committing the plan. The installed M2N
+- Destination layouts over conservative 16-source and 64-target capacities
+  are not candidates. The installed M2N
   runtime remains authoritative and validates each reshard again.
 - Each communicator holds a cached staging pool (~256 MiB by default: 4 channels x 64 MiB).
