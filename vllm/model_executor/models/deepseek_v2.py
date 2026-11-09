@@ -863,28 +863,54 @@ def _try_load_fp8_indexer_wk(
     weights and scale, and when both are available, dequantizes to BF16 and stores into
     the fused wk_weights_proj.weight parameter.
     """
+    paired = _pair_fp8_indexer_wk(name, tensor, buf, pp_missing_layer_names)
+    if paired is None:
+        return False  # Not one half of an FP8 indexer WK pair, ignore.
+    layer_prefix, weight_bf16 = paired
+    if weight_bf16 is not None:
+        # Load the dequantized weight into shard 0 of the fused buffer.
+        fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+        param = params_dict[fused_name]
+        param.weight_loader(param, weight_bf16, 0)
+        loaded_params.add(fused_name)
+    return True
+
+
+def _pair_fp8_indexer_wk(
+    name: str,
+    tensor: torch.Tensor,
+    buf: dict[str, dict[str, torch.Tensor]],
+    pp_missing_layer_names: list[str],
+) -> tuple[str, torch.Tensor | None] | None:
+    """Buffer one half of an FP8 indexer WK weight/scale pair.
+
+    Returns:
+        `None` if `name` is not such a half. Otherwise the indexer prefix and
+        the WK weight dequantized to BF16 once both halves have arrived, or
+        `None` while waiting or for a layer on another PP stage.
+
+    """
     if "indexer.wk." not in name or "wk_weights" in name:
-        return False  # Weight is not an isolated WK weight for the indexer, ignore.
+        return None
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale" in name
-    if not is_weight and not is_scale:
-        return False  # WK is not in FP8 format, ignore.
-    # Buffer this tensor (weight or scale) until both have arrived.
+    if not is_weight and "weight_scale" not in name:
+        return None  # WK is not in FP8 format.
     layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
-    if any(
-        name.startswith(missing_layer_name)
-        for missing_layer_name in pp_missing_layer_names
-    ):
-        return True
+    if any(name.startswith(missing) for missing in pp_missing_layer_names):
+        return layer_prefix, None
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
-        return True  # still waiting for the other param
-
-    # We have both weight and scale: dequantize FP8 to BF16.
-    weight_fp8, scale_inv = entry["weight"], entry["scale"]
+        return layer_prefix, None  # still waiting for the other half
     del buf[layer_prefix]
+    return layer_prefix, _dequantize_fp8_indexer_wk(entry["weight"], entry["scale"])
+
+
+def _dequantize_fp8_indexer_wk(
+    weight_fp8: torch.Tensor, scale_inv: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize an FP8 indexer WK weight to BF16 for the fused
+    `wk_weights_proj`."""
     if scale_inv.dtype in (torch.uint8, torch.float8_e8m0fnu):
         # MXFP8 checkpoints store power-of-two E8M0 scales, decode them to float.
         scale_inv = scale_inv.view(torch.float8_e8m0fnu).to(torch.float32)
@@ -899,18 +925,12 @@ def _try_load_fp8_indexer_wk(
             weight_fp8.shape[0] // scale_inv.shape[0],
             weight_fp8.shape[1] // scale_inv.shape[1],
         )
-    weight_bf16 = scaled_dequantize(
+    return scaled_dequantize(
         weight_fp8,
         scale_inv,
         group_shape=group_shape,
         out_dtype=torch.bfloat16,
     )
-
-    # Load the dequantized weight into shard 0 of the fused buffer.
-    param = params_dict[fused_name]
-    param.weight_loader(param, weight_bf16, 0)
-    loaded_params.add(fused_name)
-    return True
 
 
 def _min_latency_fused_qkv_a_proj_impl(
