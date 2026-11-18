@@ -17,6 +17,7 @@ from vllm.specialized._routing import LANGUAGE_MODEL
 
 DIRS = _lint.directories()
 REPO = _lint.VLLM_ROOT.parent
+TESTS = Path(__file__).resolve().parents[1]
 
 
 def _id(d: Path) -> str:
@@ -80,7 +81,7 @@ def test_model_refs_and_routing_entry(directory):
 @pytest.mark.parametrize("directory", DIRS, ids=_id)
 def test_rule4_tests_mirror_source(directory):
     rel = directory.relative_to(_lint.VLLM_ROOT)
-    tests = REPO / "tests" / rel
+    tests = TESTS / rel
     assert any(tests.glob("test_*.py")), f"no tests under {tests}"
     # Nothing outside a directory (and its tests) imports into it.
     module = _lint.module_of(directory / "__init__.py")
