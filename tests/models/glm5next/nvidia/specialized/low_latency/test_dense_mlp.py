@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from vllm.platforms import current_platform
 
-from .test_specialized_decode_shared_expert import _packed, _quant, _weight
+from .test_shared_expert import _packed, _quant, _weight
 
 # One TP4 shard of GLM-5.3-Flash's dense MLP.
 HIDDEN, INTER, LIMIT = 4096, 3072, 10.0
