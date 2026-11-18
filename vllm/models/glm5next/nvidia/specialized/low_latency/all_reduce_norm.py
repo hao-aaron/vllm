@@ -25,7 +25,6 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
-from vllm.specialized import services
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.models.common.ops.moe_tail_fusion.primitives import (
     ACTIVE_STAGE,
@@ -48,6 +47,7 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     to_cute,
     to_cute_dynamic,
 )
+from vllm.specialized import services
 
 from .all_reduce_mhc import _gmem_ptr, _PublishDeviceKernel
 from .cutedsl.finalize_publish import _QuadFinalizePublishDeviceKernel

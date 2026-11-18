@@ -86,7 +86,9 @@ def test_rule4_tests_mirror_source(directory):
     module = _lint.module_of(directory / "__init__.py")
     out = subprocess.run(
         ["git", "grep", "-l", module, "--", "vllm"],
-        cwd=REPO, capture_output=True, text=True,
+        cwd=REPO,
+        capture_output=True,
+        text=True,
     ).stdout.split()
     outside = [p for p in out if not p.startswith(str(Path("vllm") / rel))]
     assert not outside, outside

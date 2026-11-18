@@ -109,7 +109,6 @@ from .multimodal import (
     Glm5NextVisionTransformer,
 )
 
-
 logger = init_logger(__name__)
 
 # Fewest tokens per step on one GPU from which FlashInfer's fused mHC kernel

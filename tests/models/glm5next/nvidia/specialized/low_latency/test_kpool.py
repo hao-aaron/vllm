@@ -131,7 +131,9 @@ def test_expand_and_remap_matches_stock(rows, padding, stride_rows, max_blocks):
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
         expand_pools_and_append_tail,
     )
-    from vllm.models.glm5next.nvidia.specialized.low_latency.kpool import expand_and_remap
+    from vllm.models.glm5next.nvidia.specialized.low_latency.kpool import (
+        expand_and_remap,
+    )
     from vllm.v1.attention.backends.mla.sparse_utils import (
         triton_convert_req_index_to_global_index,
     )

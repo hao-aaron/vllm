@@ -58,7 +58,9 @@ class _LowLatency(Model):
         decode = self._decode
         if decode is not None:
             lm = self._language_model()
-            logits = decode.compute_logits(lm.logits_processor, lm.lm_head, hidden_states)
+            logits = decode.compute_logits(
+                lm.logits_processor, lm.lm_head, hidden_states
+            )
             if logits is not None:
                 return logits
         return super().compute_logits(hidden_states)

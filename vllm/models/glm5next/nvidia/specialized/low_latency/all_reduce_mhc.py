@@ -41,7 +41,6 @@ from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from vllm.specialized import services
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.models.common.ops.moe_tail_fusion.primitives import (
     ACTIVE_STAGE,
@@ -67,6 +66,7 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     to_cute,
     to_cute_dynamic,
 )
+from vllm.specialized import services
 
 from .cutedsl.finalize_publish import _QuadFinalizePublishDeviceKernel
 

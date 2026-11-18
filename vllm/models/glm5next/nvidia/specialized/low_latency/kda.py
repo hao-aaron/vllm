@@ -15,8 +15,8 @@ one; the copy adds that gate.
 import cutlass
 import torch
 
-from vllm.specialized import services
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.specialized import services
 
 from .cutedsl.host import (
     layout,

@@ -9,11 +9,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from vllm.config import CUDAGraphMode
-from vllm.specialized import services
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.model_executor.layers.mhc import hc_contract, hc_expand
+from vllm.specialized import services
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 from ..linear import planned_step

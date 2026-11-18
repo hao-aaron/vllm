@@ -14,9 +14,14 @@ from pathlib import Path
 
 VLLM_ROOT = Path(__file__).resolve().parents[1]
 # Core modules every specialized directory may import.
-ALLOWED = ("vllm.specialized.declare", "vllm.specialized.model",
-           "vllm.specialized.services", "vllm.specialized",
-           "vllm.models.common.ops", "vllm.logger")
+ALLOWED = (
+    "vllm.specialized.declare",
+    "vllm.specialized.model",
+    "vllm.specialized.services",
+    "vllm.specialized",
+    "vllm.models.common.ops",
+    "vllm.logger",
+)
 # Attributes that, assigned on an object the directory did not create, change
 # how shared code behaves.
 PATCHED_ATTRS = frozenset({"forward", "quant_method", "process_weights_after_loading"})
@@ -59,7 +64,7 @@ def _allowed(module: str, directory: str, family: str) -> bool:
         return True
     # The family's general tier, read-only; never another specialized directory.
     if module.startswith(family + ".") or module == family:
-        return ".specialized." not in module[len(family):] + "."
+        return ".specialized." not in module[len(family) :] + "."
     return not module.startswith("vllm")
 
 
@@ -79,7 +84,9 @@ def lint(directory: Path) -> Findings:
             names: list[str] = []
             if isinstance(node, ast.Import):
                 names = [a.name for a in node.names]
-                imported_names |= {(a.asname or a.name).split(".")[0] for a in node.names}
+                imported_names |= {
+                    (a.asname or a.name).split(".")[0] for a in node.names
+                }
             elif isinstance(node, ast.ImportFrom):
                 base = _resolve(node, package)
                 # `from pkg import submodule` imports pkg.submodule.
@@ -143,8 +150,10 @@ def declared(directory: Path) -> tuple[dict[str, str], dict[str, str]]:
 def main() -> None:
     for d in directories():
         f = lint(d)
-        print(f"# {d.relative_to(VLLM_ROOT.parent)}: {len(f.imports)} imports, "
-              f"{len(f.mutations)} mutations")
+        print(
+            f"# {d.relative_to(VLLM_ROOT.parent)}: {len(f.imports)} imports, "
+            f"{len(f.mutations)} mutations"
+        )
         if "-v" in sys.argv:
             for k, v in sorted(f.imports.items()):
                 print(f"  import {k}  <- {sorted(set(v))[:3]}")

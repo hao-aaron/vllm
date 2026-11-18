@@ -1,10 +1,10 @@
-# MiniMax-M3.1 specialized decode (NVIDIA)
+# MiniMax-M3.1 low-latency decode (NVIDIA specialized directory)
 
 A decode executor for small decode batches of MiniMax-M3.1-Flash on GB300
-(and B200/GB200), enabled with
-`--additional-config '{"decode_backend": "latency_specialized"}'`. The default,
-`auto`, keeps the stock decode: the model then builds no executor, defines no
-model state of its own and runs exactly as without this package. The executor
+(and B200/GB200). It is a specialized directory (`vllm.specialized`):
+`__init__.py` declares `SUPPORTS`, `defaults` and `MODEL`/`DRAFT_MODEL`, and
+routing runs it only when pinned (`--specialized-model low_latency`) or
+required, since `default_on=False`. Otherwise the general model runs. The executor
 runs the target model's decoder layers; the DSpark drafter keeps its stock
 model but, with the switch on, samples its Markov chain in one kernel per
 position (`drafter.py`), fuses its norms with the next MXFP8 quantize
@@ -14,9 +14,9 @@ MiniMax-M3 decode kernels.
 
 ## Scope
 
-`specialized_decode_config` (`__init__.py`) reads the setting once, when the
-target model is built. `unsupported()` lists every requirement the deployment
-misses, and every TP rank raises with that list:
+`SUPPORTS` and `check()` (`__init__.py`) list what the deployment must have;
+routing prints every unmet one. `defaults()` fills the block size, index cache
+dtype and graph mode when the user left them unset:
 
 - GPU: SM100 (B200/GB200) or SM103 (B300/GB300).
 - Kernels: every kernel is CuTe DSL (`nvidia-cutlass-dsl`, a vLLM
@@ -52,7 +52,11 @@ off (fp8 KV + fp8 index cache), not the recipe's NVFP4 default.
 
 | File | Contents |
 | --- | --- |
-| `__init__.py` | Row caps, `DecodeConfig` (query length, cache dtypes, autotune/JIT flags), `unsupported()`, `specialized_decode_config()` |
+| `__init__.py` | Declarations: `SUPPORTS`, `check()`, `defaults()`, `MODEL`, `DRAFT_MODEL` (import-light) |
+| `config.py` | Row caps, `DecodeConfig` (query length, cache dtypes), `decode_config()` |
+| `model.py` | `LowLatencyMiniMaxM3`: the general language model plus the executor (built and warmed up in `warmup()`) and peer target logits |
+| `draft.py` | `LowLatencyMiniMaxM3DSpark`: the general DSpark draft model with `attach_drafter` |
+| `EXCEPTIONS.py` | Core internals still imported directly, and patched objects |
 | `stages.py` | The stage interface: one ABC per stage, with tensor shapes and dtypes; `Stages` (implementations per stage) and `StepStages` (one per stage, for a step) |
 | `stock.py` | Every stage on the ops the stock layers run (the stock-op chain) |
 | `kernel_stages.py` | The `kernels/` registry entries behind the stage interfaces (`Kernel*` adapters) and `KernelContext` (peer transport, bound buffers, kernel instances, per-step page rows and sparse lengths) |
@@ -60,17 +64,14 @@ off (fp8 KV + fp8 index cache), not the recipe's NVFP4 default.
 | `draft_norm.py` | The draft norms fused with the next linear's MXFP8 quantize (after the stock all-reduce) |
 | `peer_logits.py` | Target and draft LM-head logits pushed through CUDA IPC memory instead of the NCCL all-gather |
 | `runtime/decode.py` | `SpecializedDecode` (per-layer plans, `plan()`, `run()`), `DecodeStep`, `default_stages()`, `captures_pure_decode()` |
-| `runtime/model_state.py` | `MiniMaxM3SpecializedDecodeModelState`: builds the executor after the weights are loaded and warms it up, before memory profiling |
 | `runtime/warmup.py` | Calls each stage implementation's `warm_up` for the step rows it supports |
 | `kernels/` | The kernels and their registry (stage -> implementation + arch/TP/rows envelope); `kernels/wide.py` holds the front and o_proj GEMVs above the fused kernels' rows; each kernel family is a host module plus its CuTe DSL kernel module (`front_kernel.py`, `page_topk_kernel.py`, `sparse_decode_kernel.py`, `post/`, `o_proj/`, `moe/`) |
 
-Outside the package, `../model.py` reads the switch in
-`MiniMaxM3SparseForCausalLM.__init__`, adds `build_specialized_decode()`,
-sets `get_model_state_cls` only when the switch is on (the VL wrapper forwards
-it), and `MiniMaxM3Model.forward(..., decode_step=...)` hands the layers to the
-step after the embedding. `../../common/dspark.py` calls
-`drafter.attach_drafter` only with the switch on. No shared vLLM file
-changes: the model runner, the CUDA graph manager and the DSpark speculator
+The general tier knows nothing of this directory. It offers two
+construction-time extension points that `model.py` overrides:
+`MiniMaxM3SparseForCausalLM.backbone_cls` and
+`MiniMaxM3Model.fused_finalize_max_tokens` (raised to `MAX_ROWS`). The model
+runner, the CUDA graph manager and the DSpark speculator
 run as for any model. The executor returns the aux hidden states as the stock
 forward does (clones of the residual stream, one `[rows, hidden]` tensor per
 aux layer), and the drafter's FLASHINFER_TS metadata is built eagerly before
@@ -240,11 +241,11 @@ vllm serve MiniMaxAI/MiniMax-M3.1-Flash -tp 4 --block-size 128 \
   --kv-cache-dtype fp8 --attention-config '{"indexer_kv_dtype": "fp8"}' \
   --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
   --speculative-config '{"method": "dspark", "num_speculative_tokens": 7, "attention_backend": "FLASHINFER_TS"}' \
-  --additional-config '{"decode_backend": "latency_specialized"}'
+  --specialized-model low_latency
 ```
 
-The log shows `MiniMax-M3.1 specialized decode on, for FULL-graph decode
-steps of up to 64 rows`.
+The log shows `Specialized routing: ...: nvidia/specialized/low_latency` and
+`MiniMax-M3.1 low-latency decode for FULL-graph decode steps of up to 64 rows`.
 
 ## Not yet
 
@@ -253,4 +254,4 @@ steps of up to 64 rows`.
   sparse decode's plan cache must be audited for host reads first.
 - A low-batch target LM head / fused rejection sampler.
 - The fused post + MoE engine above 8 rows (the c = 2..8 steps at K = 7).
-- TP 8/16 (`unsupported()` accepts TP 4 only).
+- TP 8/16 (`SUPPORTS.tp` is TP 4 only).

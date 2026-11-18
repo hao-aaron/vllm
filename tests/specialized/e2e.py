@@ -21,8 +21,13 @@ PROMPTS = [
 def _generate(model: str, specialized: str, **kwargs) -> tuple[str, list[list[int]]]:
     from vllm import LLM, SamplingParams
 
-    llm = LLM(model=model, tensor_parallel_size=4, specialized_model=specialized,
-              max_model_len=4096, **kwargs)
+    llm = LLM(
+        model=model,
+        tensor_parallel_size=4,
+        specialized_model=specialized,
+        max_model_len=4096,
+        **kwargs,
+    )
     choice = llm.llm_engine.vllm_config.model_config.specialized_choice
     outs = llm.generate(PROMPTS, SamplingParams(temperature=0, max_tokens=32))
     tokens = [list(o.outputs[0].token_ids) for o in outs]

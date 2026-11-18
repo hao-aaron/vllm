@@ -5,6 +5,7 @@
 Specialized directories never import this module (Rule 1).
 """
 
+import contextlib
 import importlib
 import importlib.metadata
 import importlib.util
@@ -59,10 +60,8 @@ def _arch() -> str:
 def _libraries() -> dict[str, str]:
     out = {}
     for lib in PROBED_LIBRARIES:
-        try:
+        with contextlib.suppress(importlib.metadata.PackageNotFoundError):
             out[lib] = importlib.metadata.version(lib)
-        except importlib.metadata.PackageNotFoundError:
-            pass
     return out
 
 
@@ -201,7 +200,10 @@ def _apply_defaults(cfg: "VllmConfig", mod: ModuleType) -> dict[str, Any]:
         else:
             logger.info(
                 "%s: keeping user setting %s=%s (default %s)",
-                mod.__name__, key, _get(cfg, key), value,
+                mod.__name__,
+                key,
+                _get(cfg, key),
+                value,
             )
     return filled
 
@@ -276,12 +278,37 @@ def route(cfg: "VllmConfig") -> Decision:
     return d
 
 
+_LEGACY = {"stock": "off", "auto": "auto", "latency_specialized": "require"}
+
+
+def _map_legacy_switch(cfg: "VllmConfig") -> None:
+    """Deprecated: `decode_backend` (and `--monokernel`) for families that route."""
+    extra = cfg.additional_config
+    backend = extra.get("decode_backend") if isinstance(extra, dict) else None
+    mc = cfg.model_config
+    if backend is None or family_of(mc) is None:
+        return
+    if not candidates(family_of(mc), platform_key()):
+        return
+    mode = _LEGACY.get(backend)
+    if mode is None:
+        raise ValueError(f"decode_backend={backend!r}: use --specialized-model")
+    if mc.specialized_model == "auto" and mode != "auto":
+        mc.specialized_model = mode
+    logger.warning(
+        "decode_backend=%s is deprecated for this model; using --specialized-model %s.",
+        backend,
+        mc.specialized_model,
+    )
+
+
 def route_and_record(cfg: "VllmConfig") -> None:
     """VllmConfig hook: route, record the choice on the model config, print."""
     mc = cfg.model_config
     # Once per engine: derived configs (draft overrides) share this model config.
     if mc is None or mc.is_submodel_config or mc.specialized_choice is not None:
         return
+    _map_legacy_switch(cfg)
     d = route(cfg)
     mc.specialized_choice = d.choice or ""
     for line in d.lines:
@@ -317,8 +344,9 @@ def _worker_agrees(cfg: "VllmConfig", choice: str) -> bool:
     mod = importlib.import_module(choice)
     reasons = mod.SUPPORTS.reasons(route_config(cfg))
     if reasons:
-        logger.warning("Specialized routing: this rank declines %s: %s", choice,
-                       "; ".join(reasons))
+        logger.warning(
+            "Specialized routing: this rank declines %s: %s", choice, "; ".join(reasons)
+        )
     ok = services.comm.cpu_all_reduce_min(0 if reasons else 1, group="world")
     return bool(ok)
 
