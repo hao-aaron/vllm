@@ -48,7 +48,7 @@ class _LowLatency(Model):
         if decode is not None and intermediate_tensors is None:
             step = decode.plan(positions, intermediate_tensors)
             if step is not None:
-                self.count("low_latency_capture")
+                self.mark_graph(positions.shape[0], "low_latency")
                 return decode.run(step, input_ids, inputs_embeds)
         return super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs

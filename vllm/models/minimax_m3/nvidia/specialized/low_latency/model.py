@@ -76,7 +76,7 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
             return super().forward(
                 input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
             )
-        self.count("low_latency_capture")
+        self.mark_graph(positions.shape[0], "low_latency")
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_input_ids(input_ids)
         # The executor runs the layers and the final norm (no pipeline parallelism).

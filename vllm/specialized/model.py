@@ -51,8 +51,20 @@ class Model(nn.Module):
     def fused_step(self, batch: Any, sampling: Any) -> StepResult | None:
         return None
 
+    def mark_graph(self, num_tokens: int, path: str) -> None:
+        """Record, while capturing, that the FULL graph of `num_tokens` runs `path`.
+
+        Replays run no Python, so core counts each step's path from this record.
+        """
+        self.__dict__.setdefault("_specialized_graphs", {})[num_tokens] = path
+
+    def step_path(self, full_graph: bool, num_tokens: int) -> str:
+        """The path a step takes: a marked FULL graph's, otherwise "general"."""
+        if not full_graph:
+            return "general"
+        return self.__dict__.get("_specialized_graphs", {}).get(num_tokens, "general")
+
     def count(self, path: str, n: int = 1) -> None:
-        """Per-path step counter, printed by core at shutdown."""
         counts = self.__dict__.setdefault("_specialized_path_counts", Counter())
         counts[path] += n
 
