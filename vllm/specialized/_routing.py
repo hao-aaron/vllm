@@ -286,9 +286,8 @@ def _map_legacy_switch(cfg: "VllmConfig") -> None:
     extra = cfg.additional_config
     backend = extra.get("decode_backend") if isinstance(extra, dict) else None
     mc = cfg.model_config
-    if backend is None or family_of(mc) is None:
-        return
-    if not candidates(family_of(mc), platform_key()):
+    family = family_of(mc)
+    if backend is None or family is None or not candidates(family, platform_key()):
         return
     mode = _LEGACY.get(backend)
     if mode is None:

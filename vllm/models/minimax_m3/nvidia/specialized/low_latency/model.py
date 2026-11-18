@@ -48,13 +48,14 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
         if reason:
             logger.info("Target logits stay gathered: %s.", reason)
         else:
-            self._peer_logits = peer_logits(
+            logits = peer_logits(
                 self.lm_head,
                 self.logits_processor,
                 MAX_REQUESTS * (1 + MAX_SPECULATIVE_TOKENS),
                 "target_logits",
             )
-            self._peer_logits.warm_up()
+            logits.warm_up()
+            self._peer_logits = logits
         spec = cfg.speculative_config
         if spec is not None and spec.num_speculative_tokens:
             from .drafter import warm_up_drafters
@@ -71,7 +72,7 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
     ):
         decode = self._decode
         step = None if decode is None else decode.plan(positions, intermediate_tensors)
-        if step is None:
+        if decode is None or step is None:
             return super().forward(
                 input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
             )
