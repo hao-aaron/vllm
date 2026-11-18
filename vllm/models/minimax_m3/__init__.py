@@ -2,32 +2,34 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MiniMax M3 model — hardware-isolated entry point.
 
-The implementation lives under `nvidia/` and `amd/`; this module picks the
-right one for the current platform and re-exports the public classes used by
-the model registry. (Mirrors `vllm.models.deepseek_v4`.)
+The implementation lives under `nvidia/` and `amd/`; classes load on first
+access from the current platform's folder, so routing can read `routing.py`
+and the specialized declarations without them.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from vllm.platforms import current_platform
-
-# The NVIDIA branch is the static default that type-checkers see; the ROCm
-# branch overrides it at runtime (kept type-compatible via type: ignore).
-if TYPE_CHECKING or not current_platform.is_rocm():
+if TYPE_CHECKING:
     from .nvidia.model import (
         MiniMaxM3SparseForCausalLM,
         MiniMaxM3SparseForConditionalGeneration,
     )
     from .nvidia.mtp import MiniMaxM3MTP
-else:
-    from .amd.model import (  # type: ignore[assignment]
-        MiniMaxM3SparseForCausalLM,
-        MiniMaxM3SparseForConditionalGeneration,
-    )
-    from .amd.mtp import MiniMaxM3MTP  # type: ignore[assignment]
 
 __all__ = [
     "MiniMaxM3MTP",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name not in __all__:
+        raise AttributeError(name)
+    import importlib
+
+    from vllm.platforms import current_platform
+
+    folder = "amd" if current_platform.is_rocm() else "nvidia"
+    module = "mtp" if name == "MiniMaxM3MTP" else "model"
+    return getattr(importlib.import_module(f"{__name__}.{folder}.{module}"), name)
