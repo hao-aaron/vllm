@@ -58,7 +58,7 @@ def _inputs(tokens, rank, device):
 
 
 def _boundary(rank, device):
-    from vllm.models.glm5next.nvidia.specialized_decode.all_reduce_mhc import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.all_reduce_mhc import (
         AllReduceMhcBoundary,
     )
 

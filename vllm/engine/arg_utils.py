@@ -793,6 +793,7 @@ class EngineArgs:
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
+    specialized_model: str = ModelConfig.specialized_model
     sleep_mode_backend: str = ModelConfig.sleep_mode_backend
     sleep_mode_offload_cudagraph: bool = ModelConfig.sleep_mode_offload_cudagraph
     sleep_preserve_parameter_names: list[str] = get_field(
@@ -1044,6 +1045,9 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--enable-sleep-mode", **model_kwargs["enable_sleep_mode"]
+        )
+        model_group.add_argument(
+            "--specialized-model", **model_kwargs["specialized_model"]
         )
         model_group.add_argument(
             "--sleep-mode-backend", **model_kwargs["sleep_mode_backend"]
@@ -2071,6 +2075,7 @@ class EngineArgs:
             generation_config=self.generation_config,
             override_generation_config=self.override_generation_config,
             enable_sleep_mode=self.enable_sleep_mode,
+            specialized_model=self.specialized_model,
             sleep_mode_backend=self.sleep_mode_backend,
             sleep_mode_offload_cudagraph=self.sleep_mode_offload_cudagraph,
             sleep_preserve_parameter_names=self.sleep_preserve_parameter_names,

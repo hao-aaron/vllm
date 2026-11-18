@@ -59,7 +59,7 @@ def _errors(out, ref):
 
 
 def _run(tokens, ue8m0):
-    from vllm.models.glm5next.nvidia.specialized_decode.dense_mlp import DenseMlp
+    from vllm.models.glm5next.nvidia.specialized.low_latency.dense_mlp import DenseMlp
 
     g = torch.Generator(device="cuda").manual_seed(tokens)
     w13, e13 = _weight(g, 2 * INTER, HIDDEN)  # [gate; up]

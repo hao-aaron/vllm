@@ -71,7 +71,7 @@ def test_kpool_update_matches_stock(requests, tokens, padded):
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
         kpool_decode_update_and_maybe_write_cache_batched as stock,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.kpool import kpool_update
+    from vllm.models.glm5next.nvidia.specialized.low_latency.kpool import kpool_update
     from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
     assert mqa_logits_use_mx_scales()
@@ -89,7 +89,7 @@ def test_kpool_update_matches_stock(requests, tokens, padded):
 @pytest.mark.parametrize("width", [2048, 32768])
 def test_upcast_matches_stock(rows, width):
     from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
-    from vllm.models.glm5next.nvidia.specialized_decode.kpool import upcast_logits
+    from vllm.models.glm5next.nvidia.specialized.low_latency.kpool import upcast_logits
 
     logits = torch.randn(rows, width + 64, device="cuda").bfloat16()[:, :width]
     ends = torch.randint(1, width + 1, (rows,), dtype=torch.int32, device="cuda")
@@ -113,7 +113,7 @@ def test_expand_matches_stock(rows):
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
         expand_pools_and_append_tail,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.kpool import expand_pools
+    from vllm.models.glm5next.nvidia.specialized.low_latency.kpool import expand_pools
 
     ids, positions = _pool_ids(rows, 8192, rows)
     ref = torch.full((rows, WIDTH), -1, dtype=torch.int32, device="cuda")
@@ -131,7 +131,7 @@ def test_expand_and_remap_matches_stock(rows, padding, stride_rows, max_blocks):
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
         expand_pools_and_append_tail,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.kpool import expand_and_remap
+    from vllm.models.glm5next.nvidia.specialized.low_latency.kpool import expand_and_remap
     from vllm.v1.attention.backends.mla.sparse_utils import (
         triton_convert_req_index_to_global_index,
     )
@@ -161,7 +161,7 @@ def test_expand_and_remap_matches_stock(rows, padding, stride_rows, max_blocks):
 def test_fused_remap_hook_matches_stock_conversion():
     """A deferred pool top-k converted through the index group's side stream
     equals the stock expansion followed by the stock group conversion."""
-    import vllm.models.glm5next.nvidia.specialized_decode.kpool as kpool
+    import vllm.models.glm5next.nvidia.specialized.low_latency.kpool as kpool
     from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 
     rows = 4

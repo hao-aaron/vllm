@@ -28,6 +28,19 @@ def init_model_state(
 def resolve_model_state_cls(
     vllm_config: VllmConfig, model: nn.Module
 ) -> type[ModelState]:
+    from vllm.specialized.model import Model
+
+    if isinstance(model, Model):
+        from vllm.v1.worker.gpu.model_states.specialized import adapter_for
+
+        return adapter_for(_general_model_state_cls(vllm_config, model))
+
+    return _general_model_state_cls(vllm_config, model)
+
+
+def _general_model_state_cls(
+    vllm_config: VllmConfig, model: nn.Module
+) -> type[ModelState]:
     # Let the model provide its own ModelState if it defines one.
     if hasattr(model, "get_model_state_cls"):
         return model.get_model_state_cls()

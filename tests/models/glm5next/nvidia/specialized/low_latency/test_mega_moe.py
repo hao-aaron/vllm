@@ -62,7 +62,7 @@ def _weights(g):
         _shuffle_deepseek_fp8_moe_weights,
         swap_w13_to_w31,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.grouped_moe import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.grouped_moe import (
         shared_weights,
     )
 
@@ -97,10 +97,10 @@ def _weights(g):
 @pytest.mark.parametrize("ue8m0", [False, True])
 def test_mega_moe_matches_reference(grouped, tokens, ue8m0):
     """Routing, activation quant and both expert GEMMs against PyTorch."""
-    from vllm.models.glm5next.nvidia.specialized_decode.grouped_moe import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.grouped_moe import (
         GroupedExperts,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.mega_moe import MegaExperts
+    from vllm.models.glm5next.nvidia.specialized.low_latency.mega_moe import MegaExperts
 
     g = torch.Generator(device="cuda").manual_seed(tokens)
     w = _weights(g)
@@ -208,7 +208,7 @@ def test_grouped_moe_error_within_stock(tokens):
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         per_token_group_quant_fp8,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.grouped_moe import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.grouped_moe import (
         GroupedExperts,
     )
 

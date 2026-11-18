@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize("tokens", [1, 40])
 def test_projection_matches_linear(tokens):
-    from vllm.models.glm5next.nvidia.specialized_decode.indexer import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.indexer import (
         IndexerProjection,
     )
 
@@ -54,7 +54,7 @@ def test_projection_matches_linear(tokens):
 @pytest.mark.parametrize("tokens", [1, 40])
 def test_query_epilogue_matches_unfused(tokens):
     from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
-    from vllm.models.glm5next.nvidia.specialized_decode.indexer_query import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.indexer_query import (
         indexer_query,
     )
 
@@ -85,10 +85,10 @@ def test_fused_query_matches_pair(tokens):
     """The projection kernel with the query epilogue inside writes what the
     projection and `indexer_query` write; repeated calls advance its grid
     barrier."""
-    from vllm.models.glm5next.nvidia.specialized_decode.indexer import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.indexer import (
         IndexerProjection,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.indexer_query import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.indexer_query import (
         indexer_query,
     )
 
@@ -127,10 +127,10 @@ def test_fused_query_matches_pair(tokens):
 def test_bf16_head_weights_round_fp32(fused):
     """BF16 head weights (for the SM100 MQA logits) are the FP32 ones rounded
     as `.to(torch.bfloat16)` rounds them."""
-    from vllm.models.glm5next.nvidia.specialized_decode.indexer import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.indexer import (
         IndexerProjection,
     )
-    from vllm.models.glm5next.nvidia.specialized_decode.indexer_query import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.indexer_query import (
         indexer_query,
     )
 

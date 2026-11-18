@@ -13,7 +13,7 @@ COLUMNS = 38720  # GLM-5.3-Flash's vocabulary shard at TP4
 
 
 def _gather(rank, device):
-    from vllm.models.glm5next.nvidia.specialized_decode.logits_gather import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.logits_gather import (
         LogitsGather,
     )
 

@@ -20,7 +20,7 @@ def _rms_norm(x, weight):
 
 def _embed_norm(rank, device):
     from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
-    from vllm.models.glm5next.nvidia.specialized_decode.all_reduce_norm import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.all_reduce_norm import (
         AllReduceNorm,
     )
 

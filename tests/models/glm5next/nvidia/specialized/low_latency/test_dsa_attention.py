@@ -33,7 +33,7 @@ def _errors(value, reference):
 
 @pytest.mark.parametrize("tokens", [1, 8])
 def test_value_up_matches_bmm(tokens):
-    from vllm.models.glm5next.nvidia.specialized_decode.dsa_attention import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.dsa_attention import (
         head_gemv,
     )
 
@@ -57,7 +57,7 @@ def test_absorb_quant_matches_bmm_and_quant(tokens, q_scale):
     stock bmm + `scaled_fp8_quant` but where the two BF16 products round
     differently, and no larger error against the FP64 reference."""
     from vllm import _custom_ops as ops
-    from vllm.models.glm5next.nvidia.specialized_decode.dsa_attention import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.dsa_attention import (
         head_gemv,
     )
 
@@ -86,7 +86,7 @@ def test_norm_matches_stock(tokens):
     """The q/kv a-norm: the stock Triton kernel's outputs but where a different
     summation order flips a rounding, and no larger error."""
     from vllm.models.common.ops.fused_qk_rmsnorm import fused_q_kv_rmsnorm
-    from vllm.models.glm5next.nvidia.specialized_decode.dsa_attention import norm
+    from vllm.models.glm5next.nvidia.specialized.low_latency.dsa_attention import norm
 
     g = torch.Generator(device="cuda").manual_seed(tokens)
     eps = 1e-6
@@ -114,7 +114,7 @@ def test_absorb_writes_kv_cache_as_stock(tokens, k_scale):
     at the valid slots of a padded-stride cache and nothing else, and leave
     the query as it is without them."""
     from vllm import _custom_ops as ops
-    from vllm.models.glm5next.nvidia.specialized_decode.dsa_attention import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.dsa_attention import (
         head_gemv,
     )
 
@@ -153,7 +153,7 @@ def test_absorb_writes_kv_cache_as_stock(tokens, k_scale):
 def test_kda_gate_matches_linear(tokens):
     """The KDA output gate's g_b_proj (rank 128 -> 16 heads x 128) on a strided
     slice of the in_proj output, as `head_gemv` of one head."""
-    from vllm.models.glm5next.nvidia.specialized_decode.dsa_attention import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.dsa_attention import (
         head_gemv,
     )
 
@@ -189,7 +189,7 @@ def test_split_k_projection_matches_linear(shape, tokens):
     than cuBLAS's against the FP64 product."""
     from types import SimpleNamespace
 
-    from vllm.models.glm5next.nvidia.specialized_decode.linear import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.linear import (
         planned_step,
         route,
     )

@@ -60,7 +60,7 @@ class _Case:
         return tuple(c.clone() for c in self.caches)
 
     def specialized(self, caches, fold):
-        from vllm.models.glm5next.nvidia.specialized_decode.kda import KdaStage
+        from vllm.models.glm5next.nvidia.specialized.low_latency.kda import KdaStage
 
         conv = lambda w: SimpleNamespace(weight=w)
         attention = SimpleNamespace(

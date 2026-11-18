@@ -49,7 +49,7 @@ def _packed(exponents, n):
 @pytest.mark.parametrize("ue8m0", [False, True])
 @pytest.mark.parametrize("tokens", [1, 2])
 def test_shared_expert_matches_reference(tokens, ue8m0):
-    from vllm.models.glm5next.nvidia.specialized_decode.shared_expert import (
+    from vllm.models.glm5next.nvidia.specialized.low_latency.shared_expert import (
         SharedExpert,
     )
 
