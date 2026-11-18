@@ -231,3 +231,17 @@ def test_routing_table(
     )
     cfg = dataclasses.replace(base, settings=settings, **over)
     assert _route(family, cfg, pinned) == expected
+
+
+def test_worker_recheck_uses_rank_local_facts_only():
+    # A VL wrapper's language model is built from a submodel config that lacks
+    # the checkpoint's quantization_config; workers must not decline on it.
+    from vllm.specialized._routing import _rank_local
+
+    support = importlib.import_module(f"{MM}.nvidia.specialized.low_latency").SUPPORTS
+    cfg = dataclasses.replace(
+        _base(MM), checkpoint="none", settings=_settings({}), features=frozenset()
+    )
+    assert support.reasons(cfg)
+    assert not _rank_local(support).reasons(cfg)
+    assert _rank_local(support).reasons(dataclasses.replace(cfg, arch="sm90"))

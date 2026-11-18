@@ -14,7 +14,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
-from vllm.specialized.declare import DEFAULT_KEYS, RouteConfig, Support
+from vllm.specialized.declare import DEFAULT_KEYS, FEATURES, RouteConfig, Support
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -336,12 +336,24 @@ def verify_resolved(cfg: "VllmConfig") -> None:
         raise ValueError(msg)
 
 
+def _rank_local(support: Support) -> Support:
+    """Only the facts each rank probes; the engine checked the rest on the full
+    config (a worker may hold a submodel's config here)."""
+    return Support(
+        arch=support.arch,
+        compute_units=support.compute_units,
+        machine=support.machine,
+        libraries=support.libraries,
+        features=FEATURES,
+    )
+
+
 def _worker_agrees(cfg: "VllmConfig", choice: str) -> bool:
     """Every rank re-checks the per-rank facts; one objection moves all ranks."""
     from vllm.specialized import services
 
     mod = importlib.import_module(choice)
-    reasons = mod.SUPPORTS.reasons(route_config(cfg))
+    reasons = _rank_local(mod.SUPPORTS).reasons(route_config(cfg))
     if reasons:
         logger.warning(
             "Specialized routing: this rank declines %s: %s", choice, "; ".join(reasons)
