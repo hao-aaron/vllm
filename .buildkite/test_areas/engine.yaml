@@ -17,9 +17,12 @@ steps:
   - vllm/logging_utils/
   - vllm/platforms/
   - vllm/sequence.py
+  - vllm/specialized/
+  - vllm/models/
   - vllm/triton_utils/
   - vllm/utils/
   - tests/engine
+  - tests/specialized
   - tests/test_sequence
   - tests/test_config
   - tests/test_logger
@@ -30,6 +33,7 @@ steps:
   - >-
     pytest -v -s
     engine
+    specialized
     test_sequence.py
     test_config.py
     test_logger.py
