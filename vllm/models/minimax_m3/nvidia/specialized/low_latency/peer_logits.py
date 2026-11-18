@@ -84,12 +84,12 @@ class PeerShards:
     def __init__(
         self, weight: torch.Tensor, max_rows: int, name: str, extra_bytes: int = 0
     ) -> None:
-        from vllm.distributed import get_tp_group
+        from vllm.specialized import services
 
         from .kernels._comm import make_transport
 
-        group = get_tp_group()
-        self.world, self.rank = group.world_size, group.rank_in_group
+        group = services.groups.tp
+        self.world, self.rank = group.size, group.rank
         self.shard = weight.shape[0]
         self.dtype = weight.dtype
         self.max_rows = max_rows

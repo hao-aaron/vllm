@@ -523,15 +523,11 @@ class ShardedContextFc:
         self._logged = False
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from vllm.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-            tensor_model_parallel_all_reduce,
-        )
+        from vllm.specialized import services
 
         inner = self._model.model
         fc = getattr(inner, "fc", None)
-        tp = get_tensor_model_parallel_world_size()
+        tp = services.groups.tp.size
         weight = getattr(fc, "weight", None)
         if (
             not getattr(inner, "use_aux_hidden_state", False)
@@ -549,11 +545,11 @@ class ShardedContextFc:
             logger.info("DSpark context fc: split over %d TP ranks.", tp)
             self._logged = True
         width = weight.shape[1] // tp
-        cols = slice(get_tensor_model_parallel_rank() * width, None)
+        cols = slice(services.groups.tp.rank * width, None)
         cols = slice(cols.start, cols.start + width)
         x = hidden_states.to(weight.dtype)[:, cols]
         partial = torch.mm(x, weight[:, cols].t(), out_dtype=torch.float32)
-        return tensor_model_parallel_all_reduce(partial).to(weight.dtype)
+        return services.comm.all_reduce(partial).to(weight.dtype)
 
 
 @triton.jit

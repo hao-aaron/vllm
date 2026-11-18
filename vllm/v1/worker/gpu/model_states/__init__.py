@@ -30,7 +30,8 @@ def resolve_model_state_cls(
 ) -> type[ModelState]:
     from vllm.specialized.model import Model
 
-    if isinstance(model, Model):
+    language_model = getattr(model, "get_language_model", lambda: None)()
+    if isinstance(model, Model) or isinstance(language_model, Model):
         from vllm.v1.worker.gpu.model_states.specialized import adapter_for
 
         return adapter_for(_general_model_state_cls(vllm_config, model))

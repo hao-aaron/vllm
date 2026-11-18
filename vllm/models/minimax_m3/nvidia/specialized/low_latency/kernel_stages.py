@@ -80,7 +80,7 @@ from vllm.model_executor.layers.fused_moe.moe_output import (
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
-from . import PAGE_SIZE, CacheDtypes, DecodeConfig
+from .config import PAGE_SIZE, CacheDtypes, DecodeConfig
 from .kernels import FRONT_MAX_ROWS, MAX_ROWS, PAIR_MAX_ROWS, fallback_stages
 from .kernels._mxfp8 import mxfp8_linear_nk
 from .stages import (
@@ -109,7 +109,7 @@ from .stock import (
 )
 
 if TYPE_CHECKING:
-    from ..model import (
+    from ...model import (
         MiniMaxM3DecoderLayer,
         MiniMaxM3Model,
         MiniMaxM3MoE,
@@ -246,20 +246,20 @@ class KernelContext:
         config: DecodeConfig,
         enabled: frozenset[str],
     ) -> None:
-        from vllm.distributed import get_tp_group
+        from vllm.specialized import services
 
-        from ..model import MiniMaxM3DecoderLayer, MiniMaxM3SparseAttention
+        from ...model import MiniMaxM3DecoderLayer, MiniMaxM3SparseAttention
         from .kernels import _arch
 
         self.backbone = backbone
         self.config = config
         self.enabled = frozenset(enabled)
         self.step_rows = tuple(r for r in config.step_rows if 1 <= r <= KERNEL_MAX_ROWS)
-        group = get_tp_group()
+        group = services.groups.tp
         self.cpu_group = group.cpu_group
         self.device_group = group.device_group
-        self.rank = group.rank_in_group
-        self.tp = group.world_size
+        self.rank = group.rank
+        self.tp = group.size
         try:
             self.arch: str | None = _arch.device_spec().arch
         except Exception as err:  # UnsupportedArch, no CUDA

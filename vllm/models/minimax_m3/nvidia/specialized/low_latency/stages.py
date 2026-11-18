@@ -56,7 +56,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 
 import torch
 
-from . import STAGE_NAMES, CacheDtypes
+from .config import STAGE_NAMES, CacheDtypes
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
@@ -64,7 +64,7 @@ if TYPE_CHECKING:
         QuantizedActivation,
     )
 
-    from ..model import (
+    from ...model import (
         MiniMaxM3Attention,
         MiniMaxM3DecoderLayer,
         MiniMaxM3MLP,

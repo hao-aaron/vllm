@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from vllm.config import CUDAGraphMode
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.specialized import services
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
@@ -284,7 +284,7 @@ class LayerStages:
         _, grouped = self.mega[layer.layer_idx]
         logits = self._router(moe, x)
         bias = moe.gate.e_score_correction_bias
-        return tensor_model_parallel_all_reduce(grouped(x, logits, bias, finalize=True))
+        return services.comm.all_reduce(grouped(x, logits, bias, finalize=True))
 
     @property
     def boundary_max_tokens(self) -> int:
@@ -313,7 +313,7 @@ class LayerStages:
         if dense is not None and self.policy("dense_mlp", x.shape[0]):
             out = dense(x)
             if not partial:
-                out = tensor_model_parallel_all_reduce(out)
+                out = services.comm.all_reduce(out)
             return out, partial
         moe_tokens = x.shape[0] if moe_policy_tokens is None else moe_policy_tokens
         choice = self.policy("moe", moe_tokens)
@@ -649,7 +649,7 @@ class SpecializedDecode(LayerStages):
         x, partial = self.mlp(layer, x)
         if layer.layer_idx == layer.num_hidden_layers - 1:
             if partial:
-                x = tensor_model_parallel_all_reduce(x)
+                x = services.comm.all_reduce(x)
             if self.ar_mhc is not None:
                 self.ar_mhc.join()
             x = layer.hc_post(x, residual, post, comb)

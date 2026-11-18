@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 MODES = ("auto", "off", "require")
+LANGUAGE_MODEL = "language_model"
 # Libraries probed for `Support.libraries`.
 PROBED_LIBRARIES = ("flashinfer-python", "nvidia-cutlass-dsl", "torch")
 
@@ -164,7 +165,11 @@ def _set(cfg: Any, key: str, value: Any) -> None:
     setattr(obj, last, value)
 
 
-def _is_unset(value: Any) -> bool:
+def _is_unset(cfg: Any, key: str) -> bool:
+    if key == "cache_config.block_size":
+        # Platforms fill a block size before routing; only the user's counts.
+        return not cfg.cache_config.user_specified_block_size
+    value = _get(cfg, key)
     return value is None or value == "auto"
 
 
@@ -190,7 +195,7 @@ def _apply_defaults(cfg: "VllmConfig", mod: ModuleType) -> dict[str, Any]:
     for key, value in proposed.items():
         if key not in DEFAULT_KEYS:
             raise ValueError(f"{mod.__name__}.defaults sets {key}, not allowed")
-        if _is_unset(_get(cfg, key)):
+        if _is_unset(cfg, key):
             filled[key] = (_get(cfg, key), value)
             _set(cfg, key, _coerce(key, value))
         else:
@@ -274,10 +279,11 @@ def route(cfg: "VllmConfig") -> Decision:
 def route_and_record(cfg: "VllmConfig") -> None:
     """VllmConfig hook: route, record the choice on the model config, print."""
     mc = cfg.model_config
-    if mc is None or mc.is_submodel_config:
+    # Once per engine: derived configs (draft overrides) share this model config.
+    if mc is None or mc.is_submodel_config or mc.specialized_choice is not None:
         return
     d = route(cfg)
-    mc.specialized_choice = d.choice
+    mc.specialized_choice = d.choice or ""
     for line in d.lines:
         logger.info("Specialized routing: %s", line)
 
@@ -285,7 +291,10 @@ def route_and_record(cfg: "VllmConfig") -> None:
 def verify_resolved(cfg: "VllmConfig") -> None:
     """Re-check the choice once core has resolved every setting."""
     mc = cfg.model_config
-    if mc is None or mc.specialized_choice is None:
+    if mc is None or mc.is_submodel_config or mc.specialized_verified:
+        return
+    mc.specialized_verified = True
+    if not mc.specialized_choice:
         return
     mod = importlib.import_module(mc.specialized_choice)
     reasons = mod.SUPPORTS.reasons(route_config(cfg))
@@ -296,7 +305,7 @@ def verify_resolved(cfg: "VllmConfig") -> None:
     )
     if mc.specialized_model == "auto":
         logger.warning("Specialized routing: %s; using the general model.", msg)
-        mc.specialized_choice = None
+        mc.specialized_choice = ""
     else:
         raise ValueError(msg)
 
@@ -317,13 +326,30 @@ def _worker_agrees(cfg: "VllmConfig", choice: str) -> bool:
 _agreed: dict[str, bool] = {}
 
 
+def _arch_of(model_config: "ModelConfig") -> str:
+    return (model_config.architectures or [""])[0]
+
+
 def model_class(
     vllm_config: "VllmConfig", model_config: "ModelConfig", general_cls: type
 ) -> type:
     """The class to build: the chosen directory's MODEL / DRAFT_MODEL, or general."""
     target = vllm_config.model_config
     choice = target.specialized_choice
-    if choice is None:
+    spec = vllm_config.speculative_config
+    is_draft = spec is not None and model_config is spec.draft_model_config
+    if not choice:
+        return general_cls
+    mod = importlib.import_module(choice)
+    table = mod.MODEL if isinstance(mod.MODEL, dict) else {}
+    if is_draft:
+        pass
+    elif model_config.is_submodel_config:
+        # A wrapper's language model: specialized only when MODEL maps the
+        # wrapper to "language_model" (the wrapper then stays general).
+        if LANGUAGE_MODEL not in table.values() or general_cls.__name__ not in table:
+            return general_cls
+    elif model_config is not target or table.get(_arch_of(target)) == LANGUAGE_MODEL:
         return general_cls
     if choice not in _agreed:
         _agreed[choice] = _worker_agrees(vllm_config, choice)
@@ -333,17 +359,15 @@ def model_class(
             logger.warning("Specialized routing: a rank declines %s; general", choice)
     if not _agreed[choice]:
         return general_cls
-    mod = importlib.import_module(choice)
-    if model_config is target:
+    if not is_draft:
         ref = mod.MODEL
         if isinstance(ref, dict):  # one class per registered architecture
             ref = ref.get(general_cls.__name__)
             if ref is None:
                 raise ValueError(f"{choice} has no MODEL for {general_cls.__name__}")
     else:
-        spec = vllm_config.speculative_config
-        method = None if spec is None else spec.method
-        ref = getattr(mod, "DRAFT_MODEL", {}).get(method)
+        assert spec is not None
+        ref = getattr(mod, "DRAFT_MODEL", {}).get(spec.method)
         if ref is None:
             return general_cls
     module, _, cls_name = ref.partition(":")

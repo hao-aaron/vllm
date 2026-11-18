@@ -25,7 +25,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
-from vllm.distributed import get_tp_group
+from vllm.specialized import services
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.models.common.ops.moe_tail_fusion.primitives import (
     ACTIVE_STAGE,
@@ -403,7 +403,7 @@ class AllReduceNorm:
         eps: float,
         device: torch.device,
     ) -> None:
-        group = get_tp_group().device_group
+        group = services.groups.tp.device_group
         self.top_k = top_k
         self.hidden_size = hidden = hidden_size
         self.capacity = capacity = max_num_tokens

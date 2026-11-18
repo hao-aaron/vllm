@@ -51,7 +51,7 @@ from .stages import (
 )
 
 if TYPE_CHECKING:
-    from ..model import (
+    from ...model import (
         MiniMaxM3Attention,
         MiniMaxM3DecoderLayer,
         MiniMaxM3MLP,
@@ -74,7 +74,7 @@ class StockFront(FrontStage):
         hidden: "LayerInput",
         positions: torch.Tensor,
     ) -> FrontOutput:
-        from ..model import MiniMaxM3SparseAttention
+        from ...model import MiniMaxM3SparseAttention
 
         if not isinstance(attn, MiniMaxM3SparseAttention):
             return self._dense(attn, hidden, positions)

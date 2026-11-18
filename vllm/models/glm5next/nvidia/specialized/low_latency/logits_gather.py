@@ -26,7 +26,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
-from vllm.distributed import get_tp_group
+from vllm.specialized import services
 from vllm.models.common.ops.moe_tail_fusion.primitives import (
     current_cu_stream,
     make_fake_dynamic_compact_tensor,
@@ -134,7 +134,7 @@ class LogitsGather:
     overwrites. Construction is collective over the TP group."""
 
     def __init__(self, *, columns: int, capacity: int, device: torch.device):
-        group = get_tp_group().device_group
+        group = services.groups.tp.device_group
         rank = dist.get_rank(group)
         tp = dist.get_world_size(group)
         device = torch.device(device)

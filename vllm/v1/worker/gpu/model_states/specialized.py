@@ -19,6 +19,10 @@ def adapter_for(base: type[ModelState]) -> type[ModelState]:
     class SpecializedModelState(base):  # type: ignore[valid-type,misc]
         def __init__(self, vllm_config, model, encoder_cache, device):
             super().__init__(vllm_config, model, encoder_cache, device)
+            from vllm.specialized.model import Model
+
+            if not isinstance(model, Model):  # a wrapper over a specialized LM
+                model = model.get_language_model()
             self.specialized = model
             model.warmup()
 

@@ -15,7 +15,7 @@ one; the copy adds that gate.
 import cutlass
 import torch
 
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.specialized import services
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
 from .cutedsl.host import (
@@ -166,4 +166,4 @@ class KdaStage:
             return a.o_proj(out)[0]
         else:
             partial = a.o_proj.quant_method.apply(a.o_proj, out)
-        return tensor_model_parallel_all_reduce(partial) if reduce else partial
+        return services.comm.all_reduce(partial) if reduce else partial

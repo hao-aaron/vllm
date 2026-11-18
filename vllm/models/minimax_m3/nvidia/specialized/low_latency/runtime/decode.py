@@ -41,12 +41,12 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.sequence import IntermediateTensors
 
-from .. import DecodeConfig, max_rows
+from ..config import DecodeConfig, max_rows
 from ..stages import Stages, StepStages
 from ..stock import stock_stages
 
 if TYPE_CHECKING:
-    from ...model import MiniMaxM3DecoderLayer, MiniMaxM3Model
+    from ....model import MiniMaxM3DecoderLayer, MiniMaxM3Model
 
 DecodeOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
 
@@ -122,7 +122,7 @@ class SpecializedDecode:
         lm_head: nn.Module,
         stages: Stages | None = None,
     ) -> None:
-        from ...model import MiniMaxM3DecoderLayer, MiniMaxM3SparseAttention
+        from ....model import MiniMaxM3DecoderLayer, MiniMaxM3SparseAttention
 
         self.backbone = backbone
         self.config = config
@@ -163,8 +163,8 @@ class SpecializedDecode:
 
     @staticmethod
     def _check_sparse_attention(attn) -> None:
-        from ...indexer_msa import MiniMaxM3IndexerMSAImpl
-        from ...sparse_attention_msa import MiniMaxM3SparseMSAImpl
+        from ....indexer_msa import MiniMaxM3IndexerMSAImpl
+        from ....sparse_attention_msa import MiniMaxM3SparseMSAImpl
 
         # unsupported() refuses the NVFP4 caches that select the other impls.
         if not isinstance(attn.indexer.impl, MiniMaxM3IndexerMSAImpl):

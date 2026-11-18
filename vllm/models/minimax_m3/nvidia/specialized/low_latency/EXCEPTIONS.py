@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Core internals this directory still reaches directly (Rule 1).
+
+Kept exact by tests/specialized/test_rule1_lint.py; each entry is a
+missing piece of `vllm.specialized`."""
+
+EXCEPTIONS = {
+    "vllm._custom_ops": "fused CUDA op in the core extension",
+    "vllm.config": "reads engine settings at build; needs RouteConfig/settings handed to Model",
+    "vllm.distributed.device_communicators.cuda_wrapper": "process groups / peer transport not yet covered by services",
+    "vllm.distributed.parallel_state": "process groups / peer transport not yet covered by services",
+    "vllm.forward_context": "per-step attention metadata and capture state; needs a prepare_inputs hook",
+    "vllm.model_executor.layers.fused_allreduce_gemma_rms_norm": "shared layer ops/types the executor reuses",
+    "vllm.model_executor.layers.fused_moe.moe_output": "MoE output types shared with the general layers",
+    "vllm.model_executor.layers.fused_moe.runner.moe_runner": "MoE output types shared with the general layers",
+    "vllm.model_executor.layers.fusion.quant_activation": "shared layer ops/types the executor reuses",
+    "vllm.model_executor.layers.quantization.utils.quant_utils": "shared layer ops/types the executor reuses",
+    "vllm.sequence": "IntermediateTensors type",
+    "vllm.third_party.fmha_sm100.api": "vendored attention kernels",
+    "vllm.triton_utils": "triton import shim",
+    "vllm.v1.worker.gpu.sample.gumbel": "sampler internals (gumbel noise) for the fused Markov sampler",
+    "vllm.v1.worker.gpu.spec_decode.draft_logits": "speculator internals for the fused Markov sampler",
+}
+
+MUTATIONS = {
+    "_cd.CuTeDSL._generate_kernel_attrs = ...": "patches CuTe DSL library internals",
+    "hidden_norm.forward = ...": "replaces forward on a general-tier module",
+    "module.forward = ...": "replaces forward on a general-tier module",
+    "norm.forward = ...": "replaces forward on a general-tier module",
+}

@@ -41,7 +41,7 @@ from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from vllm.distributed import get_tp_group
+from vllm.specialized import services
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.models.common.ops.moe_tail_fusion.primitives import (
     ACTIVE_STAGE,
@@ -987,7 +987,7 @@ class AllReduceMhcBoundary:
         cluster_size: int = 8,
         cluster_tokens: Mapping[int, int] | None = None,
     ) -> None:
-        group = get_tp_group().device_group
+        group = services.groups.tp.device_group
         self.top_k = top_k
         self.hidden_size = hidden = hidden_size
         self.capacity = capacity = max_num_tokens
