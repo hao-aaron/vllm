@@ -38,8 +38,9 @@ import torch
 from torch import nn
 
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
+from vllm.specialized import services
 
 from ..config import DecodeConfig, max_rows
 from ..stages import Stages, StepStages
@@ -47,6 +48,8 @@ from ..stock import stock_stages
 
 if TYPE_CHECKING:
     from ....model import MiniMaxM3DecoderLayer, MiniMaxM3Model
+
+logger = init_logger(__name__)
 
 DecodeOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
 
@@ -99,11 +102,8 @@ def captures_pure_decode(prefixes: list[str]) -> bool:
     graphs with the forward context's mode NONE, and PIECEWISE ones, which
     report capturing too, with PIECEWISE), and attention metadata without
     prefills for every attention layer and index cache in `prefixes`."""
-    context = get_forward_context()
-    attn_metadata = context.attn_metadata
-    if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE or not isinstance(
-        attn_metadata, dict
-    ):
+    attn_metadata = services.step.attn_metadata
+    if services.step.graph_mode == CUDAGraphMode.PIECEWISE or not attn_metadata:
         return False
     for prefix in prefixes:
         metadata = attn_metadata.get(prefix)
@@ -128,6 +128,7 @@ class SpecializedDecode:
         self.config = config
         self.lm_head = lm_head
         self.max_rows = max_rows(config.query_len)
+        self.fast_sizes: set[int] = set()  # captured row counts it planned
         self.stages = default_stages(config, backbone) if stages is None else stages
         if any(not impls for impls in self.stages):
             raise ValueError(
@@ -197,15 +198,17 @@ class SpecializedDecode:
         if (
             intermediate_tensors is not None
             or not 0 < rows <= self.max_rows
-            or not is_forward_context_available()
+            or not services.step.attn_metadata
         ):
             return None
-        if not torch.cuda.is_current_stream_capturing():
+        if not services.step.is_capturing:
             # The eager run before each capture (and every eager step) runs the stock
             # layers, which also compiles the stock kernels.
             return None
         if not captures_pure_decode(self._prefixes):
             return None
+        self.fast_sizes.add(rows)
+        logger.info_once("MiniMax-M3.1 low-latency decode captures %d-row steps", rows)
         return DecodeStep(rows=rows, stages=self.stages.select(rows), executor=self)
 
     def run(

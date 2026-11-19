@@ -2,25 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The low-latency GLM-5.3-Flash MTP draft model."""
 
+from typing import Any
+
 import torch
 
 from vllm.models.glm5next.common.mtp import Glm5NextMTP, Glm5NextMultiTokenPredictor
 from vllm.specialized import Model
 
-from .runtime import decode_config
+from .runtime import DecodeConfig
 from .runtime.draft import SpecializedDraft
 
 
 class _Predictor(Glm5NextMultiTokenPredictor):
-    def __init__(self, *, vllm_config, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self._decode_config = decode_config(vllm_config)
-        self._decode: SpecializedDraft | None = None
-        self.prefill_rows: torch.Tensor | None = None
-
-    def set_prefill_rows(self, rows: torch.Tensor) -> None:
-        """The speculator's [max_num_reqs] last-token rows of a draft prefill."""
-        self.prefill_rows = rows
+    _decode: SpecializedDraft | None = None
+    prefill_rows: torch.Tensor | None = None
 
     def forward(
         self,
@@ -30,10 +25,6 @@ class _Predictor(Glm5NextMultiTokenPredictor):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        # Built on the first eager forward, after the weights are processed;
-        # collective across TP ranks.
-        if self._decode is None and not torch.cuda.is_current_stream_capturing():
-            self._decode = SpecializedDraft(self, self._decode_config)
         if self._decode is not None:
             step = self._decode.plan(positions)
             if step is not None:
@@ -53,3 +44,17 @@ class _Predictor(Glm5NextMultiTokenPredictor):
 
 class LowLatencyGlm5NextMTP(Model, Glm5NextMTP):
     predictor_cls = _Predictor
+    _kpool: Any = None
+
+    def build_executor(self, config: DecodeConfig, kpool: Any) -> None:
+        """From the target's `warmup`, after `attach_draft` (the target
+        embedding and head are shared by then). Collective across TP ranks."""
+        self._kpool = kpool
+        self.model._decode = SpecializedDraft(self.model, config)
+
+    def indexer_kpool_stage(self) -> Any:
+        return self._kpool
+
+    def set_prefill_rows(self, rows: torch.Tensor) -> None:
+        """The speculator's [max_num_reqs] last-token rows of a draft prefill."""
+        self.model.prefill_rows = rows

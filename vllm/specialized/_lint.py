@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Rule 1 lints for specialized directories: imports and mutations, by AST.
+"""Rule 1 lints for specialized directories, by AST: imports, mutations, and
+what a subclass of a general model overrides. They can't see attributes set at
+run time; those stay review items.
 
 `python -m vllm.specialized._lint` prints each directory's current findings in
 EXCEPTIONS.py form.
@@ -21,6 +23,7 @@ ALLOWED = (
     "vllm.specialized",
     "vllm.models.common.ops",
     "vllm.logger",
+    "vllm.config",  # read-only
 )
 # Attributes that, assigned on an object the directory did not create, change
 # how shared code behaves.
@@ -128,6 +131,114 @@ def lint(directory: Path) -> Findings:
     return out
 
 
+def _module_path(module: str) -> Path | None:
+    base = VLLM_ROOT.parent / Path(*module.split("."))
+    for p in (base.with_suffix(".py"), base / "__init__.py"):
+        if p.exists():
+            return p
+    return None
+
+
+def _imports(tree: ast.Module, package: str) -> dict[str, str]:
+    """Local name -> the vllm module it was imported from."""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            base = _resolve(node, package)
+            for a in node.names:
+                out[a.asname or a.name] = base
+    return out
+
+
+def _class_names(module: str, name: str, depth: int = 0) -> tuple[set[str], set[str]]:
+    """Names a vllm class defines along its vllm bases, and its EXTENSION_POINTS."""
+    path = _module_path(module)
+    if path is None or depth > 8:
+        return set(), set()
+    tree = ast.parse(path.read_text())
+    package = module if path.name == "__init__.py" else module.rsplit(".", 1)[0]
+    imports = _imports(tree, package)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            names, points = _body_names(node), set()
+            for stmt in node.body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and any(
+                        isinstance(t, ast.Name) and t.id == "EXTENSION_POINTS"
+                        for t in stmt.targets
+                    )
+                    and isinstance(stmt.value, (ast.Tuple, ast.List))
+                ):
+                    points |= {
+                        e.value for e in stmt.value.elts if isinstance(e, ast.Constant)
+                    }
+            for base in node.bases:
+                if isinstance(base, ast.Name):
+                    src = imports.get(base.id, module)
+                    if src.startswith("vllm."):
+                        n, p = _class_names(src, base.id, depth + 1)
+                        names |= n
+                        points |= p
+            return names, points
+    return set(), set()
+
+
+def _body_names(node: ast.ClassDef) -> set[str]:
+    out = set()
+    for stmt in node.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.add(stmt.name)
+        elif isinstance(stmt, ast.Assign):
+            out |= {t.id for t in stmt.targets if isinstance(t, ast.Name)}
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            out.add(stmt.target.id)
+    return out
+
+
+def overrides(directory: Path) -> dict[str, list[str]]:
+    """`Class.name` a subclass of a general-tier class redefines that is not a
+    `Model` hook, accessor or the general class's EXTENSION_POINTS."""
+    from vllm.specialized.model import (
+        ACCESSORS,
+        DRAFT_HOOKS,
+        HOOKS,
+        LIFECYCLE,
+        MODULE_METHODS,
+    )
+
+    allowed = set(HOOKS + LIFECYCLE + ACCESSORS + DRAFT_HOOKS + MODULE_METHODS)
+    allowed |= {"fused_step", "__doc__", "__module__", "__qualname__"}
+    dmod = module_of(directory / "__init__.py")
+    family = ".".join(dmod.split(".")[:3])
+    out: dict[str, list[str]] = {}
+    for f in sorted(directory.rglob("*.py")):
+        mod = module_of(f)
+        package = mod if f.name == "__init__.py" else mod.rsplit(".", 1)[0]
+        tree = ast.parse(f.read_text(), str(f))
+        imports = _imports(tree, package)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            general: set[str] = set()
+            points: set[str] = set()
+            for base in node.bases:
+                src = isinstance(base, ast.Name) and imports.get(base.id)
+                if src and src.startswith(family) and ".specialized" not in src:
+                    n, p = _class_names(src, base.id)
+                    general |= n
+                    points |= p
+            if not general:
+                continue
+            for name in _body_names(node):
+                if name == "__init__" or (
+                    name in general and name not in allowed | points
+                ):
+                    what = f"{node.name}.{name}"
+                    out.setdefault(what, []).append(str(f.relative_to(directory)))
+    return out
+
+
 def _is_module(name: str) -> bool:
     if not name.startswith("vllm."):
         return False
@@ -159,6 +270,8 @@ def main() -> None:
                 print(f"  import {k}  <- {sorted(set(v))[:3]}")
             for k, v in sorted(f.mutations.items()):
                 print(f"  mutate {k}  <- {sorted(set(v))[:3]}")
+        for k, v in sorted(overrides(d).items()):
+            print(f"  override {k}  <- {sorted(set(v))[:3]}")
 
 
 if __name__ == "__main__":

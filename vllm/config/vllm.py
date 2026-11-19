@@ -1602,13 +1602,6 @@ class VllmConfig:
         self.try_verify_and_update_config()
         self._reject_mismatched_float_kv_cache()
         self._resolve_and_verify_engram_config()
-        if self.model_config is not None:
-            # Picks a specialized implementation and fills its defaults into
-            # settings the user left unset, before core resolves them.
-            from vllm.specialized._routing import route_and_record
-
-            route_and_record(self)
-
         self._check_supports_watermarking()
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
@@ -2401,9 +2394,10 @@ class VllmConfig:
         self.compilation_config.pass_config.log_enabled_passes()
         self.num_hash_lookahead_tokens = self._resolve_num_hash_lookahead_tokens()
         if self.model_config is not None:
-            from vllm.specialized._routing import verify_resolved
+            # Last: routing only reads the resolved config, once per engine.
+            from vllm.specialized._routing import route_and_record
 
-            verify_resolved(self)
+            route_and_record(self)
 
     def _set_max_num_scheduled_tokens(self):
         """In most cases, the scheduler may schedule a batch with as many tokens as the

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Peer-memory transport for the cross-rank "push" kernels.
+"""Peer-memory transport for cross-rank "push" kernels, behind
+`vllm.specialized.services.comm.peer_arena` and `peer_buffer`.
 
-Every cross-rank exchange of the specialized decode is a push: a producer
+Every cross-rank exchange of a push kernel: a producer
 kernel stores its partial (Lamport-tagged words) straight into each peer's
 receive buffer through a device pointer, and the consumer polls its own
 buffer. The kernels only need, per exchange buffer, the local base pointer

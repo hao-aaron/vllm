@@ -1216,7 +1216,7 @@ class GroupedExperts:
         """Compiles the kernel for these token counts before graph capture;
         `finalized`: the token counts that run with `finalize`."""
         device = self.w13.device
-        bias = torch.zeros(self.experts, device=device)
+        bias = torch.zeros(self.experts, dtype=torch.float32, device=device)
         for m in tokens:
             x = torch.zeros(m, self.hidden, dtype=torch.bfloat16, device=device)
             logits = torch.zeros(m, self.experts, dtype=logits_dtype, device=device)

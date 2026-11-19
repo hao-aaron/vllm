@@ -9,10 +9,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
-from vllm.model_executor.layers.mhc import hc_contract, hc_expand
+from vllm.models.common.ops.mhc import hc_contract, hc_expand
 from vllm.specialized import services
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
@@ -340,6 +339,7 @@ class SpecializedDecode(LayerStages):
         self.policy = Policy(config.policy)
         self.q = config.q
         self.layers = list(backbone.layers)
+        self.fast_sizes: set[int] = set()  # captured token counts it planned
         self.text_config = backbone.config
         # MoE layers followed by a fused boundary (every one but the last).
         self.moe_layers = self.layers[:-1]
@@ -392,16 +392,16 @@ class SpecializedDecode(LayerStages):
                         layer.self_attn,
                         self.policy.tokens("dsa_value_up", "cute"),
                     )
+        # The sparse indexers reach it through `indexer_kpool_stage`.
+        self.kpool: Any = None
         if self.policy.enabled("dsa_kpool"):
-            from vllm.models.glm5next.nvidia import sparse_indexer
-
             from ..kpool import KpoolStage
 
             attentions = [
                 layer.self_attn for layer in self.layers if layer.layer_kind == "mla"
             ]
             kpool = KpoolStage(attentions, MAX_TOKENS, self.layers[0].hc_attn_fn.device)
-            sparse_indexer.SPECIALIZED_KPOOL = kpool
+            self.kpool = kpool
             logger.info(
                 "Specialized decode kpool kernels (fused index remap: %s)", kpool.fuse
             )
@@ -566,14 +566,11 @@ class SpecializedDecode(LayerStages):
                 self.backbone.aux_hidden_state_layers,
             )
             return None
-        if not is_forward_context_available():
-            return None
-        context = get_forward_context()
-        if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+        if services.step.graph_mode == CUDAGraphMode.PIECEWISE:
             logger.info_once("Specialized decode skips a PIECEWISE %d-token capture", b)
             return None
-        by_layer = context.attn_metadata
-        if not isinstance(by_layer, dict) or not by_layer:
+        by_layer = services.step.attn_metadata
+        if not by_layer:
             return None
         rows: list[Any] = list(by_layer.values())
         q = self.q if any(getattr(md, "num_spec_decodes", 0) for md in rows) else 1
@@ -602,6 +599,7 @@ class SpecializedDecode(LayerStages):
                     ),
                 )
             return None
+        self.fast_sizes.add(b)
         logger.info_once("GLM-5.3-Flash specialized decode captures %d-token steps", b)
         return Step(q, positions, by_layer)
 

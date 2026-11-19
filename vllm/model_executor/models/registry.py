@@ -695,7 +695,7 @@ _SPECULATIVE_DECODING_MODELS = {
         "DSparkDeepseekV4ForCausalLM",
     ),
     "DSparkMiniMaxDraftModel": (
-        "vllm.models.minimax_m3.common.dspark",
+        "vllm.models.minimax_m3",
         "MiniMaxM3DSparkForCausalLM",
     ),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),

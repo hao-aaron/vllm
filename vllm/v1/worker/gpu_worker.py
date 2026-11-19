@@ -1365,6 +1365,10 @@ class Worker(WorkerBase):
             draft_model, speculative_config.draft_model_config
         )
 
+    def fast_path_sizes(self) -> list[int]:
+        """The captured graph sizes that take a specialized fast path."""
+        return list(getattr(self.model_runner, "fast_path_sizes", []))
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 

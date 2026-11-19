@@ -84,8 +84,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     from vllm.model_executor.model_loader import get_model
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
     from vllm.model_executor.models.utils import get_draft_quant_config
+    from vllm.v1.worker.gpu.model_states.accessors import get_lm_head
     from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
-        get_target_lm_head,
         maybe_share_target_embed,
         share_target_lm_head,
     )
@@ -130,17 +130,11 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
-    target_language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    target_inner = target_language_model.model
     draft_inner = draft_model.model
     target_vocab_size = vllm_config.model_config.get_vocab_size()
 
     if draft_model_config.get_vocab_size() <= target_vocab_size:
-        maybe_share_target_embed(draft_model, draft_inner, target_inner)
+        maybe_share_target_embed(draft_model, draft_inner, target_model)
 
     draft_output_vocab_size = (
         getattr(draft_model_config.hf_config, "draft_vocab_size", None)
@@ -148,7 +142,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     )
     share_target_lm_head(
         draft_model,
-        get_target_lm_head(target_model, target_language_model),
+        get_lm_head(target_model),
         speculative_config.draft_lm_head_quantization,
         can_share=draft_output_vocab_size == target_vocab_size,
     )

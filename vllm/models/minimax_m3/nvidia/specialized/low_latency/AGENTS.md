@@ -2,7 +2,7 @@
 
 A decode executor for small decode batches of MiniMax-M3.1-Flash on GB300
 (and B200/GB200). It is a specialized directory (`vllm.specialized`):
-`__init__.py` declares `SUPPORTS`, `defaults` and `MODEL`/`DRAFT_MODEL`, and
+`__init__.py` declares `SUPPORTS` and `MODEL`/`DRAFT_MODEL`, and
 routing runs it only when pinned (`--specialized-model low_latency`) or
 required, since `default_on=False`. Otherwise the general model runs. The executor
 runs the target model's decoder layers; the DSpark drafter keeps its stock
@@ -15,8 +15,8 @@ MiniMax-M3 decode kernels.
 ## Scope
 
 `SUPPORTS` and `check()` (`__init__.py`) list what the deployment must have;
-routing prints every unmet one. `defaults()` fills the block size, index cache
-dtype and graph mode when the user left them unset:
+routing prints every unmet one with the flag to add. Nothing is filled in, so a
+recipe passes `--block-size 128 --kv-cache-dtype fp8 -ac.indexer_kv_dtype fp8`:
 
 - GPU: SM100 (B200/GB200) or SM103 (B300/GB300).
 - Kernels: every kernel is CuTe DSL (`nvidia-cutlass-dsl`, a vLLM
@@ -52,10 +52,10 @@ off (fp8 KV + fp8 index cache), not the recipe's NVFP4 default.
 
 | File | Contents |
 | --- | --- |
-| `__init__.py` | Declarations: `SUPPORTS`, `check()`, `defaults()`, `MODEL`, `DRAFT_MODEL` (import-light) |
+| `__init__.py` | Declarations: `SUPPORTS`, `check()`, `MODEL`, `DRAFT_MODEL` (import-light) |
 | `config.py` | Row caps, `DecodeConfig` (query length, cache dtypes), `decode_config()` |
-| `model.py` | `LowLatencyMiniMaxM3`: the general language model plus the executor (built and warmed up in `warmup()`) and peer target logits |
-| `draft.py` | `LowLatencyMiniMaxM3DSpark`: the general DSpark draft model with `attach_drafter` |
+| `model.py` | `LowLatencyMiniMaxM3`: the general language model plus the executor and peer target logits (built in `process_weights_after_loading()`, warmed up in `warmup()`) |
+| `draft.py` | `LowLatencyMiniMaxM3DSpark`: the general DSpark draft model plus the fused Markov sampler (`sample_sequential`) and the TP-split context projection (`combine_hidden_states`) |
 | `EXCEPTIONS.py` | Core internals still imported directly, and patched objects |
 | `stages.py` | The stage interface: one ABC per stage, with tensor shapes and dtypes; `Stages` (implementations per stage) and `StepStages` (one per stage, for a step) |
 | `stock.py` | Every stage on the ops the stock layers run (the stock-op chain) |
@@ -67,11 +67,10 @@ off (fp8 KV + fp8 index cache), not the recipe's NVFP4 default.
 | `runtime/warmup.py` | Calls each stage implementation's `warm_up` for the step rows it supports |
 | `kernels/` | The kernels and their registry (stage -> implementation + arch/TP/rows envelope); `kernels/wide.py` holds the front and o_proj GEMVs above the fused kernels' rows; each kernel family is a host module plus its CuTe DSL kernel module (`front_kernel.py`, `page_topk_kernel.py`, `sparse_decode_kernel.py`, `post/`, `o_proj/`, `moe/`) |
 
-The general tier knows nothing of this directory. It offers two
-construction-time extension points that `model.py` overrides:
-`MiniMaxM3SparseForCausalLM.backbone_cls` and
-`MiniMaxM3Model.fused_finalize_max_tokens` (raised to `MAX_ROWS`). The model
-runner, the CUDA graph manager and the DSpark speculator
+The general tier knows nothing of this directory. The executor needs the
+general model's fused MoE finalize sized for `MAX_ROWS` tokens, which the
+general model reads from `additional_config` (`nvidia/fused_finalize.py`) and
+`check()` requires. The model runner, the CUDA graph manager and the DSpark speculator
 run as for any model. The executor returns the aux hidden states as the stock
 forward does (clones of the residual stream, one `[rows, hidden]` tensor per
 aux layer), and the drafter's FLASHINFER_TS metadata is built eagerly before
@@ -110,8 +109,9 @@ ahead. Keep o_proj/post paired and both halves.
 included; at most `MAX_ROWS` = 64 (8 requests x 8 rows). The MoE leaves its
 top-k finalize to the next input boundary exactly when the stock MoE does
 (`defers_finalize`), unless the next front fuses that boundary (a kernel
-front takes a finalized BF16 partial or a push). With the switch on, the stock
-model defers up to 64 rows instead of 32 (`fused_finalize_max_tokens`): at
+front takes a finalized BF16 partial or a push). The cap is
+derived from config (`max_num_seqs` x (1 + draft length), at most the token
+budget), so the stock model defers every decode step; at
 33..64 rows the next input boundary is then the stock fused finalize +
 all-reduce + norm + MXFP8 (two launches) instead of the MoE's finalize, the
 shared add, FlashInfer's all-reduce + norm and an MXFP8 quantize.

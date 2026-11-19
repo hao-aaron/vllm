@@ -36,8 +36,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-
-from ._comm import MAX_PEERS, PeerBuffer, PeerTransport
+from vllm.specialized.services import MAX_PEERS, PeerBuffer, PeerTransport
 
 if TYPE_CHECKING:
     import torch

@@ -24,20 +24,22 @@ FEATURES = (
     "kv_transfer",
 )
 
-# Config keys `defaults()` may fill (dotted paths into VllmConfig).
-DEFAULT_KEYS = frozenset(
-    {
-        "compilation_config.cudagraph_mode",
-        "compilation_config.cudagraph_capture_sizes",
-        "compilation_config.mode",
-        "attention_config.backend",
-        "kernel_config.moe_backend",
-        "parallel_config.all_reduce_strategy",
-        "cache_config.block_size",
-        "attention_config.indexer_kv_dtype",
-        "attention_config.indexer_sparse_logits",
-    }
-)
+# The flag that sets each field, named in decline messages.
+FLAGS = {
+    "kv_cache_dtype": "--kv-cache-dtype",
+    "attention_backend": "--attention-backend",
+    "moe_backend": "--moe-backend",
+    "block_size": "--block-size",
+    "dtype": "--dtype",
+    "max_model_len": "--max-model-len",
+    "tp": "--tensor-parallel-size",
+    "pp": "--pipeline-parallel-size",
+    "dp": "--data-parallel-size",
+    "dcp": "--decode-context-parallel-size",
+    "graph_mode": "-cc.cudagraph_mode",
+    "speculation": "--speculative-config",
+    "num_speculative_tokens": "--speculative-config",
+}
 
 
 @dataclass(frozen=True)
@@ -53,8 +55,10 @@ class RouteConfig:
     max_model_len: int
     checkpoint: str
     hf_config: Any
+    expert_quantization: str | None
     kv_cache_dtype: str
     attention_backend: str | None
+    moe_backend: str | None
     tp: int
     pp: int
     dp: int
@@ -81,6 +85,18 @@ def _version_tuple(v: str) -> tuple[int, ...]:
     return tuple(out)
 
 
+def _describe(want: Any) -> str:
+    if isinstance(want, range):
+        return f"{want.start}..{want.stop - 1}"
+    shown = sorted(want, key=str)
+    return repr(shown[0]) if len(shown) == 1 else f"one of {shown}"
+
+
+def _hint(name: str, need: object) -> str:
+    flag = FLAGS.get(name)
+    return f" (set {flag} {need})" if flag else ""
+
+
 @dataclass(frozen=True)
 class Support:
     """The deployments a directory runs. Omitted field = any value."""
@@ -90,9 +106,12 @@ class Support:
     machine: frozenset[str] | set[str] | None = None
     libraries: Mapping[str, str] | None = None
     checkpoint: frozenset[str] | set[str] | None = None
+    expert_quantization: frozenset[str] | set[str] | None = None
     model_shape: Mapping[str, Any] | None = None
     kv_cache_dtype: frozenset[str] | set[str] | None = None
     attention_backend: frozenset[str | None] | set[str | None] | None = None
+    moe_backend: frozenset[str] | set[str] | None = None
+    block_size: frozenset[int] | set[int] | None = None
     dtype: frozenset[str] | set[str] | None = None
     max_model_len: range | None = None
     tp: frozenset[int] | set[int] | None = None
@@ -107,7 +126,6 @@ class Support:
     speculation: frozenset[str | None] | set[str | None] | None = None
     num_speculative_tokens: frozenset[int] | set[int] | None = None
     role: frozenset[str] | set[str] | None = None
-    block_size: frozenset[int] | set[int] | None = None
     # Engine features handled; any feature in use and not listed declines.
     features: frozenset[str] | set[str] = frozenset()
     default_on: bool = True
@@ -140,8 +158,10 @@ class Support:
                     if have and not want:
                         out.append(f"{f.name} is on, not supported")
                 elif have not in want:
-                    shown = sorted(want, key=str)
-                    out.append(f"{f.name} is {have!r}, needs one of {shown}")
+                    need = _describe(want)
+                    out.append(
+                        f"{f.name} is {have!r}, needs {need}" + _hint(f.name, need)
+                    )
         if extra := cfg.features - set(self.features):
             out.append(f"engine features {sorted(extra)} not supported")
         if self.check is not None:

@@ -17,8 +17,8 @@ class DecodeConfig:
 
 def decode_config(vllm_config) -> DecodeConfig:
     """The executor settings for a deployment routing already accepted."""
-    extra = vllm_config.additional_config
-    extra = extra if isinstance(extra, dict) else {}
+    from vllm.specialized import options
+
     spec = vllm_config.speculative_config
     return DecodeConfig(
         max_context=vllm_config.model_config.max_model_len,
@@ -26,5 +26,5 @@ def decode_config(vllm_config) -> DecodeConfig:
         capture_sizes=tuple(
             vllm_config.compilation_config.cudagraph_capture_sizes or ()
         ),
-        policy=tuple(extra.get("policy", {}).items()),
+        policy=tuple(options(vllm_config).policy.items()),
     )

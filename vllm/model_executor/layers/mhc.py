@@ -1036,11 +1036,5 @@ class MHCFusedPostPreOp(CustomOp):
         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
 
-def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
-    """[s, hidden_size] -> [s, n * hidden_size] by replication."""
-    return x.unsqueeze(1).expand(-1, n, -1).contiguous()
-
-
-def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
-    """[s, n * hidden_size] -> [s, hidden_size] by averaging."""
-    return x.mean(dim=1)
+# Shared ops with an executable contract; re-exported for existing callers.
+from vllm.models.common.ops.mhc import hc_contract, hc_expand  # noqa: E402, F401

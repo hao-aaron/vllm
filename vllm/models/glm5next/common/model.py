@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
@@ -1216,6 +1216,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
 ):
+    # What a specialized subclass may override besides the `Model` hooks.
+    EXTENSION_POINTS = ("indexer_kpool_stage",)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1238,6 +1241,12 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=_LOGIT_SCALE
         )
+        wire_kpool_stage(self, Glm5NextForCausalLM)
+
+    def indexer_kpool_stage(self) -> Any:
+        """Extension point: a kpool stage the sparse indexers run inside planned
+        decode steps, or None for the stock kernels."""
+        return None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1452,9 +1461,21 @@ class Glm5NextForConditionalGeneration(
             moe.n_redundant_experts = self.num_redundant_experts
             moe.experts.update_expert_map()
 
-    def process_weights_after_loading(self) -> None:
-        # The loader calls only the outermost model's hook.
-        self.language_model.process_weights_after_loading()
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        # Through the language model's forward, not its backbone, so a
+        # specialized language model runs its own.
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
 
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding
@@ -1462,6 +1483,16 @@ class Glm5NextForConditionalGeneration(
         config = super().get_encoder_cudagraph_config()
         config.buffer_keys = [k for k in config.buffer_keys if k != "pos_embeds"]
         return config
+
+
+def wire_kpool_stage(model: nn.Module, general_cls: type) -> None:
+    """Point the model's sparse indexers at its `indexer_kpool_stage` when a
+    subclass overrides it; the general model leaves them on the stock path."""
+    if type(model).indexer_kpool_stage is general_cls.indexer_kpool_stage:
+        return
+    for module in model.modules():
+        if hasattr(type(module), "kpool_stage"):
+            module.kpool_stage = model.indexer_kpool_stage
 
 
 def get_spec_layer_idx_from_weight_name(

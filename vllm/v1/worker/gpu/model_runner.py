@@ -76,6 +76,7 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
+from vllm.specialized.model import Model
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.math_utils import cdiv
@@ -309,6 +310,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
+        self.fast_path_sizes: list[int] = []
         self.use_aux_hidden_state_outputs = False
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
@@ -455,6 +457,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        if isinstance(self.speculator, DraftModelSpeculator):
+            with self.draft_context(), set_current_vllm_config(self.vllm_config):
+                self.model_state.attach_draft(self.speculator.model)
+        with set_current_vllm_config(self.vllm_config):
+            self.model_state.warmup()
+            draft = getattr(self.speculator, "model", None)
+            if isinstance(self.speculator, DraftModelSpeculator) and isinstance(
+                draft, Model
+            ):
+                with self.draft_context():
+                    draft.warmup()
         if self.pp_handler is not None:
             self.pp_handler.relay_positions = (
                 self.model_state.positions_depend_on_encoder
@@ -1216,6 +1229,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         if not profile_only:
+            self.fast_path_sizes = sorted(self.model_state.fast_path_sizes())
+            if self.fast_path_sizes:
+                logger.info_once(
+                    "Specialized fast path covers captured sizes %s",
+                    tuple(self.fast_path_sizes),
+                )
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
             lock_workspace()

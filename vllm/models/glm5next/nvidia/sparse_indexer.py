@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -61,11 +62,6 @@ if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 
 logger = init_logger(__name__)
-
-# The specialized decode's kpool stage (specialized_decode/kpool.py), when
-# installed: CuTe kernels for the decode kernels below inside planned steps.
-SPECIALIZED_KPOOL: Any = None
-
 
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
@@ -152,6 +148,8 @@ def sparse_attn_indexer_kpool(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     logits_dtype: torch.dtype = torch.float32,
+    # A specialized decode's kpool stage: its kernels inside planned steps.
+    kpool_stage: Any = None,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -294,7 +292,6 @@ def sparse_attn_indexer_kpool(
                 "mxfp8" if mqa_logits_use_mx_scales() else scale_fmt,
             )
 
-    kpool_stage = SPECIALIZED_KPOOL
     if kpool_stage is not None and not kpool_stage.active():
         kpool_stage = None
     # Uniform kpool decode rows can leave their expansion to the layer's index
@@ -799,6 +796,9 @@ def sparse_attn_indexer_kpool(
 
 @CustomOp.register("sparse_attn_indexer_kpool")
 class SparseAttnIndexerKpool(CustomOp):
+    # Set by the owning model when a subclass provides `indexer_kpool_stage`.
+    kpool_stage: Callable[[], Any] | None = None
+
     """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
     separate custom op since it involves heavy custom kernels like `mqa_logits`,
     `paged_mqa_logits` and `top_k_per_row`, etc. Those kernels maybe requires
@@ -949,4 +949,5 @@ class SparseAttnIndexerKpool(CustomOp):
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
             self.logits_dtype,
+            None if self.kpool_stage is None else self.kpool_stage(),
         )
