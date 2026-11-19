@@ -219,6 +219,10 @@ type, constructed by the `trainer_init` classmethod factory, and driven by `send
 | `send_weights()` | Push weights and drive the full update round trip |
 | `shutdown()` | Tear down communicators / process groups. Default no-op |
 
+`send_weights` wraps the apply in `self._pause_for_update()`, which pauses
+generation through the client per `TrainerInitInfo.pause_mode` and resumes it on
+success. Keep trainer-side work that does not touch the live weights outside it.
+
 Both `trainer_init` and `send_weights` are called on **every** trainer rank.
 `is_sender` is resolved once, at `trainer_init`, from `init_info.rank`. Each
 engine holds the real client on every rank but guards the control-plane RPCs and
@@ -335,17 +339,18 @@ class MyTrainerWeightTransferEngine(TrainerWeightTransferEngine[MyTrainerInitInf
                 pass
             return
 
-        self.client.start_weight_update()
-        self.client.update_weights(
-            {
-                "names": [m.name for m in meta],
-                "dtype_names": [str(m.dtype).split(".")[-1] for m in meta],
-                "shapes": [list(m.shape) for m in meta],
-            }
-        )
-        for name, tensor in self.source.iter_full():
-            ...                            # transmit
-        self.client.finish_weight_update()
+        with self._pause_for_update():
+            self.client.start_weight_update()
+            self.client.update_weights(
+                {
+                    "names": [m.name for m in meta],
+                    "dtype_names": [str(m.dtype).split(".")[-1] for m in meta],
+                    "shapes": [list(m.shape) for m in meta],
+                }
+            )
+            for name, tensor in self.source.iter_full():
+                ...                        # transmit
+            self.client.finish_weight_update()
 ```
 
 Two things to get right, both of which have bitten the built-in backends:

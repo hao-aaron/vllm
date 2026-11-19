@@ -5,6 +5,7 @@
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import (
@@ -22,9 +23,13 @@ import torch
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.engine import PauseMode
 
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 TInitInfo = TypeVar("TInitInfo", bound="WeightTransferInitInfo")
 TUpdateInfo = TypeVar("TUpdateInfo", bound="WeightTransferUpdateInfo")
@@ -389,6 +394,10 @@ class TrainerInitInfo:
     backend: ClassVar[str]
 
     rank: int = field(kw_only=True)
+    pause_mode: "PauseMode | None" = field(default="keep", kw_only=True)
+    """How `send_weights` pauses generation around the apply; `None` leaves
+    pausing to the caller."""
+    pause_clear_cache: bool = field(default=True, kw_only=True)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -630,7 +639,8 @@ class VLLMWeightSyncClient(Protocol):
     protocol stays a flat four-method surface that any wrapper can implement.
 
     The protocol is structural (PEP 544), so user implementations need only
-    define these four methods — no import or subclassing required.
+    define these methods — no import or subclassing required. A client without
+    the pause methods still works; the caller then owns pausing.
     """
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None: ...
@@ -640,6 +650,14 @@ class VLLMWeightSyncClient(Protocol):
     def update_weights(self, update_info: WeightTransferUpdatePayload) -> None: ...
 
     def finish_weight_update(self, weight_version: str | None = None) -> None: ...
+
+    def pause_generation(
+        self, mode: "PauseMode" = "keep", clear_cache: bool = True
+    ) -> None: ...
+
+    def resume_generation(self) -> None: ...
+
+    def is_paused(self) -> bool: ...
 
 
 class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
@@ -669,6 +687,10 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
     RPCs and the transmit on `self.is_sender`, so only the sender touches the
     client.
 
+    Pausing: `send_weights` pauses generation only around the inference-side
+    apply (`start_weight_update` .. `finish_weight_update`), per the init info's
+    `pause_mode`, so trainer-side work before it overlaps with serving.
+
     Subclasses should define:
         init_info_cls: Type of backend-specific trainer init info
     """
@@ -690,6 +712,46 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         # `is_sender`, so non-sender ranks never touch the wire.
         self.client = client
         self.source = source
+        self.pause_mode: PauseMode | None = "keep"
+        self.pause_clear_cache = True
+        self._warned_unpausable = False
+
+    def _apply_pause_config(self, init_info: TrainerInitInfo) -> None:
+        """Take the pause settings from the init info; called by `trainer_init`."""
+        self.pause_mode = init_info.pause_mode
+        self.pause_clear_cache = init_info.pause_clear_cache
+
+    @contextmanager
+    def _pause_for_update(self) -> Iterator[None]:
+        """Pause generation around the apply unless the caller already paused.
+
+        Resumes only on success, so a failed apply never serves partial weights.
+        """
+        client = self.client
+        if not self.is_sender or self.pause_mode is None:
+            yield
+            return
+        if not all(
+            callable(getattr(client, m, None))
+            for m in ("pause_generation", "resume_generation", "is_paused")
+        ):
+            if not self._warned_unpausable:
+                logger.warning(
+                    "%s has no pause_generation/resume_generation/is_paused; "
+                    "send_weights will not pause generation.",
+                    type(client).__name__,
+                )
+                self._warned_unpausable = True
+            yield
+            return
+        if client.is_paused():
+            yield
+            return
+        client.pause_generation(
+            mode=self.pause_mode, clear_cache=self.pause_clear_cache
+        )
+        yield
+        client.resume_generation()
 
     @classmethod
     @abstractmethod
@@ -714,7 +776,8 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         """Push weights to inference workers and drive the full update round
         trip: `start_weight_update`, `update_weights` (run concurrently with the
         trainer-side broadcast when the backend requires it), then
-        `finish_weight_update`. Called on every trainer rank.
+        `finish_weight_update`, inside `_pause_for_update`. Called on every
+        trainer rank.
         """
         raise NotImplementedError
 

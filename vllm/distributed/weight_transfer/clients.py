@@ -11,7 +11,7 @@ Imports of `ray` / `requests` are deferred to call time so this module is
 importable without those packages installed.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from vllm.distributed.weight_transfer.base import (
     WeightTransferInitRequest,
@@ -21,6 +21,9 @@ from vllm.distributed.weight_transfer.base import (
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
+
+# Mirrors `vllm.v1.engine.PauseMode` without importing the engine.
+PauseMode = Literal["abort", "wait", "keep"]
 
 
 def _json_safe_update_info(update_info: dict[str, Any]) -> dict[str, Any]:
@@ -60,20 +63,43 @@ class HTTPVLLMWeightSyncClient:
 
     Mirrors `vllm/entrypoints/rl/online/api_router.py`:
     `/init_weight_transfer_engine`, `/start_weight_update`, `/update_weights`,
-    `/finish_weight_update`, `/shutdown_weight_transfer_engine`.
+    `/finish_weight_update`, `/shutdown_weight_transfer_engine`, `/pause`,
+    `/resume`, `/is_paused`.
     """
 
     def __init__(self, base_url: str, timeout: float = 300) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def _post(self, path: str, json: dict[str, Any] | None = None) -> None:
+    def _post(
+        self,
+        path: str,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
         import requests
 
         response = requests.post(
-            f"{self.base_url}/{path}", json=json, timeout=self.timeout
+            f"{self.base_url}/{path}", json=json, params=params, timeout=self.timeout
         )
         response.raise_for_status()
+
+    def pause_generation(
+        self, mode: PauseMode = "keep", clear_cache: bool = True
+    ) -> None:
+        self._post(
+            "pause", params={"mode": mode, "clear_cache": str(clear_cache).lower()}
+        )
+
+    def resume_generation(self) -> None:
+        self._post("resume")
+
+    def is_paused(self) -> bool:
+        import requests
+
+        response = requests.get(f"{self.base_url}/is_paused", timeout=self.timeout)
+        response.raise_for_status()
+        return bool(response.json()["is_paused"])
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
         self._post("init_weight_transfer_engine", {"init_info": init_info})
@@ -100,11 +126,37 @@ class RayVLLMWeightSyncClient:
     """Talks to one or more vLLM `AsyncLLM`/`LLM` Ray actors.
 
     Each call fans out to every handle and blocks on all of them, so a
-    multi-actor (e.g. multi-DP) deployment is driven as one unit.
+    multi-actor (e.g. multi-DP) deployment is driven as one unit. Pause calls
+    skip actors without them (e.g. offline `LLM`, which serializes calls anyway).
     """
 
     def __init__(self, handle: "ActorHandle | list[ActorHandle]") -> None:
         self.handles = handle if isinstance(handle, list) else [handle]
+
+    def _pausable(self) -> list["ActorHandle"]:
+        return [h for h in self.handles if hasattr(h, "pause_generation")]
+
+    def pause_generation(
+        self, mode: PauseMode = "keep", clear_cache: bool = True
+    ) -> None:
+        import ray
+
+        ray.get(
+            [
+                h.pause_generation.remote(mode=mode, clear_cache=clear_cache)
+                for h in self._pausable()
+            ]
+        )
+
+    def resume_generation(self) -> None:
+        import ray
+
+        ray.get([h.resume_generation.remote() for h in self._pausable()])
+
+    def is_paused(self) -> bool:
+        import ray
+
+        return all(ray.get([h.is_paused.remote() for h in self._pausable()]))
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
         import ray

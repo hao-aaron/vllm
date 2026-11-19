@@ -104,6 +104,13 @@ data-plane transfer, including any concurrency the backend needs (NCCL, for
 example, must run the workers' `update_weights` at the same time as the
 trainer's broadcast, since both rendezvous inside the same NCCL calls).
 
+`send_weights()` also pauses generation, only around the inference-side apply
+(start → finish), and resumes it afterward. Trainer-side work before the apply
+keeps overlapping with serving. Set `pause_mode` on the init info to choose
+`"keep"` (default), `"wait"` or `"abort"`, or `None` to pause yourself. If the
+engine is already paused when `send_weights()` starts, it is left paused for
+the caller to resume. A failed update leaves the engine paused.
+
 There is no `backend=` argument on the trainer side: each `TrainerInitInfo`
 subclass declares its own `backend`, and the factory dispatches on it.
 
