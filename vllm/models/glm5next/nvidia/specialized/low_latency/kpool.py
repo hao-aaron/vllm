@@ -20,12 +20,13 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
 
-from vllm.forward_context import in_piecewise_cudagraph
+from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     expand_pools_and_append_tail,
     kpool_decode_update_and_maybe_write_cache_batched,
 )
+from vllm.specialized import services
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroup
@@ -648,7 +649,7 @@ class FusedRemap:
         out = group.physical_topk_indices[:rows]
         counts = group.valid_topk_counts[:rows]
         compute_stream = current_stream()
-        if not in_piecewise_cudagraph():
+        if services.step.graph_mode != CUDAGraphMode.PIECEWISE:
             group.side_stream.wait_event(group.logical_topk_ready)
         else:
             group.side_stream.wait_stream(compute_stream)

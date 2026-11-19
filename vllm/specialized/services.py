@@ -3,7 +3,9 @@
 """Core-owned process groups and collectives for specialized models."""
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -14,7 +16,7 @@ from vllm.distributed.device_communicators.peer_transport import (
     PeerTransport,
 )
 
-__all__ = ["MAX_PEERS", "PeerBuffer", "PeerTransport", "comm", "groups"]
+__all__ = ["MAX_PEERS", "PeerBuffer", "PeerTransport", "comm", "groups", "step"]
 
 
 @dataclass(frozen=True)
@@ -130,5 +132,49 @@ class _Comm:
 
 
 _arenas: list[PeerTransport] = []
+
+
+class _Step:
+    """Read-only metadata of the step (or capture) being run; core sets it per
+    step and per capture. Empty mappings and mode NONE outside a step."""
+
+    @staticmethod
+    def _context() -> Any:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        return get_forward_context() if is_forward_context_available() else None
+
+    @property
+    def attn_metadata(self) -> Mapping[str, Any]:
+        """Attention metadata by layer name."""
+        md = getattr(self._context(), "attn_metadata", None)
+        return MappingProxyType(md) if isinstance(md, dict) else _EMPTY
+
+    @property
+    def slot_mapping(self) -> Mapping[str, torch.Tensor]:
+        """KV-cache slot mapping by layer name."""
+        sm = getattr(self._context(), "slot_mapping", None)
+        return MappingProxyType(sm) if isinstance(sm, dict) else _EMPTY
+
+    @property
+    def is_capturing(self) -> bool:
+        """Whether this forward is being captured into a CUDA graph."""
+        return torch.cuda.is_current_stream_capturing()
+
+    @property
+    def graph_mode(self) -> Any:
+        """The step's `CUDAGraphMode`; FULL captures run with NONE."""
+        from vllm.config import CUDAGraphMode
+
+        context = self._context()
+        return CUDAGraphMode.NONE if context is None else context.cudagraph_runtime_mode
+
+
+_EMPTY: Mapping[str, Any] = MappingProxyType({})
+
 groups = _Groups()
 comm = _Comm()
+step = _Step()

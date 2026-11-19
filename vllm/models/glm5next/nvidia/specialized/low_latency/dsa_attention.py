@@ -465,8 +465,8 @@ class DsaAttentionStage:
         )
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
-        from vllm.forward_context import get_forward_context
         from vllm.platforms import current_platform
+        from vllm.specialized import services
 
         from .linear import planned
 
@@ -474,8 +474,7 @@ class DsaAttentionStage:
         mla = self.mla
         if not planned() or llama_4_scaling is not None:
             return self.stock(positions, hidden_states, llama_4_scaling)
-        context = get_forward_context()
-        md = context.attn_metadata[mla.layer_name]
+        md = services.step.attn_metadata[mla.layer_name]
         if not self.supports(md, m):
             return self.stock(positions, hidden_states, llama_4_scaling)
         w = self.wrapper
@@ -493,7 +492,8 @@ class DsaAttentionStage:
             dtype=torch.float8_e4m3fn,
             device=q.device,
         )
-        cache = (kv_c, mla.kv_cache, context.slot_mapping[mla.layer_name], mla._k_scale)
+        slots = services.step.slot_mapping[mla.layer_name]
+        cache = (kv_c, mla.kv_cache, slots, mla._k_scale)
         head_gemv(q, self.w_uk, q_fp8, mla._q_scale, cache)
         if not w.skip_topk:  # MTP draft steps 1+ reuse step 0's top-k
             w.indexer(hidden_states, q_c, positions, w.indexer_rope_emb)

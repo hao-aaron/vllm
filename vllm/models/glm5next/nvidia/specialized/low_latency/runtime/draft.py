@@ -15,9 +15,9 @@ from typing import Any
 import torch
 
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
+from vllm.specialized import services
 
 from ..linear import MAX_TOKENS as PROJECTION_MAX_TOKENS
 from ..linear import planned_step
@@ -146,13 +146,10 @@ class SpecializedDraft(LayerStages):
         b = positions.shape[-1]
         if not torch.cuda.is_current_stream_capturing() or b > MAX_TOKENS:
             return None
-        if not is_forward_context_available():
+        if services.step.graph_mode == CUDAGraphMode.PIECEWISE:
             return None
-        context = get_forward_context()
-        if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
-            return None
-        by_layer = context.attn_metadata
-        if not isinstance(by_layer, dict) or not by_layer:
+        by_layer = services.step.attn_metadata
+        if not by_layer:
             return None
         rows = list(by_layer.values())
         for q in dict.fromkeys((self.q, 1)):

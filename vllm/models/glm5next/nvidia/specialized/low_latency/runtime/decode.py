@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.models.common.ops.mhc import hc_contract, hc_expand
@@ -566,14 +565,11 @@ class SpecializedDecode(LayerStages):
                 self.backbone.aux_hidden_state_layers,
             )
             return None
-        if not is_forward_context_available():
-            return None
-        context = get_forward_context()
-        if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+        if services.step.graph_mode == CUDAGraphMode.PIECEWISE:
             logger.info_once("Specialized decode skips a PIECEWISE %d-token capture", b)
             return None
-        by_layer = context.attn_metadata
-        if not isinstance(by_layer, dict) or not by_layer:
+        by_layer = services.step.attn_metadata
+        if not by_layer:
             return None
         rows: list[Any] = list(by_layer.values())
         q = self.q if any(getattr(md, "num_spec_decodes", 0) for md in rows) else 1

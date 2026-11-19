@@ -38,9 +38,9 @@ import torch
 from torch import nn
 
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
+from vllm.specialized import services
 
 from ..config import DecodeConfig, max_rows
 from ..stages import Stages, StepStages
@@ -102,11 +102,8 @@ def captures_pure_decode(prefixes: list[str]) -> bool:
     graphs with the forward context's mode NONE, and PIECEWISE ones, which
     report capturing too, with PIECEWISE), and attention metadata without
     prefills for every attention layer and index cache in `prefixes`."""
-    context = get_forward_context()
-    attn_metadata = context.attn_metadata
-    if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE or not isinstance(
-        attn_metadata, dict
-    ):
+    attn_metadata = services.step.attn_metadata
+    if services.step.graph_mode == CUDAGraphMode.PIECEWISE or not attn_metadata:
         return False
     for prefix in prefixes:
         metadata = attn_metadata.get(prefix)
@@ -200,10 +197,10 @@ class SpecializedDecode:
         if (
             intermediate_tensors is not None
             or not 0 < rows <= self.max_rows
-            or not is_forward_context_available()
+            or not services.step.attn_metadata
         ):
             return None
-        if not torch.cuda.is_current_stream_capturing():
+        if not services.step.is_capturing:
             # The eager run before each capture (and every eager step) runs the stock
             # layers, which also compiles the stock kernels.
             return None

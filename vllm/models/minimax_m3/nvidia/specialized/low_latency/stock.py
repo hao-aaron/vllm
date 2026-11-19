@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     fused_allreduce_gemma_rms_norm,
 )
@@ -34,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.moe_output import (
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _unpack
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.specialized import services
 
 from .stages import (
     AllReduceNormStage,
@@ -97,8 +97,7 @@ class StockFront(FrontStage):
     ) -> FrontOutput:
         """The sparse front after `qkv_proj`: q/k norms, RoPE and the KV /
         index-K cache insert of `qkv` (a kernel QKV projection reuses it)."""
-        slot_mappings = get_forward_context().slot_mapping
-        assert isinstance(slot_mappings, dict)
+        slot_mappings = services.step.slot_mapping
         main_slot_mapping = slot_mappings[attn.layer_name]
         index_slot_mapping = slot_mappings[attn.indexer.index_cache.prefix]
         q = attn._allocate_query(num_tokens, dtype, qkv.device)
@@ -375,8 +374,7 @@ def _indexer_metadata(attn: "MiniMaxM3SparseAttention"):
         MiniMaxM3IndexerMSAMetadata,
     )
 
-    attn_metadata = get_forward_context().attn_metadata
-    assert isinstance(attn_metadata, dict)
+    attn_metadata = services.step.attn_metadata
     md = attn_metadata[attn.indexer.index_cache.prefix]
     assert isinstance(md, MiniMaxM3IndexerMSAMetadata)
     return md
