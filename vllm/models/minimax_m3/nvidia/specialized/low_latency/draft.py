@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from vllm.config import get_current_vllm_config
-from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkForCausalLM
+from vllm.models.minimax_m3.nvidia.dspark import MiniMaxM3DSparkForCausalLM
 from vllm.specialized import Model
 
 from .drafter import FusedMarkovSampler, ShardedContextFc, build_drafter

@@ -51,7 +51,7 @@ def test_draft_attention_stores_kv_after_compile(
         set_current_vllm_config,
     )
     from vllm.forward_context import set_forward_context
-    from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkAttention
+    from vllm.models.minimax_m3.nvidia.dspark import MiniMaxM3DSparkAttention
 
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
     config = MiniMaxM3VLTextConfig(

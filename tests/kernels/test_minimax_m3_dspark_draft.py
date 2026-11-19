@@ -294,7 +294,7 @@ def test_draft_attention_fused_qk_norm_rope(
 
     from vllm.forward_context import set_forward_context
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention
-    from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkAttention
+    from vllm.models.minimax_m3.nvidia.dspark import MiniMaxM3DSparkAttention
 
     torch.manual_seed(0)
     config = MiniMaxM3VLTextConfig(
@@ -386,7 +386,7 @@ def test_draft_fp16_attention_output_feeds_mxfp8_o_proj(dist_init, default_vllm_
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         _mxfp8_e4m3_quantize_torch,
     )
-    from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkAttention
+    from vllm.models.minimax_m3.nvidia.dspark import MiniMaxM3DSparkAttention
 
     torch.manual_seed(0)
     config = MiniMaxM3VLTextConfig(

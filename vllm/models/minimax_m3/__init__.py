@@ -10,6 +10,7 @@ and the specialized declarations without them.
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .nvidia.dspark import MiniMaxM3DSparkForCausalLM
     from .nvidia.model import (
         MiniMaxM3SparseForCausalLM,
         MiniMaxM3SparseForConditionalGeneration,
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from .nvidia.mtp import MiniMaxM3MTP
 
 __all__ = [
+    "MiniMaxM3DSparkForCausalLM",
     "MiniMaxM3MTP",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -31,5 +33,7 @@ def __getattr__(name: str) -> Any:
     from vllm.platforms import current_platform
 
     folder = "amd" if current_platform.is_rocm() else "nvidia"
-    module = "mtp" if name == "MiniMaxM3MTP" else "model"
+    module = {"MiniMaxM3MTP": "mtp", "MiniMaxM3DSparkForCausalLM": "dspark"}.get(
+        name, "model"
+    )
     return getattr(importlib.import_module(f"{__name__}.{folder}.{module}"), name)

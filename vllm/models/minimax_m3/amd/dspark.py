@@ -72,10 +72,8 @@ def _gemma_rms_norm(hidden_size: int, eps: float) -> nn.Module:
     vllm_c kernel rejects for bf16 inputs, so every call ran the unfused native
     path (about ten kernels).
     """
-    if current_platform.is_rocm():
-        from vllm.models.minimax_m3.amd.model import MiniMAXGemmaRMSNorm
-    else:
-        from vllm.models.minimax_m3.nvidia.model import MiniMAXGemmaRMSNorm
+    from vllm.models.minimax_m3.amd.model import MiniMAXGemmaRMSNorm
+
     return MiniMAXGemmaRMSNorm(hidden_size, eps=eps)
 
 
@@ -327,15 +325,12 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         # VLLM_ROCM_MINIMAX_M3_MONO_DRAFTER=1: supported draft steps run the draft
         # layers as FlyDSL launches (MI355X)
         self._mono_drafter = None
-        if current_platform.is_rocm():
-            from vllm.models.minimax_m3.amd.mono.envs import envs as mono_envs
+        from vllm.models.minimax_m3.amd.mono.envs import envs as mono_envs
 
-            if mono_envs.MONO_DRAFTER:
-                from vllm.models.minimax_m3.amd.mono.drafter.dispatch import (
-                    DrafterDecode,
-                )
+        if mono_envs.MONO_DRAFTER:
+            from vllm.models.minimax_m3.amd.mono.drafter.dispatch import DrafterDecode
 
-                self._mono_drafter = DrafterDecode(self, vllm_config)
+            self._mono_drafter = DrafterDecode(self, vllm_config)
 
     def __call__(self, *args, **kwargs):
         # ahead of torch.compile's wrapper: the kernels launch outside the graph
