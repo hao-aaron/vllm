@@ -109,7 +109,8 @@ trainer's broadcast, since both rendezvous inside the same NCCL calls).
 keeps overlapping with serving. Set `pause_mode` on the init info to choose
 `"keep"` (default), `"wait"` or `"abort"`, or `None` to pause yourself. If the
 engine is already paused when `send_weights()` starts, it is left paused for
-the caller to resume. A failed update leaves the engine paused.
+the caller to resume. A failed update leaves the engine paused; a retry runs
+under that pause, and the caller resumes with `client.resume_generation()`.
 
 There is no `backend=` argument on the trainer side: each `TrainerInitInfo`
 subclass declares its own `backend`, and the factory dispatches on it.

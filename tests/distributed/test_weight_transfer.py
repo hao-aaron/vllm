@@ -1856,8 +1856,8 @@ class TestTrainerClients:
     def test_recording_client_is_protocol(self):
         assert isinstance(RecordingClient(), VLLMWeightSyncClient)
 
-    def test_http_client_sends_pause_query(self, monkeypatch):
-        """The server defaults to `abort` and parses `clear_cache` as a bool."""
+    def test_clients_forward_pause_mode(self, monkeypatch):
+        """The server defaults to `abort`, so the mode must reach it."""
         captured = {}
 
         def fake_post(self, path, json=None, params=None):
@@ -1869,6 +1869,13 @@ class TestTrainerClients:
             "path": "pause",
             "params": {"mode": "keep", "clear_cache": "false"},
         }
+
+        monkeypatch.setattr(ray, "get", lambda refs: refs)
+        handle = MagicMock()
+        RayVLLMWeightSyncClient(handle).pause_generation("wait")
+        handle.pause_generation.remote.assert_called_once_with(
+            mode="wait", clear_cache=True
+        )
 
     def test_http_client_is_protocol(self):
         assert isinstance(
@@ -1994,21 +2001,11 @@ class TestTrainerManagedPause:
         assert client.paused
         assert "resume" not in client.order
 
-        # A successful retry resumes the pause the failed attempt left.
+        # A retry runs under the leftover pause and leaves it to the caller.
         client.update_weights = lambda update_info: None
         engine.send_weights("v1")
-        assert not client.paused
+        assert client.paused
         assert client.order.count("pause:keep") == 1
-
-        # If the operator resumed after a failure, the retry pauses again.
-        client.update_weights = FailingUpdate.update_weights.__get__(client)
-        with pytest.raises(RuntimeError, match="boom"):
-            engine.send_weights("v2")
-        client.resume_generation()
-        client.update_weights = lambda update_info: None
-        engine.send_weights("v2")
-        assert client.order.count("pause:keep") == 3
-        assert not client.paused
 
 
 class TestModuleSource:

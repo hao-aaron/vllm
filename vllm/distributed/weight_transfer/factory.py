@@ -208,11 +208,14 @@ class WeightTransferTrainerFactory:
             engine_cls.__name__,
         )
 
-        return engine_cls.trainer_init(
+        engine = engine_cls.trainer_init(
             init_info=init_info,
             client=client,
             source=source,
         )
+        # Covers backends whose trainer_init does not apply it themselves.
+        engine._apply_pause_config(init_info)
+        return engine
 
 
 # Register built-in weight transfer engines here.

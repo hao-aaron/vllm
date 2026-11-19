@@ -323,7 +323,6 @@ class MyTrainerWeightTransferEngine(TrainerWeightTransferEngine[MyTrainerInitInf
             is_sender=init_info.is_sender,
             chunk_size_bytes=init_info.chunk_size_bytes,
         )
-        engine._apply_pause_config(init_info)  # pause_mode / pause_clear_cache
         if engine.is_sender:
             # Ship the must-agree wire params so the worker decodes exactly as
             # this trainer encodes, then open the trainer-side endpoint.

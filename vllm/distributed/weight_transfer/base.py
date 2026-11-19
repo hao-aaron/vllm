@@ -720,8 +720,6 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         self.pause_mode: PauseMode | None = "keep"
         self.pause_clear_cache = True
         self._warned_unpausable = False
-        # Set while a pause we issued is outstanding, e.g. after a failed apply.
-        self._holds_pause = False
 
     def _apply_pause_config(self, init_info: TrainerInitInfo) -> None:
         """Take the pause settings from the init info; called by `trainer_init`."""
@@ -737,8 +735,8 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
     def _pause_for_update(self) -> Iterator[None]:
         """Pause generation around the apply unless the caller already paused.
 
-        Resumes only on success, so a failed apply stays paused until a retry
-        succeeds; assumes no other controller pauses during `send_weights`.
+        Resumes only on success: after a failure generation stays paused (a
+        retry then runs under that pause) until the caller resumes it.
         """
         client = self.client
         if not self.is_sender or self.pause_mode is None:
@@ -754,23 +752,21 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
                 self._warned_unpausable = True
             yield
             return
-        paused = client.is_paused()
-        if paused and not self._holds_pause:
+        if client.is_paused():
             yield
             return
-        if not paused:
-            # Set first: a pause that times out client-side may still land.
-            self._holds_pause = True
-            client.pause_generation(
-                mode=self.pause_mode, clear_cache=self.pause_clear_cache
-            )
-        yield
+        client.pause_generation(
+            mode=self.pause_mode, clear_cache=self.pause_clear_cache
+        )
         try:
-            client.resume_generation()
-            self._holds_pause = False
-        except Exception:
-            # The weights are installed; the next send_weights retries the resume.
-            logger.exception("Failed to resume generation after a weight update")
+            yield
+        except BaseException:
+            logger.error(
+                "Weight update failed; generation stays paused. Retry "
+                "send_weights or call resume_generation on the client."
+            )
+            raise
+        client.resume_generation()
 
     @classmethod
     @abstractmethod

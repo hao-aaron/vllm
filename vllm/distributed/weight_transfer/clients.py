@@ -141,8 +141,8 @@ class RayVLLMWeightSyncClient:
         pausable = [h for h in self.handles if all(hasattr(h, m) for m in methods)]
         if len(pausable) < len(self.handles):
             logger.warning_once(
-                "%d of %d Ray actors have no pause_generation; they are not "
-                "paused during weight updates.",
+                "%d of %d Ray actors lack pause_generation/resume_generation/"
+                "is_paused; they are not paused during weight updates.",
                 len(self.handles) - len(pausable),
                 len(self.handles),
             )
@@ -170,7 +170,7 @@ class RayVLLMWeightSyncClient:
 
         states = ray.get([h.is_paused.remote() for h in self._pausable()])
         if any(states) and not all(states):
-            raise RuntimeError("Only some Ray actors are paused; pause all or none.")
+            logger.warning("Only some Ray actors are paused; treating all as unpaused.")
         return bool(states) and all(states)
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
