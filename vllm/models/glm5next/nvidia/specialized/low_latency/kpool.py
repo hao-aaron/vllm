@@ -20,6 +20,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
 
+from vllm.forward_context import in_piecewise_cudagraph
 from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     expand_pools_and_append_tail,
@@ -647,8 +648,10 @@ class FusedRemap:
         out = group.physical_topk_indices[:rows]
         counts = group.valid_topk_counts[:rows]
         compute_stream = current_stream()
-        # A deferred top-k exists only in planned steps, always FULL graphs.
-        group.side_stream.wait_event(group.logical_topk_ready)
+        if not in_piecewise_cudagraph():
+            group.side_stream.wait_event(group.logical_topk_ready)
+        else:
+            group.side_stream.wait_stream(compute_stream)
         pool_ids, positions, pool_size = pending
         with group.side_stream:
             expand_and_remap(

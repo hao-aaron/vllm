@@ -158,7 +158,7 @@ class SpecializedDraft(LayerStages):
         for q in dict.fromkeys((self.q, 1)):
             if b % q == 0 and all(is_decode(md, q, b) for md in rows):
                 logger.info_once("Specialized draft captures %d-token steps", b)
-                return Step(q, positions, by_layer, context.slot_mapping)
+                return Step(q, positions, by_layer)
         logger.info_once("Specialized draft skips a %d-token capture", b)
         return None
 
@@ -207,7 +207,7 @@ class SpecializedDraft(LayerStages):
                 mtp.enorm.variance_epsilon,
             )
         projection = self.eh_proj.get(layer.layer_idx)
-        with planned_step(step.metadata, step.slots):
+        with planned_step():
             if projection is not None and projection.supports(tokens):
                 x = projection(x)
             else:

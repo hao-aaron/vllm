@@ -8,6 +8,7 @@ of `vllm.specialized`, and each MUTATIONS entry a write to be removed."""
 
 EXCEPTIONS = {
     "vllm._custom_ops": "fused CUDA op in the core extension",
+    "vllm.forward_context": "step metadata; needs prepare_inputs",
     "vllm.model_executor.layers.fused_allreduce_gemma_rms_norm": "shared layer ops",
     "vllm.model_executor.layers.fused_moe.moe_output": "MoE output types",
     "vllm.model_executor.layers.fused_moe.runner.moe_runner": "MoE output types",

@@ -3,12 +3,11 @@
 """The low-latency GLM-5.3-Flash language model: the general class plus a decode
 executor built from the processed weights, run inside FULL decode graphs."""
 
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 import torch.nn as nn
 
-from vllm.config import CUDAGraphMode
 from vllm.models.glm5next.common.model import Glm5NextForCausalLM
 from vllm.specialized import Model
 
@@ -16,15 +15,8 @@ from .runtime import decode_config
 from .runtime.decode import SpecializedDecode
 
 
-class AttnStep(NamedTuple):
-    metadata: Any  # by layer name
-    slots: dict[str, torch.Tensor]  # slot mappings by layer name
-    full_graph: bool  # a FULL-graph step or capture
-
-
 class LowLatencyGlm5Next(Model, Glm5NextForCausalLM):
     _decode: SpecializedDecode | None = None
-    _attn: AttnStep | None = None
 
     def process_weights_after_loading(self) -> None:
         super().process_weights_after_loading()
@@ -38,39 +30,6 @@ class LowLatencyGlm5Next(Model, Glm5NextForCausalLM):
 
     def indexer_kpool_stage(self) -> Any:
         return None if self._decode is None else self._decode.kpool
-
-    def prepare_attn(
-        self,
-        input_batch,
-        cudagraph_mode,
-        block_tables,
-        slot_mappings,
-        attn_groups,
-        kv_cache_config,
-        for_capture: bool = False,
-        ubatch_idx: int = 0,
-    ) -> Any:
-        """Also keeps the step's metadata for the next forward's plan (FULL
-        captures pass for_capture=True with mode NONE)."""
-        metadata = super().prepare_attn(
-            input_batch,
-            cudagraph_mode,
-            block_tables,
-            slot_mappings,
-            attn_groups,
-            kv_cache_config,
-            for_capture,
-            ubatch_idx,
-        )
-        groups = kv_cache_config.kv_cache_groups
-        slots = {
-            name: slot_mapping
-            for slot_mapping, group in zip(slot_mappings, groups)
-            for name in group.layer_names
-        }
-        full = for_capture or cudagraph_mode == CUDAGraphMode.FULL
-        self._attn = AttnStep(metadata, slots, full)
-        return metadata
 
     def initialize_kv_cache(self, kv_cache_config, block_tables) -> None:
         super().initialize_kv_cache(kv_cache_config, block_tables)
@@ -93,7 +52,7 @@ class LowLatencyGlm5Next(Model, Glm5NextForCausalLM):
     ):
         decode = self._decode
         if decode is not None and intermediate_tensors is None:
-            step = decode.plan(positions, intermediate_tensors, self._attn)
+            step = decode.plan(positions, intermediate_tensors)
             if step is not None:
                 return decode.run(step, input_ids, inputs_embeds)
         return super().forward(

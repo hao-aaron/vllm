@@ -18,28 +18,21 @@ import torch
 from .gemm import Projection
 
 MAX_TOKENS = 2
-# The planned step being captured: (attention metadata, slot mappings), by layer.
-_active: list[tuple[dict, dict] | None] = [None]
+_active = [False]
 
 
 def planned() -> bool:
     """Whether a planned decode step is being captured."""
-    return _active[0] is not None
-
-
-def step_metadata() -> tuple[dict, dict]:
-    """The planned step's attention metadata and slot mappings, by layer name."""
-    assert _active[0] is not None
     return _active[0]
 
 
 @contextmanager
-def planned_step(metadata: dict, slots: dict):
-    _active[0] = (metadata, slots)
+def planned_step():
+    _active[0] = True
     try:
         yield
     finally:
-        _active[0] = None
+        _active[0] = False
 
 
 class _RoutedApply:
