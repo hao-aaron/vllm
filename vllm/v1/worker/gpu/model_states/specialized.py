@@ -18,9 +18,16 @@ def _forward(name: str):
 
 
 @functools.cache
-def dispatching(base: type[ModelState], model_cls: type[Model]) -> type[ModelState]:
-    """`base` with each hook `model_cls` overrides routed to the model."""
-    names = [n for n in HOOKS + LIFECYCLE if overridden(model_cls, n)]
+def dispatching(
+    base: type[ModelState], model_cls: type[Model], wrapper_cls: type | None = None
+) -> type[ModelState]:
+    """`base` with each hook `model_cls` overrides routed to the model, except
+    hooks a general wrapper class implements itself."""
+    names = [
+        n
+        for n in HOOKS + LIFECYCLE
+        if overridden(model_cls, n) and not hasattr(wrapper_cls, n)
+    ]
     attrs: dict[str, Any] = {n: _forward(n) for n in names}
 
     def bind(self, model: Model, kind: type[ModelState]) -> None:

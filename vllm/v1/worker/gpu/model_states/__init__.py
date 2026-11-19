@@ -39,7 +39,10 @@ def init_model_state(
         return cls(vllm_config, model, encoder_cache, device)
     from vllm.v1.worker.gpu.model_states.specialized import dispatching
 
-    state = dispatching(cls, type(target))(vllm_config, model, encoder_cache, device)
+    wrapper = None if target is model else type(model)
+    state = dispatching(cls, type(target), wrapper)(
+        vllm_config, model, encoder_cache, device
+    )
     state.bind(target, cls)
     return state
 
