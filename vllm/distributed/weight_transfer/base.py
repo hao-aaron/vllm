@@ -412,6 +412,14 @@ class TrainerInitInfo:
         return self.rank == 0
 
 
+def check_pause_mode(init_info: TrainerInitInfo) -> None:
+    if init_info.pause_mode not in (None, "abort", "wait", "keep"):
+        raise ValueError(
+            "pause_mode must be 'abort', 'wait', 'keep' or None, "
+            f"got {init_info.pause_mode!r}"
+        )
+
+
 @dataclass
 class WeightTransferUpdateInfo(ABC):  # noqa: B024
     """Base class for backend-specific weight update info."""
@@ -722,12 +730,11 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         self._warned_unpausable = False
 
     def _apply_pause_config(self, init_info: TrainerInitInfo) -> None:
-        """Take the pause settings from the init info; called by `trainer_init`."""
-        if init_info.pause_mode not in (None, "abort", "wait", "keep"):
-            raise ValueError(
-                f"pause_mode must be 'abort', 'wait', 'keep' or None, "
-                f"got {init_info.pause_mode!r}"
-            )
+        """Take the pause settings from the init info.
+
+        The factory applies it; backends call it early in `trainer_init` too.
+        """
+        check_pause_mode(init_info)
         self.pause_mode = init_info.pause_mode
         self.pause_clear_cache = init_info.pause_clear_cache
 
@@ -755,18 +762,24 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         if client.is_paused():
             yield
             return
-        client.pause_generation(
-            mode=self.pause_mode, clear_cache=self.pause_clear_cache
-        )
         try:
+            client.pause_generation(
+                mode=self.pause_mode, clear_cache=self.pause_clear_cache
+            )
             yield
-        except BaseException:
+        except Exception:
             logger.error(
-                "Weight update failed; generation stays paused. Retry "
+                "Weight update failed; generation may stay paused. Retry "
                 "send_weights or call resume_generation on the client."
             )
             raise
-        client.resume_generation()
+        try:
+            client.resume_generation()
+        except Exception as e:
+            raise RuntimeError(
+                "Weights were installed but resume_generation failed; "
+                "generation is still paused."
+            ) from e
 
     @classmethod
     @abstractmethod

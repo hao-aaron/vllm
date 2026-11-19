@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from vllm.distributed.weight_transfer.base import (
     TrainerWeightTransferEngine,
     WeightTransferEngine,
+    check_pause_mode,
 )
 from vllm.logger import init_logger
 
@@ -208,6 +209,7 @@ class WeightTransferTrainerFactory:
             engine_cls.__name__,
         )
 
+        check_pause_mode(init_info)  # before any rendezvous
         engine = engine_cls.trainer_init(
             init_info=init_info,
             client=client,

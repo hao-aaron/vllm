@@ -170,7 +170,10 @@ class RayVLLMWeightSyncClient:
 
         states = ray.get([h.is_paused.remote() for h in self._pausable()])
         if any(states) and not all(states):
-            logger.warning("Only some Ray actors are paused; treating all as unpaused.")
+            raise RuntimeError(
+                "Only some Ray actors are paused; pause all of them or none "
+                "before send_weights."
+            )
         return bool(states) and all(states)
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:

@@ -2007,6 +2007,12 @@ class TestTrainerManagedPause:
         assert client.paused
         assert client.order.count("pause:keep") == 1
 
+        # Once the caller resumes, the next send pauses and resumes again.
+        client.resume_generation()
+        engine.send_weights("v2")
+        assert client.order.count("pause:keep") == 2
+        assert not client.paused
+
 
 class TestModuleSource:
     """`ModuleSource` metadata vs. its iteration modes (dense, no GPU)."""
