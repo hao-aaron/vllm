@@ -7,7 +7,7 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.v1.worker.gpu.model_states.accessors import (
-    get_input_embeddings,
+    get_embedding_layer,
     get_lm_head,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
@@ -34,7 +34,7 @@ class LiLiCorrSpeculator(DFlash2Speculator):
         self, target_model: nn.Module, target_attn_layer_names: set[str]
     ) -> nn.Module:
         model = super().load_draft_model(target_model, target_attn_layer_names)
-        embedding = get_input_embeddings(target_model)
+        embedding = get_embedding_layer(target_model)
         lm_head = model.lm_head if model.has_own_lm_head else get_lm_head(target_model)
         if not isinstance(embedding, VocabParallelEmbedding) or not isinstance(
             lm_head, VocabParallelEmbedding

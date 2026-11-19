@@ -24,13 +24,22 @@ def get_lm_head(model: nn.Module) -> nn.Module | None:
     )
 
 
-def get_input_embeddings(model: nn.Module) -> nn.Module | None:
+def get_embedding_layer(model: nn.Module) -> nn.Module | None:
     """The target's input embedding layer, for drafters that share it."""
     if isinstance(model, Model):
-        return model.get_input_embeddings()
+        return model.get_embedding_layer()
     lm = get_language_model(model)
     inner = getattr(lm, "model", lm)
     return getattr(inner, "embed_tokens", None) or getattr(inner, "embedding", None)
+
+
+def get_topk_indices_buffer(model: nn.Module) -> Any:
+    """The target's sparse-attention top-k buffer that MTP drafts share, if any."""
+    fn = getattr(model, "get_topk_indices_buffer", None)
+    if isinstance(model, Model) and fn is not None:
+        return fn()
+    inner = getattr(get_language_model(model), "model", None)
+    return getattr(inner, "topk_indices_buffer", None)
 
 
 def draft_hook(draft: nn.Module, name: str) -> Callable[..., Any] | None:

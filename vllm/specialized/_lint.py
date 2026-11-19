@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rule 1 lints for specialized directories, by AST: imports, mutations, and
-what a subclass of a general model overrides.
+what a subclass of a general model overrides. They can't see attributes set at
+run time; those stay review items.
 
 `python -m vllm.specialized._lint` prints each directory's current findings in
 EXCEPTIONS.py form.

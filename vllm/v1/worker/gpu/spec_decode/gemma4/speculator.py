@@ -17,7 +17,7 @@ from vllm.distributed.parallel_state import in_single_pp_stage
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
-from vllm.v1.worker.gpu.model_states.accessors import get_input_embeddings
+from vllm.v1.worker.gpu.model_states.accessors import get_embedding_layer
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
@@ -177,7 +177,7 @@ class Gemma4Speculator(TargetDependentARSpeculator):
         target_model: nn.Module,
     ) -> None:
         if not in_single_pp_stage():
-            target_embed = get_input_embeddings(target_model)
+            target_embed = get_embedding_layer(target_model)
             if target_embed is not None:
                 del draft_model.model.embed_tokens
                 draft_model.model.embed_tokens = target_embed

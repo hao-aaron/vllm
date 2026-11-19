@@ -15,9 +15,9 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.v1.worker.gpu.model_states.accessors import (
-    get_input_embeddings,
-    get_language_model,
+    get_embedding_layer,
     get_lm_head,
+    get_topk_indices_buffer,
 )
 
 
@@ -80,7 +80,7 @@ def maybe_share_target_embed(
     draft_model: nn.Module, draft_inner: nn.Module, target_model: nn.Module
 ) -> None:
     """Share the target input embedding with the drafter when needed."""
-    target_embed = get_input_embeddings(target_model)
+    target_embed = get_embedding_layer(target_model)
     if isinstance(target_embed, PPMissingLayer):
         target_embed = None
     # The drafter does not use the target's LoRA adapter.
@@ -147,13 +147,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     # every module in the draft that holds a buffer reference so that
     # the per-layer indexer and sparse-attention backends all point to
     # the target's buffer.
-    # Not yet an accessor: the target backbone's shared top-k buffer.
-    target_inner = getattr(get_language_model(target_model), "model", None)
-    if hasattr(target_inner, "topk_indices_buffer"):
-        target_buffer = target_inner.topk_indices_buffer
-        if target_buffer is not None:
-            for _, module in draft_inner.named_modules():
-                if hasattr(module, "topk_indices_buffer"):
-                    module.topk_indices_buffer = target_buffer
+    target_buffer = get_topk_indices_buffer(target_model)
+    if target_buffer is not None:
+        for _, module in draft_inner.named_modules():
+            if hasattr(module, "topk_indices_buffer"):
+                module.topk_indices_buffer = target_buffer
 
     return eagle_model

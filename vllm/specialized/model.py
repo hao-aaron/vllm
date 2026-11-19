@@ -32,7 +32,13 @@ HOOKS = (
 # Called once by core: attach_draft then warmup before memory profiling (the
 # draft's own warmup runs after the target's); fast_path_sizes after capture.
 LIFECYCLE = ("attach_draft", "warmup", "fast_path_sizes")
-ACCESSORS = ("get_input_embeddings", "get_lm_head", "get_language_model")
+# get_topk_indices_buffer is optional: core falls back to the backbone attribute.
+ACCESSORS = (
+    "get_embedding_layer",
+    "get_lm_head",
+    "get_language_model",
+    "get_topk_indices_buffer",
+)
 # Methods core probes on draft models; a draft class defines the ones it has.
 DRAFT_HOOKS = (
     "set_prefill_rows",
@@ -102,7 +108,7 @@ class Model(nn.Module):
     def get_lm_head(self) -> nn.Module | None:
         return getattr(self.get_language_model(), "lm_head", None)
 
-    def get_input_embeddings(self) -> nn.Module | None:
+    def get_embedding_layer(self) -> nn.Module | None:
         lm = self.get_language_model()
         inner = getattr(lm, "model", lm)
         return getattr(inner, "embed_tokens", None) or getattr(inner, "embedding", None)
