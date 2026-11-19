@@ -119,7 +119,10 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
         return decode.run(step, inputs_embeds, positions)
 
     def compute_sample_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # The same on every TP rank: every rank samples every request.
-        if self._peer_logits is None:
-            return super().compute_sample_logits(hidden_states)
-        return self._peer_logits(hidden_states)
+        # The same on every TP rank: every rank samples every request. None for
+        # rows the peer logits don't cover.
+        if self._peer_logits is not None:
+            logits = self._peer_logits(hidden_states)
+            if logits is not None:
+                return logits
+        return super().compute_sample_logits(hidden_states)

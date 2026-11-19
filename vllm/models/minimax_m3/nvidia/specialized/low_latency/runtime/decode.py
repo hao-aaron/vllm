@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
 from ..config import DecodeConfig, max_rows
@@ -46,6 +47,8 @@ from ..stock import stock_stages
 
 if TYPE_CHECKING:
     from ....model import MiniMaxM3DecoderLayer, MiniMaxM3Model
+
+logger = init_logger(__name__)
 
 DecodeOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
 
@@ -202,6 +205,7 @@ class SpecializedDecode:
             return None
         if not captures_pure_decode(attn, self._prefixes):
             return None
+        logger.info_once("MiniMax-M3.1 low-latency decode captures %d-row steps", rows)
         return DecodeStep(
             rows=rows, stages=self.stages.select(rows), executor=self, attn=attn
         )

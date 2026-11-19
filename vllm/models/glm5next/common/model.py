@@ -1461,6 +1461,22 @@ class Glm5NextForConditionalGeneration(
             moe.n_redundant_experts = self.num_redundant_experts
             moe.experts.update_expert_map()
 
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        # Through the language model's forward, not its backbone, so a
+        # specialized language model runs its own.
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding
         # buffer used by GLM4V.
