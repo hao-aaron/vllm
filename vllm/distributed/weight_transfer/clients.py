@@ -11,19 +11,21 @@ Imports of `ray` / `requests` are deferred to call time so this module is
 importable without those packages installed.
 """
 
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.weight_transfer.base import (
     WeightTransferInitRequest,
     WeightTransferUpdatePayload,
     WeightTransferUpdateRequest,
 )
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
-# Mirrors `vllm.v1.engine.PauseMode` without importing the engine.
-PauseMode = Literal["abort", "wait", "keep"]
+    from vllm.v1.engine import PauseMode
+
+logger = init_logger(__name__)
 
 
 def _json_safe_update_info(update_info: dict[str, Any]) -> dict[str, Any]:
@@ -85,7 +87,7 @@ class HTTPVLLMWeightSyncClient:
         response.raise_for_status()
 
     def pause_generation(
-        self, mode: PauseMode = "keep", clear_cache: bool = True
+        self, mode: "PauseMode" = "keep", clear_cache: bool = True
     ) -> None:
         self._post(
             "pause", params={"mode": mode, "clear_cache": str(clear_cache).lower()}
@@ -127,17 +129,26 @@ class RayVLLMWeightSyncClient:
 
     Each call fans out to every handle and blocks on all of them, so a
     multi-actor (e.g. multi-DP) deployment is driven as one unit. Pause calls
-    skip actors without them (e.g. offline `LLM`, which serializes calls anyway).
+    skip actors without them (e.g. offline `LLM`, which serializes calls anyway),
+    with a warning.
     """
 
     def __init__(self, handle: "ActorHandle | list[ActorHandle]") -> None:
         self.handles = handle if isinstance(handle, list) else [handle]
 
     def _pausable(self) -> list["ActorHandle"]:
-        return [h for h in self.handles if hasattr(h, "pause_generation")]
+        pausable = [h for h in self.handles if hasattr(h, "pause_generation")]
+        if len(pausable) < len(self.handles):
+            logger.warning_once(
+                "%d of %d Ray actors have no pause_generation; they are not "
+                "paused during weight updates.",
+                len(self.handles) - len(pausable),
+                len(self.handles),
+            )
+        return pausable
 
     def pause_generation(
-        self, mode: PauseMode = "keep", clear_cache: bool = True
+        self, mode: "PauseMode" = "keep", clear_cache: bool = True
     ) -> None:
         import ray
 
@@ -156,7 +167,8 @@ class RayVLLMWeightSyncClient:
     def is_paused(self) -> bool:
         import ray
 
-        return all(ray.get([h.is_paused.remote() for h in self._pausable()]))
+        handles = self._pausable()
+        return bool(handles) and all(ray.get([h.is_paused.remote() for h in handles]))
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
         import ray

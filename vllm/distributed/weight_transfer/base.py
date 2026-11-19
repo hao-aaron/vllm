@@ -639,8 +639,8 @@ class VLLMWeightSyncClient(Protocol):
     protocol stays a flat four-method surface that any wrapper can implement.
 
     The protocol is structural (PEP 544), so user implementations need only
-    define these methods — no import or subclassing required. A client without
-    the pause methods still works; the caller then owns pausing.
+    define these four methods — no import or subclassing required. Clients that
+    also implement `SupportsPauseGeneration` let `send_weights` pause for you.
     """
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None: ...
@@ -650,6 +650,11 @@ class VLLMWeightSyncClient(Protocol):
     def update_weights(self, update_info: WeightTransferUpdatePayload) -> None: ...
 
     def finish_weight_update(self, weight_version: str | None = None) -> None: ...
+
+
+@runtime_checkable
+class SupportsPauseGeneration(Protocol):
+    """Optional client surface that lets `send_weights` pause generation."""
 
     def pause_generation(
         self, mode: "PauseMode" = "keep", clear_cache: bool = True
@@ -715,9 +720,16 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         self.pause_mode: PauseMode | None = "keep"
         self.pause_clear_cache = True
         self._warned_unpausable = False
+        # Set while a pause we issued is outstanding, e.g. after a failed apply.
+        self._holds_pause = False
 
     def _apply_pause_config(self, init_info: TrainerInitInfo) -> None:
         """Take the pause settings from the init info; called by `trainer_init`."""
+        if init_info.pause_mode not in (None, "abort", "wait", "keep"):
+            raise ValueError(
+                f"pause_mode must be 'abort', 'wait', 'keep' or None, "
+                f"got {init_info.pause_mode!r}"
+            )
         self.pause_mode = init_info.pause_mode
         self.pause_clear_cache = init_info.pause_clear_cache
 
@@ -725,33 +737,34 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
     def _pause_for_update(self) -> Iterator[None]:
         """Pause generation around the apply unless the caller already paused.
 
-        Resumes only on success, so a failed apply never serves partial weights.
+        Resumes only on success, so a failed apply stays paused until a retry
+        succeeds; assumes no other controller pauses during `send_weights`.
         """
         client = self.client
         if not self.is_sender or self.pause_mode is None:
             yield
             return
-        if not all(
-            callable(getattr(client, m, None))
-            for m in ("pause_generation", "resume_generation", "is_paused")
-        ):
+        if not isinstance(client, SupportsPauseGeneration):
             if not self._warned_unpausable:
                 logger.warning(
-                    "%s has no pause_generation/resume_generation/is_paused; "
+                    "%s does not implement SupportsPauseGeneration; "
                     "send_weights will not pause generation.",
                     type(client).__name__,
                 )
                 self._warned_unpausable = True
             yield
             return
-        if client.is_paused():
-            yield
-            return
-        client.pause_generation(
-            mode=self.pause_mode, clear_cache=self.pause_clear_cache
-        )
+        if not self._holds_pause:
+            if client.is_paused():
+                yield
+                return
+            client.pause_generation(
+                mode=self.pause_mode, clear_cache=self.pause_clear_cache
+            )
+            self._holds_pause = True
         yield
         client.resume_generation()
+        self._holds_pause = False
 
     @classmethod
     @abstractmethod
