@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
-from vllm.config import CUDAGraphMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.model_executor.layers.mhc import hc_contract, hc_expand
@@ -56,6 +54,7 @@ class Step(NamedTuple):
     q: int  # tokens per request
     positions: torch.Tensor
     metadata: dict[str, Any]  # by layer name
+    slots: dict[str, torch.Tensor]  # slot mappings by layer name
 
 
 def is_decode(md, q: int, b: int) -> bool:
@@ -539,7 +538,7 @@ class SpecializedDecode(LayerStages):
         for index, stage in self.kda.items():
             stage.prepare_caches(self.layers[index].self_attn.kv_cache)
 
-    def plan(self, positions, intermediate_tensors) -> Step | None:
+    def plan(self, positions, intermediate_tensors, attn) -> Step | None:
         """This step's decode plan, or None to run the stock forward instead.
 
         Steps that run the stock forward:
@@ -566,13 +565,13 @@ class SpecializedDecode(LayerStages):
                 self.backbone.aux_hidden_state_layers,
             )
             return None
-        if not is_forward_context_available():
+        # `attn`: this step's metadata, from the model's `prepare_attn` hook.
+        if attn is None:
             return None
-        context = get_forward_context()
-        if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+        if not attn.full_graph:
             logger.info_once("Specialized decode skips a PIECEWISE %d-token capture", b)
             return None
-        by_layer = context.attn_metadata
+        by_layer = attn.metadata
         if not isinstance(by_layer, dict) or not by_layer:
             return None
         rows: list[Any] = list(by_layer.values())
@@ -603,7 +602,7 @@ class SpecializedDecode(LayerStages):
                 )
             return None
         logger.info_once("GLM-5.3-Flash specialized decode captures %d-token steps", b)
-        return Step(q, positions, by_layer)
+        return Step(q, positions, by_layer, attn.slots)
 
     def layer(self, layer, x, partial, residual, post, comb, step: Step):
         """`Glm5NextDecoderLayer.forward` for a decode step (mHC, no SP).
@@ -663,7 +662,7 @@ class SpecializedDecode(LayerStages):
         if x is None:
             x = backbone.embed_input_ids(input_ids)
         state = (False, None, None, None)
-        with planned_step():
+        with planned_step(step.metadata, step.slots):
             for layer in self.layers:
                 x, *state = self.layer(layer, x, *state, step)
         return backbone.norm(x)
