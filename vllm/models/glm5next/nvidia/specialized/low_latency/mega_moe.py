@@ -586,7 +586,7 @@ class MegaExperts:
         """Compiles the kernel for these token counts before graph capture."""
         device = self.w13.device
         experts = self.w13.shape[0]
-        bias = torch.zeros(experts, device=device)
+        bias = torch.zeros(experts, dtype=torch.float32, device=device)
         for m in tokens:
             x = torch.zeros(m, self.hidden, dtype=torch.bfloat16, device=device)
             logits = torch.zeros(m, experts, dtype=logits_dtype, device=device)
