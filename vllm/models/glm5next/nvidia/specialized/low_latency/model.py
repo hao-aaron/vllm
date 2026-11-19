@@ -3,7 +3,6 @@
 """The low-latency GLM-5.3-Flash language model: the general class plus a decode
 executor built from the processed weights, run inside FULL decode graphs."""
 
-import weakref
 from typing import Any
 
 import torch
@@ -18,26 +17,22 @@ from .runtime.decode import SpecializedDecode
 
 class LowLatencyGlm5Next(Model, Glm5NextForCausalLM):
     _decode: SpecializedDecode | None = None
-    _draft: weakref.ref | None = None  # not a submodule
+
+    def process_weights_after_loading(self) -> None:
+        super().process_weights_after_loading()
+        # Built once: no deployment with weight reload routes here.
+        if self._decode is None:
+            # Collective: symmetric-memory rendezvous across the TP ranks.
+            self._decode = SpecializedDecode(
+                self.model, decode_config(self.vllm_config)
+            )
+            self._decode.build_logits(self.logits_processor, self.lm_head)
 
     def attach_draft(self, draft: nn.Module) -> None:
         from .draft import LowLatencyGlm5NextMTP
 
-        if isinstance(draft, LowLatencyGlm5NextMTP):
-            self._draft = weakref.ref(draft)
-
-    def warmup(self) -> None:
-        # Not in process_weights_after_loading: an executor built during the
-        # load decodes wrongly (see the prototype log). Collective, in order:
-        # the decode executor, then the MTP draft's.
-        if self._decode is not None:
-            return
-        cfg = decode_config(self.vllm_config)
-        self._decode = SpecializedDecode(self.model, cfg)
-        self._decode.build_logits(self.logits_processor, self.lm_head)
-        draft = None if self._draft is None else self._draft()
-        if draft is not None:
-            draft.build_executor(cfg, self._decode.kpool)
+        if isinstance(draft, LowLatencyGlm5NextMTP) and self._decode is not None:
+            draft.build_executor(decode_config(self.vllm_config), self._decode.kpool)
 
     def indexer_kpool_stage(self) -> Any:
         return None if self._decode is None else self._decode.kpool
