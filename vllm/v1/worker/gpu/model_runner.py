@@ -1233,7 +1233,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.fast_path_sizes:
                 logger.info_once(
                     "Specialized fast path covers captured sizes %s",
-                    self.fast_path_sizes,
+                    tuple(self.fast_path_sizes),
                 )
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
