@@ -10,7 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
-from vllm.model_executor.layers.mhc import hc_contract, hc_expand
+from vllm.models.common.ops.mhc import hc_contract, hc_expand
 from vllm.specialized import services
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 

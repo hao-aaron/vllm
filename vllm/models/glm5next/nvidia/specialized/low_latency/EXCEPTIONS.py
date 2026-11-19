@@ -12,7 +12,6 @@ EXCEPTIONS = {
     "vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm": "CuTe DSL GEMMs; shared-op candidate",
     "vllm.model_executor.layers.fused_moe.moe_output": "MoE output types",
     "vllm.model_executor.layers.mamba.mamba_utils": "shared layer ops",
-    "vllm.model_executor.layers.mhc": "shared layer ops",
     "vllm.model_executor.layers.quantization.utils.flashinfer_utils": "shared layer ops",
     "vllm.model_executor.layers.sparse_attn_indexer": "shared layer ops",
     "vllm.platforms": "device queries; RouteConfig probe",

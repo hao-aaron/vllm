@@ -23,6 +23,7 @@ steps:
   - vllm/utils/
   - tests/engine
   - tests/specialized
+  - tests/models/common/ops
   - tests/test_sequence
   - tests/test_config
   - tests/test_logger
@@ -34,6 +35,7 @@ steps:
     pytest -v -s
     engine
     specialized
+    models/common/ops
     test_sequence.py
     test_config.py
     test_logger.py
