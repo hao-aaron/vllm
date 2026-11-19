@@ -2184,7 +2184,7 @@ class TestTrainerFactory:
         try:
             WeightTransferTrainerFactory.register_engine("dummy", _DummyTrainerEngine)
             engine = WeightTransferTrainerFactory.trainer_init(
-                MagicMock(backend="dummy"),  # backend read from the init info
+                MagicMock(backend="dummy", pause_mode="keep"),  # read from init info
                 client=RecordingClient(),
                 source=ModuleSource(_module_with(("w", torch.zeros(2)))),
             )
