@@ -37,7 +37,6 @@ FLAGS = {
     "dp": "--data-parallel-size",
     "dcp": "--decode-context-parallel-size",
     "graph_mode": "-cc.cudagraph_mode",
-    "capture_sizes": "-cc.cudagraph_capture_sizes",
     "speculation": "--speculative-config",
     "num_speculative_tokens": "--speculative-config",
 }
@@ -70,7 +69,6 @@ class RouteConfig:
     speculation: str | None
     num_speculative_tokens: int
     graph_mode: str | None
-    capture_sizes: frozenset[int]
     compile: bool
     role: str
     features: frozenset[str]
@@ -124,8 +122,6 @@ class Support:
     pcp: frozenset[int] | set[int] | None = None
     micro_batching: bool | None = None
     graph_mode: frozenset[str] | set[str] | None = None
-    # Batch sizes the captured graphs must cover: each pads to a graph in range.
-    capture_sizes: range | None = None
     compile: bool | None = None
     speculation: frozenset[str | None] | set[str | None] | None = None
     num_speculative_tokens: frozenset[int] | set[int] | None = None
@@ -155,13 +151,6 @@ class Support:
                     have = getattr(cfg.hf_config, key, None)
                     if have != value:
                         out.append(f"{key} is {have!r}, needs {value!r}")
-            elif f.name == "capture_sizes":
-                # Every size in the range pads to a captured graph inside it.
-                if want and want[-1] not in cfg.capture_sizes:
-                    out.append(
-                        f"no CUDA graph of {want[-1]} tokens (add {want[-1]} to "
-                        f"{FLAGS['capture_sizes']})"
-                    )
             else:
                 have = getattr(cfg, f.name)
                 if isinstance(want, bool):

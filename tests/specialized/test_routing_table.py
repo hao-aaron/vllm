@@ -37,7 +37,6 @@ def _settings(quant: dict, **over):
         scheduler_config=NS(async_scheduling=True, max_num_seqs=256),
         speculative_config=None,
         kv_transfer_config=None,
-        additional_config={"minimax_m3_fused_finalize_max_tokens": 64},
     )
     for path, value in over.items():
         obj = s
@@ -81,7 +80,6 @@ def _base(family: str) -> RouteConfig:
         speculation=None,
         num_speculative_tokens=0,
         graph_mode="FULL_AND_PIECEWISE",
-        capture_sizes=frozenset({1, 2, 4, 8, 16, 32, 64}),
         compile=False,
         role="colocated",
         features=frozenset(),
@@ -174,14 +172,6 @@ TABLE = [
     ),
     (MM, "block 64", {"block_size": 64}, {}, True, "general"),
     (MM, "bf16 experts", {"expert_quantization": None}, {}, True, "general"),
-    (
-        MM,
-        "finalize cap 32",
-        {},
-        {"additional_config": {}},
-        True,
-        "general",
-    ),
     (MM, "nvfp4 kv", {"kv_cache_dtype": "nvfp4"}, {}, True, "general"),
     (
         MM,
@@ -209,14 +199,6 @@ TABLE = [
     ),
     (MM, "sleep mode", {"features": frozenset({"sleep_mode"})}, {}, True, "general"),
     (MM, "megamoe", {"moe_backend": "deep_gemm_mega_moe"}, {}, True, "general"),
-    (
-        MM,
-        "no small graphs",
-        {"capture_sizes": frozenset({4, 128})},
-        {},
-        True,
-        "general",
-    ),
 ]
 
 

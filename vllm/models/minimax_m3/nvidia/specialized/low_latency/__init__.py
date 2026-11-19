@@ -5,18 +5,12 @@ to `MAX_ROWS` rows over the general backbone, at TP4 on SM100/SM103, with a
 fused DSpark drafter. Other steps run the general layers.
 """
 
-from vllm.models.minimax_m3.nvidia.fused_finalize import (
-    FUSED_MOE_FINALIZE_MAX_TOKENS_KEY,
-    fused_finalize_max_tokens,
-)
 from vllm.specialized.declare import RouteConfig, Support
 
 from .config import (
     INDEXER_KV_DTYPES,
     KV_CACHE_DTYPES,
     MAX_PAGES,
-    MAX_REQUESTS,
-    MAX_ROWS,
     MAX_SPECULATIVE_TOKENS,
     PAGE_SIZE,
     STEP_LEVEL_KV_CONNECTORS,
@@ -44,13 +38,6 @@ def check(cfg: RouteConfig) -> list[str]:
     kv = s.kv_transfer_config
     if kv is not None and kv.kv_connector not in STEP_LEVEL_KV_CONNECTORS:
         out.append(f"KV connector {kv.kv_connector} has per-layer hooks")
-    # The executor reads the fused finalize's rows: every step it runs defers it.
-    if fused_finalize_max_tokens(s) < MAX_ROWS:
-        out.append(
-            f"fused MoE finalize up to {fused_finalize_max_tokens(s)} tokens, needs "
-            f"{MAX_ROWS} (set --additional-config.{FUSED_MOE_FINALIZE_MAX_TOKENS_KEY} "
-            f"{MAX_ROWS})"
-        )
     return out
 
 
@@ -70,8 +57,6 @@ SUPPORTS = Support(
     pcp={1},
     micro_batching=False,
     graph_mode={"FULL_AND_PIECEWISE", "FULL_DECODE_ONLY"},
-    # A graph for every executor step of one-token requests.
-    capture_sizes=range(1, MAX_REQUESTS + 1),
     compile=False,
     speculation={None, "dspark"},
     num_speculative_tokens=set(range(MAX_SPECULATIVE_TOKENS + 1)),

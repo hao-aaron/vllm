@@ -156,7 +156,6 @@ def route_config(cfg: "VllmConfig") -> RouteConfig:
         speculation=None if spec is None else spec.method,
         num_speculative_tokens=0 if spec is None else spec.num_speculative_tokens,
         graph_mode=None if graph_mode is None else graph_mode.name,
-        capture_sizes=frozenset(cfg.compilation_config.cudagraph_capture_sizes or ()),
         compile=cfg.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE,
         role=role,
         features=_features(cfg),

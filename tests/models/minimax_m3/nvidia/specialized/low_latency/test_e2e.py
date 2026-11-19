@@ -15,5 +15,4 @@ def test_matches_general():
         kv_cache_dtype="fp8",
         block_size=128,
         attention_config={"indexer_kv_dtype": "fp8"},
-        additional_config={"minimax_m3_fused_finalize_max_tokens": 64},
     )

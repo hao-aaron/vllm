@@ -16,8 +16,7 @@ MiniMax-M3 decode kernels.
 
 `SUPPORTS` and `check()` (`__init__.py`) list what the deployment must have;
 routing prints every unmet one with the flag to add. Nothing is filled in, so a
-recipe passes `--block-size 128 --kv-cache-dtype fp8 -ac.indexer_kv_dtype fp8
---additional-config.minimax_m3_fused_finalize_max_tokens 64`:
+recipe passes `--block-size 128 --kv-cache-dtype fp8 -ac.indexer_kv_dtype fp8`:
 
 - GPU: SM100 (B200/GB200) or SM103 (B300/GB300).
 - Kernels: every kernel is CuTe DSL (`nvidia-cutlass-dsl`, a vLLM
@@ -110,9 +109,9 @@ ahead. Keep o_proj/post paired and both halves.
 included; at most `MAX_ROWS` = 64 (8 requests x 8 rows). The MoE leaves its
 top-k finalize to the next input boundary exactly when the stock MoE does
 (`defers_finalize`), unless the next front fuses that boundary (a kernel
-front takes a finalized BF16 partial or a push). With the cap at 64
-(`minimax_m3_fused_finalize_max_tokens`), the stock model defers up to 64 rows
-instead of 32: at
+front takes a finalized BF16 partial or a push). The cap is
+derived from config (`max_num_seqs` x (1 + draft length), at most the token
+budget), so the stock model defers every decode step; at
 33..64 rows the next input boundary is then the stock fused finalize +
 all-reduce + norm + MXFP8 (two launches) instead of the MoE's finalize, the
 shared add, FlashInfer's all-reduce + norm and an MXFP8 quantize.
