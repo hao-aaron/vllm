@@ -131,6 +131,10 @@ class ModelState(ABC):
         """JIT compile and autotune, once, before memory profiling."""
         return None
 
+    def fast_path_sizes(self) -> set[int]:
+        """The captured graph sizes that take a specialized fast path."""
+        return set()
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         return None
 

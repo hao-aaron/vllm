@@ -339,6 +339,7 @@ class SpecializedDecode(LayerStages):
         self.policy = Policy(config.policy)
         self.q = config.q
         self.layers = list(backbone.layers)
+        self.fast_sizes: set[int] = set()  # captured token counts it planned
         self.text_config = backbone.config
         # MoE layers followed by a fused boundary (every one but the last).
         self.moe_layers = self.layers[:-1]
@@ -598,6 +599,7 @@ class SpecializedDecode(LayerStages):
                     ),
                 )
             return None
+        self.fast_sizes.add(b)
         logger.info_once("GLM-5.3-Flash specialized decode captures %d-token steps", b)
         return Step(q, positions, by_layer)
 

@@ -32,6 +32,7 @@ def _generate(model: str, specialized: str, chat: dict | None, **kwargs):
         **kwargs,
     )
     choice = llm.llm_engine.vllm_config.model_config.specialized_choice
+    fast_sizes = llm.collective_rpc("fast_path_sizes")
     params = SamplingParams(temperature=0, max_tokens=32, logprobs=5)
     if chat is None:
         outs = llm.generate(PROMPTS, params)
@@ -44,7 +45,7 @@ def _generate(model: str, specialized: str, chat: dict | None, **kwargs):
     ]
     del llm
     cleanup_dist_env_and_memory()
-    return choice, results
+    return choice, fast_sizes, results
 
 
 def check_against_general(
@@ -53,9 +54,10 @@ def check_against_general(
     model = os.environ.get(env_var)
     if not model or torch.accelerator.device_count() < 4:
         pytest.skip(f"needs 4 GPUs and ${env_var} pointing at the checkpoint")
-    choice, fast = _generate(model, name, chat, **kwargs)
+    choice, sizes, fast = _generate(model, name, chat, **kwargs)
     assert choice.endswith("." + name)
-    general_choice, ref = _generate(model, "off", chat, **kwargs)
+    assert all(sizes), f"no captured size takes the fast path: {sizes}"
+    general_choice, _, ref = _generate(model, "off", chat, **kwargs)
     assert general_choice == ""
     # Different kernels round differently; vLLM's usual greedy check: where the
     # tokens diverge, each must be in the other's top logprobs.

@@ -34,6 +34,9 @@ class LowLatencyGlm5Next(Model, Glm5NextForCausalLM):
         if isinstance(draft, LowLatencyGlm5NextMTP) and self._decode is not None:
             draft.build_executor(decode_config(self.vllm_config), self._decode.kpool)
 
+    def fast_path_sizes(self) -> set[int]:
+        return set() if self._decode is None else set(self._decode.fast_sizes)
+
     def indexer_kpool_stage(self) -> Any:
         return None if self._decode is None else self._decode.kpool
 

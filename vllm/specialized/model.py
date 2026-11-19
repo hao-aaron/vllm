@@ -29,8 +29,9 @@ HOOKS = (
     "compute_sample_logits",
     "dummy_sampler_run",
 )
-# Called once by core, in this order, before memory profiling.
-LIFECYCLE = ("attach_draft", "warmup")
+# Called once by core: attach_draft then warmup before memory profiling (the
+# draft's own warmup runs after the target's); fast_path_sizes after capture.
+LIFECYCLE = ("attach_draft", "warmup", "fast_path_sizes")
 ACCESSORS = ("get_input_embeddings", "get_lm_head", "get_language_model")
 # Methods core probes on draft models; a draft class defines the ones it has.
 DRAFT_HOOKS = (
@@ -84,6 +85,10 @@ class Model(nn.Module):
 
     def attach_draft(self, draft: nn.Module) -> None:
         """Called on the target once it and its `DRAFT_MODEL` are both loaded."""
+
+    def fast_path_sizes(self) -> set[int]:
+        """The captured graph sizes that take this model's fast path."""
+        return set()
 
     def fused_step(self, batch: Any, sampling: Any) -> StepResult | None:
         return None

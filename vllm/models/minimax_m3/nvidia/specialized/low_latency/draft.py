@@ -24,10 +24,15 @@ class LowLatencyMiniMaxM3DSpark(Model, MiniMaxM3DSparkForCausalLM):
             self._sampler = build_drafter(self, get_current_vllm_config())
             self._context_fc = ShardedContextFc(self, super().combine_hidden_states)
 
-    def warm_up(self, num_speculative_tokens: int) -> None:
-        """Collective; from the target's `warmup`."""
-        if self._sampler is not None:
-            self._sampler.warm_up(num_speculative_tokens)
+    def warmup(self) -> None:
+        """Collective; core runs it after the target's `warmup`."""
+        spec = get_current_vllm_config().speculative_config
+        if (
+            self._sampler is not None
+            and spec is not None
+            and spec.num_speculative_tokens
+        ):
+            self._sampler.warm_up(int(spec.num_speculative_tokens))
 
     def sample_sequential(
         self, speculator: Any, num_reqs: int, head_hidden: torch.Tensor

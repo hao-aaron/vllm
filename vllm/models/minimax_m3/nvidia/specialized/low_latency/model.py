@@ -3,10 +3,7 @@
 """The low-latency MiniMax-M3.1 language model: the general class plus a decode
 executor built from the processed weights, run inside FULL decode graphs."""
 
-import weakref
-
 import torch
-import torch.nn as nn
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
@@ -24,7 +21,6 @@ logger = init_logger(__name__)
 class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
     _decode: SpecializedDecode | None = None
     _peer_logits = None
-    _draft: weakref.ref | None = None
 
     def process_weights_after_loading(self) -> None:
         super().process_weights_after_loading()
@@ -45,20 +41,15 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
                 "target_logits",
             )
 
-    def attach_draft(self, draft: nn.Module) -> None:
-        self._draft = weakref.ref(draft)
-
     def warmup(self) -> None:
-        # Collective: the executor's kernels, the peer logits, then the drafter's.
-        vllm_config = get_current_vllm_config()
+        # Collective: the executor's kernels, then the peer logits.
         if self._decode is not None:
-            warm_up(self._decode, vllm_config)
+            warm_up(self._decode, get_current_vllm_config())
         if self._peer_logits is not None:
             self._peer_logits.warm_up()
-        draft = None if self._draft is None else self._draft()
-        spec = vllm_config.speculative_config
-        if draft is not None and spec is not None and spec.num_speculative_tokens:
-            draft.warm_up(int(spec.num_speculative_tokens))
+
+    def fast_path_sizes(self) -> set[int]:
+        return set() if self._decode is None else set(self._decode.fast_sizes)
 
     def forward(
         self,

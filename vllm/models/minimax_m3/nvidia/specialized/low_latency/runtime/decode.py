@@ -128,6 +128,7 @@ class SpecializedDecode:
         self.config = config
         self.lm_head = lm_head
         self.max_rows = max_rows(config.query_len)
+        self.fast_sizes: set[int] = set()  # captured row counts it planned
         self.stages = default_stages(config, backbone) if stages is None else stages
         if any(not impls for impls in self.stages):
             raise ValueError(
@@ -206,6 +207,7 @@ class SpecializedDecode:
             return None
         if not captures_pure_decode(self._prefixes):
             return None
+        self.fast_sizes.add(rows)
         logger.info_once("MiniMax-M3.1 low-latency decode captures %d-row steps", rows)
         return DecodeStep(rows=rows, stages=self.stages.select(rows), executor=self)
 
