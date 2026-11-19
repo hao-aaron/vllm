@@ -47,8 +47,8 @@ class LowLatencyGlm5NextMTP(Model, Glm5NextMTP):
     _kpool: Any = None
 
     def build_executor(self, config: DecodeConfig, kpool: Any) -> None:
-        """From the target's `attach_draft`, once the target embedding and head
-        are shared. Collective across TP ranks."""
+        """From the target's `warmup`, after `attach_draft` (the target
+        embedding and head are shared by then). Collective across TP ranks."""
         self._kpool = kpool
         self.model._decode = SpecializedDraft(self.model, config)
 
