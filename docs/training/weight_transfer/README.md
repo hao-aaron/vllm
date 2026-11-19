@@ -27,6 +27,9 @@ engine drives on your behalf:
 3. **Weight Update** (`update_weights`): transfers updated weights. May be called one or more times (e.g. for chunked transfers).
 4. **Finish** (`finish_weight_update`): finalizes the update (e.g. runs post-processing for checkpoint-format weights). Called once after all weights have been transferred.
 
+Each round's start → finish runs between `pause_generation` and
+`resume_generation`, which the trainer engine also drives.
+
 Checkpoint-format backends reload in the mode set by the `VLLM_RELOAD_MODE`
 environment variable. For RL weight updates, prefer
 [direct reload](../direct_reload.md) (`VLLM_RELOAD_MODE=direct`) over the
@@ -103,6 +106,12 @@ for step in range(num_steps):
 data-plane transfer, including any concurrency the backend needs (NCCL, for
 example, must run the workers' `update_weights` at the same time as the
 trainer's broadcast, since both rendezvous inside the same NCCL calls).
+
+`send_weights()` also pauses generation, only around the inference-side apply
+(start → finish), and resumes it afterward. Trainer-side work before the apply
+keeps overlapping with serving. Set `pause_mode` on the init info to `"keep"`
+(default), `"wait"` or `"abort"`. A failed update leaves generation paused until
+a retry succeeds or the caller calls `client.resume_generation()`.
 
 There is no `backend=` argument on the trainer side: each `TrainerInitInfo`
 subclass declares its own `backend`, and the factory dispatches on it.

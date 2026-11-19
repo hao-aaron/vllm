@@ -25,6 +25,9 @@ source selection, transfer, and installation.
 4. After a successful update, `finish_weight_update` releases the staged handle.
    The orchestrator can then resume inference.
 
+The [trainer-side engine](#trainer-side) runs steps 2-4 in one
+`send_weights(version_id)` call.
+
 Initialize the backend before starting an update session, and send exactly one
 version per session. Invalid transitions must raise; an orchestrator must keep
 inference paused after an update error and retry with a new session only after
@@ -154,3 +157,33 @@ installation failures propagate; do not resume a worker with uncertain weights.
 
 See the ModelExpress documentation for publication, source selection, object
 storage, and deployment requirements.
+
+## Trainer Side
+
+`ModelExpressTrainerWeightTransferEngine` drives the install of a published
+version through any `VLLMWeightSyncClient`, pausing generation only around it.
+It does not publish; publish with `ModelExpressTrainerClient` first.
+`worker_init_info` is forwarded as the workers' `init_info`.
+
+```python
+from vllm.distributed.weight_transfer import (
+    HTTPVLLMWeightSyncClient,
+    WeightTransferTrainerFactory,
+)
+from vllm.distributed.weight_transfer.modelexpress_trainer import (
+    ModelExpressTrainerInitInfo,
+)
+
+engine = WeightTransferTrainerFactory.trainer_init(
+    ModelExpressTrainerInitInfo(
+        rank=0,
+        pause_mode="keep",
+        worker_init_info={"model_name": "policy", "server_url": "modelexpress:8001"},
+    ),
+    client=HTTPVLLMWeightSyncClient("http://localhost:8000"),
+)
+
+for step in range(num_steps):
+    version_id = publish_version(step)  # e.g. with ModelExpressTrainerClient
+    engine.send_weights(version_id)
+```

@@ -139,9 +139,10 @@ inference engines in their own abstractions, and each reaches vLLM its own way.
 weight sync engines remain control plane agnostic.
 
 The contract is only this: **however the wrapper is shaped, it must bottom out in
-the same four calls** — `init_weight_transfer_engine` once at setup, then
-`start_weight_update` → one or more `update_weights` → `finish_weight_update` per
-round. Everything a trainer engine needs from the inference side goes through them.
+the same six calls** — `init_weight_transfer_engine` once at setup, then
+`pause_generation` → `start_weight_update` → one or more `update_weights` →
+`finish_weight_update` → `resume_generation` per round. Everything a trainer
+engine needs from the inference side goes through them.
 
 ```python
 class VLLMWeightSyncClient(Protocol):
@@ -149,11 +150,13 @@ class VLLMWeightSyncClient(Protocol):
     def start_weight_update(self) -> None: ...
     def update_weights(self, update_info: dict[str, Any]) -> None: ...
     def finish_weight_update(self, weight_version: str | None = None) -> None: ...
+    def pause_generation(self, mode: PauseMode = "keep", clear_cache: bool = True) -> None: ...
+    def resume_generation(self) -> None: ...
 ```
 
 It is a `@runtime_checkable` structural `Protocol` (PEP 544), which is what makes
-adapting cheap: **any object with those four methods already satisfies it**. An existing
-wrapper in your framework can usually become a client by gaining four forwarding
+adapting cheap: **any object with those six methods already satisfies it**. An existing
+wrapper in your framework can usually become a client by gaining six forwarding
 methods.
 
 Two implementations ship with vLLM:
@@ -167,7 +170,7 @@ Custom weight sync clients can be implemented like so:
 
 ```python
 class MyFrameworkWeightSyncClient:
-    """Adapts one RL framework's rollout pool to the four weight-sync calls."""
+    """Adapts one RL framework's rollout pool to the weight-sync calls."""
 
     def __init__(self, rollout_pool):
         self.pool = rollout_pool          # whatever your stack already has
@@ -186,6 +189,12 @@ class MyFrameworkWeightSyncClient:
         self.pool.broadcast_rpc("finish_weight_update")
         if weight_version is not None:
             self.pool.broadcast_rpc("update_weight_version", weight_version)
+
+    def pause_generation(self, mode="keep", clear_cache=True):
+        self.pool.broadcast_rpc("pause_generation", mode=mode, clear_cache=clear_cache)
+
+    def resume_generation(self):
+        self.pool.broadcast_rpc("resume_generation")
 ```
 
 Two things to get right in any adapter:
@@ -218,6 +227,10 @@ type, constructed by the `trainer_init` classmethod factory, and driven by `send
 | `trainer_init(init_info, *, client, source=None)` | Classmethod. Rendezvous with the inference side and return a ready instance |
 | `send_weights()` | Push weights and drive the full update round trip |
 | `shutdown()` | Tear down communicators / process groups. Default no-op |
+
+`send_weights` must wrap the apply in `self._pause_for_update()`, which pauses
+generation through the client per `TrainerInitInfo.pause_mode` and resumes it on
+success. Keep trainer-side work that does not touch the live weights outside it.
 
 Both `trainer_init` and `send_weights` are called on **every** trainer rank.
 `is_sender` is resolved once, at `trainer_init`, from `init_info.rank`. Each
@@ -335,17 +348,18 @@ class MyTrainerWeightTransferEngine(TrainerWeightTransferEngine[MyTrainerInitInf
                 pass
             return
 
-        self.client.start_weight_update()
-        self.client.update_weights(
-            {
-                "names": [m.name for m in meta],
-                "dtype_names": [str(m.dtype).split(".")[-1] for m in meta],
-                "shapes": [list(m.shape) for m in meta],
-            }
-        )
-        for name, tensor in self.source.iter_full():
-            ...                            # transmit
-        self.client.finish_weight_update()
+        with self._pause_for_update():
+            self.client.start_weight_update()
+            self.client.update_weights(
+                {
+                    "names": [m.name for m in meta],
+                    "dtype_names": [str(m.dtype).split(".")[-1] for m in meta],
+                    "shapes": [list(m.shape) for m in meta],
+                }
+            )
+            for name, tensor in self.source.iter_full():
+                ...                        # transmit
+            self.client.finish_weight_update()
 ```
 
 Two things to get right, both of which have bitten the built-in backends:

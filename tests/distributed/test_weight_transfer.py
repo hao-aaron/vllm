@@ -996,6 +996,12 @@ def trainer_send_from_source(
         def finish_weight_update(self, weight_version=None):
             pass
 
+        def pause_generation(self, mode="keep", clear_cache=True):
+            pass
+
+        def resume_generation(self):
+            pass
+
     engine = WeightTransferTrainerFactory.trainer_init(
         NCCLTrainerInitInfo(
             master_address=master_address,
@@ -1086,6 +1092,12 @@ def test_sparse_nccl_checkpoint_chunks_to_ep_local_experts_cpu(monkeypatch):
 
         def finish_weight_update(self):
             self.order.append("finish")
+
+        def pause_generation(self, mode="keep", clear_cache=True):
+            pass
+
+        def resume_generation(self):
+            pass
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -1810,6 +1822,27 @@ class RecordingClient:
     def finish_weight_update(self, weight_version: str | None = None) -> None:
         self.order.append("finish")
 
+    # Pauses are tracked apart from `order`, which records the update lifecycle.
+    paused = False
+
+    def pause_generation(self, mode="keep", clear_cache=True) -> None:
+        self.paused = True
+
+    def resume_generation(self) -> None:
+        self.paused = False
+
+
+class PausingRecordingClient(RecordingClient):
+    """A RecordingClient that also records pauses in `order`."""
+
+    def pause_generation(self, mode="keep", clear_cache=True) -> None:
+        self.order.append(f"pause:{mode}")
+        super().pause_generation(mode, clear_cache)
+
+    def resume_generation(self) -> None:
+        self.order.append("resume")
+        super().resume_generation()
+
 
 def _module_with(*pairs):
     """A tiny nn.Module exposing the given (name, tensor) pairs as parameters,
@@ -1836,6 +1869,27 @@ class TestTrainerClients:
 
     def test_recording_client_is_protocol(self):
         assert isinstance(RecordingClient(), VLLMWeightSyncClient)
+
+    def test_clients_forward_pause_mode(self, monkeypatch):
+        """The server defaults to `abort`, so the mode must reach it."""
+        captured = {}
+
+        def fake_post(self, path, json=None, params=None):
+            captured.update(path=path, params=params)
+
+        monkeypatch.setattr(HTTPVLLMWeightSyncClient, "_post", fake_post)
+        HTTPVLLMWeightSyncClient("http://x").pause_generation("keep", False)
+        assert captured == {
+            "path": "pause",
+            "params": {"mode": "keep", "clear_cache": "false"},
+        }
+
+        monkeypatch.setattr(ray, "get", lambda refs: refs)
+        handle = MagicMock()
+        RayVLLMWeightSyncClient(handle).pause_generation("wait")
+        handle.pause_generation.remote.assert_called_once_with(
+            mode="wait", clear_cache=True
+        )
 
     def test_http_client_is_protocol(self):
         assert isinstance(
@@ -1914,6 +1968,49 @@ class TestTrainerClients:
 
         client.shutdown_weight_transfer_engine()
         assert captured == {"path": "shutdown_weight_transfer_engine", "json": None}
+
+
+class TestTrainerManagedPause:
+    """`send_weights` pauses only around the apply, via the ModelExpress engine."""
+
+    @staticmethod
+    def _engine(client):
+        from vllm.distributed.weight_transfer.modelexpress_trainer import (
+            ModelExpressTrainerInitInfo,
+        )
+
+        return WeightTransferTrainerFactory.trainer_init(
+            ModelExpressTrainerInitInfo(rank=0, worker_init_info={"model_name": "m"}),
+            client=client,
+        )
+
+    def test_pauses_around_apply(self):
+        client = PausingRecordingClient()
+        self._engine(client).send_weights("v1")
+        assert client.order == [
+            "init", "pause:keep", "start", "update", "finish", "resume"
+        ]  # fmt: skip
+        assert client.last_init_info == {"model_name": "m"}
+        assert client.last_update_info == {"version_id": "v1"}
+        assert not client.paused
+
+    def test_failed_update_stays_paused(self):
+        class FailingUpdate(PausingRecordingClient):
+            def update_weights(self, update_info):
+                raise RuntimeError("boom")
+
+        client = FailingUpdate()
+        engine = self._engine(client)
+        with pytest.raises(RuntimeError, match="boom"):
+            engine.send_weights("v1")
+        assert client.paused
+        assert "resume" not in client.order
+
+        # A successful retry pauses again and resumes.
+        client.update_weights = lambda update_info: None
+        engine.send_weights("v1")
+        assert client.order.count("pause:keep") == 2
+        assert not client.paused
 
 
 class TestModuleSource:
@@ -2086,7 +2183,7 @@ class TestTrainerFactory:
         try:
             WeightTransferTrainerFactory.register_engine("dummy", _DummyTrainerEngine)
             engine = WeightTransferTrainerFactory.trainer_init(
-                MagicMock(backend="dummy"),  # backend read from the init info
+                MagicMock(backend="dummy", pause_mode="keep"),  # read from init info
                 client=RecordingClient(),
                 source=ModuleSource(_module_with(("w", torch.zeros(2)))),
             )
