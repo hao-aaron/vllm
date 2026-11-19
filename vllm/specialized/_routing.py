@@ -6,11 +6,12 @@ Specialized directories never import this module (Rule 1).
 """
 
 import contextlib
+import dataclasses
 import importlib
 import importlib.metadata
 import importlib.util
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.specialized.declare import FEATURES, RouteConfig, Support
@@ -254,6 +255,38 @@ def route_and_record(cfg: "VllmConfig") -> None:
     mc.specialized_choice = d.choice or ""
     for line in d.lines:
         logger.info("Specialized routing: %s", line)
+    if mc.specialized_model_options:
+        if d.choice:
+            options(cfg)  # unknown or mistyped options fail at startup
+        else:
+            logger.warning(
+                "Specialized routing: the general model ignores "
+                "--specialized-model-options %s",
+                mc.specialized_model_options,
+            )
+
+
+def options(cfg: "VllmConfig") -> Any:
+    """The chosen directory's `OPTIONS` from --specialized-model-options, with
+    its defaults; None if the directory declares none."""
+    mc = cfg.model_config
+    if not mc.specialized_choice:
+        return None
+    cls = getattr(importlib.import_module(mc.specialized_choice), "OPTIONS", None)
+    given = mc.specialized_model_options or {}
+    if cls is None:
+        if given:
+            raise ValueError(
+                f"{mc.specialized_choice} takes no --specialized-model-options"
+            )
+        return None
+    names = {f.name for f in dataclasses.fields(cls)}
+    if unknown := sorted(set(given) - names):
+        raise ValueError(
+            f"{mc.specialized_choice} has no options {unknown}; it takes "
+            f"{sorted(names)}"
+        )
+    return cls(**given)
 
 
 def _rank_local(support: Support) -> Support:

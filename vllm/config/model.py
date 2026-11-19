@@ -391,6 +391,9 @@ class ModelConfig:
     """Which specialized implementation runs: `auto` (route on the deployment),
     `off` (always the general model), `require` (fail unless one qualifies), or
     a specialized directory name to pin."""
+    specialized_model_options: dict[str, Any] = field(default_factory=dict)
+    """Options of the chosen specialized directory (its `OPTIONS` dataclass),
+    e.g. `{"policy": {...}}`; only that directory reads them."""
     specialized_choice: str | None = None
     """Set by routing: module of the chosen specialized directory, "" for the
     general model, None before routing."""

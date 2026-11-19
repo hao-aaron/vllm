@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from vllm.specialized import services
     from vllm.specialized.model import Model, StepResult
 
-__all__ = ["Model", "StepResult", "services"]
+__all__ = ["Model", "StepResult", "options", "services"]
 
 
 def __getattr__(name: str) -> Any:
@@ -24,4 +24,8 @@ def __getattr__(name: str) -> Any:
         import importlib
 
         return importlib.import_module("vllm.specialized.services")
+    if name == "options":
+        from vllm.specialized._routing import options
+
+        return options
     raise AttributeError(name)

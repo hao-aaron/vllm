@@ -240,3 +240,18 @@ def test_worker_recheck_uses_rank_local_facts_only():
     assert support.reasons(cfg)
     assert not _rank_local(support).reasons(cfg)
     assert _rank_local(support).reasons(dataclasses.replace(cfg, arch="sm90"))
+
+
+def test_options_reject_unknown_names():
+    from vllm.specialized._routing import options
+
+    def cfg(given):
+        choice = f"{GLM}.nvidia.specialized.low_latency"
+        return NS(
+            model_config=NS(specialized_choice=choice, specialized_model_options=given)
+        )
+
+    assert options(cfg({})).policy == {}
+    assert options(cfg({"policy": {"moe": "1-4:per_route"}})).policy
+    with pytest.raises(ValueError, match="has no options"):
+        options(cfg({"polcy": {}}))

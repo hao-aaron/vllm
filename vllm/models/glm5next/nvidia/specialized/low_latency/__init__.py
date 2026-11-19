@@ -4,7 +4,19 @@
 the general backbone, at TP4 on SM100/SM103. Other steps run the general layers.
 """
 
+from dataclasses import dataclass, field
+
 from vllm.specialized.declare import RouteConfig, Support
+
+
+@dataclass(frozen=True)
+class OPTIONS:
+    """--specialized-model-options for this directory."""
+
+    # Overrides of the per-token-count dispatch by stage name (see `policy.py`),
+    # e.g. {"moe": "1-4:per_route,8-16:grouped"}.
+    policy: dict[str, str] = field(default_factory=dict)
+
 
 # The model geometry the kernels are specialized for: hidden size, KDA heads and
 # head dim, conv width, MLA heads / latent / NoPE dims, indexer, mHC streams, MoE.
