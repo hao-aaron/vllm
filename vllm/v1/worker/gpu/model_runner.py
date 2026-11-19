@@ -455,6 +455,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        if isinstance(self.speculator, DraftModelSpeculator):
+            with self.draft_context(), set_current_vllm_config(self.vllm_config):
+                self.model_state.attach_draft(self.speculator.model)
+        with set_current_vllm_config(self.vllm_config):
+            self.model_state.warmup()
         if self.pp_handler is not None:
             self.pp_handler.relay_positions = (
                 self.model_state.positions_depend_on_encoder

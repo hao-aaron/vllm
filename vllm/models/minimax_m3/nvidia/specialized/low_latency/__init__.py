@@ -5,17 +5,22 @@ to `MAX_ROWS` rows over the general backbone, at TP4 on SM100/SM103, with a
 fused DSpark drafter. Other steps run the general layers.
 """
 
+from vllm.models.minimax_m3.nvidia.fused_finalize import (
+    FUSED_MOE_FINALIZE_MAX_TOKENS_KEY,
+    fused_finalize_max_tokens,
+)
 from vllm.specialized.declare import RouteConfig, Support
 
 from .config import (
     INDEXER_KV_DTYPES,
     KV_CACHE_DTYPES,
     MAX_PAGES,
+    MAX_REQUESTS,
+    MAX_ROWS,
     MAX_SPECULATIVE_TOKENS,
     PAGE_SIZE,
     STEP_LEVEL_KV_CONNECTORS,
     SUPPORTED_TP_SIZES,
-    max_rows,
 )
 
 
@@ -23,18 +28,14 @@ def check(cfg: RouteConfig) -> list[str]:
     """Settings the `Support` fields don't cover."""
     s = cfg.settings
     out = []
-    quant = getattr(s.model_config.hf_config, "quantization_config", None) or {}
-    if not isinstance(quant, dict):
-        quant = quant.to_dict()
-    if quant.get("moe_quant_algo") != "NVFP4":
-        out.append("checkpoint without NVFP4 routed experts")
-    if s.kernel_config.moe_backend == "deep_gemm_mega_moe":
-        out.append("MegaMoE backend (needs the default TRTLLM-gen MoE)")
     if s.scheduler_config.async_scheduling is False:
         out.append("async scheduling off")
     attention = s.attention_config
     if attention.indexer_kv_dtype not in INDEXER_KV_DTYPES:
-        out.append(f"indexer_kv_dtype {attention.indexer_kv_dtype}, needs fp8")
+        out.append(
+            f"indexer_kv_dtype {attention.indexer_kv_dtype}, needs fp8 "
+            "(set -ac.indexer_kv_dtype fp8)"
+        )
     if attention.indexer_decode_cp or attention.minimax_m3_indexer_cp:
         out.append("indexer context parallelism")
     spec = s.speculative_config
@@ -43,18 +44,24 @@ def check(cfg: RouteConfig) -> list[str]:
     kv = s.kv_transfer_config
     if kv is not None and kv.kv_connector not in STEP_LEVEL_KV_CONNECTORS:
         out.append(f"KV connector {kv.kv_connector} has per-layer hooks")
-    sizes = s.compilation_config.cudagraph_capture_sizes
-    cap = max_rows(1 + cfg.num_speculative_tokens)
-    if sizes is not None and not any(size <= cap for size in sizes):
-        out.append(f"no CUDA graph capture size <= {cap} rows")
+    # The executor reads the fused finalize's rows: every step it runs defers it.
+    if fused_finalize_max_tokens(s) < MAX_ROWS:
+        out.append(
+            f"fused MoE finalize up to {fused_finalize_max_tokens(s)} tokens, needs "
+            f"{MAX_ROWS} (set --additional-config.{FUSED_MOE_FINALIZE_MAX_TOKENS_KEY} "
+            f"{MAX_ROWS})"
+        )
     return out
 
 
 SUPPORTS = Support(
     arch={"sm100", "sm103"},
     libraries={"nvidia-cutlass-dsl": "4.0"},
-    checkpoint={"mxfp8", "modelopt_mxfp8"},
+    checkpoint={"modelopt_mxfp8"},
+    expert_quantization={"nvfp4"},
     kv_cache_dtype=set(KV_CACHE_DTYPES),
+    # MegaMoE replaces the TRTLLM-gen experts the executor reads.
+    moe_backend={"auto", "flashinfer_trtllm"},
     tp=set(SUPPORTED_TP_SIZES),
     pp={1},
     dp={1},
@@ -63,6 +70,8 @@ SUPPORTS = Support(
     pcp={1},
     micro_batching=False,
     graph_mode={"FULL_AND_PIECEWISE", "FULL_DECODE_ONLY"},
+    # A graph for every executor step of one-token requests.
+    capture_sizes=range(1, MAX_REQUESTS + 1),
     compile=False,
     speculation={None, "dspark"},
     num_speculative_tokens=set(range(MAX_SPECULATIVE_TOKENS + 1)),
@@ -76,17 +85,6 @@ SUPPORTS = Support(
 )
 
 
-def defaults(cfg: RouteConfig) -> dict:
-    return {
-        "compilation_config.cudagraph_mode": "FULL_AND_PIECEWISE",
-        "cache_config.block_size": PAGE_SIZE,
-        "attention_config.indexer_kv_dtype": "fp8",
-    }
-
-
-# The VL wrapper stays general; its language model is the specialized class.
-MODEL = {
-    "MiniMaxM3SparseForConditionalGeneration": "language_model",
-    "MiniMaxM3SparseForCausalLM": "model:LowLatencyMiniMaxM3",
-}
+# The VL wrapper stays general and builds this text model through the registry.
+MODEL = {"MiniMaxM3SparseForCausalLM": "model:LowLatencyMiniMaxM3"}
 DRAFT_MODEL = {"dspark": "draft:LowLatencyMiniMaxM3DSpark"}

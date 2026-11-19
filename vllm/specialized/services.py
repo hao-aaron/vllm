@@ -2,10 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core-owned process groups and collectives for specialized models."""
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from vllm.distributed.device_communicators.peer_transport import (
+    MAX_PEERS,
+    PeerBuffer,
+    PeerTransport,
+)
+
+__all__ = ["MAX_PEERS", "PeerBuffer", "PeerTransport", "comm", "groups"]
 
 
 @dataclass(frozen=True)
@@ -86,11 +95,40 @@ class _Comm:
         )
         return int(t.item())
 
+    def peer_arena(
+        self, capacity: int, group: str = "tp", kind: str = "auto"
+    ) -> PeerTransport:
+        """Collective: an arena shared with the group's peers over CUDA IPC or
+        symmetric memory; `alloc(name, nbytes)` carves buffers in rank order."""
+        from vllm.distributed.device_communicators.peer_transport import (
+            make_transport,
+        )
+
+        g = groups.get(group)
+        return make_transport(
+            kind,
+            group=g.device_group,
+            cpu_group=g.cpu_group,
+            rank=g.rank,
+            world=g.size,
+            capacity=capacity,
+        )
+
+    def peer_buffer(
+        self, name: str, shape: tuple[int, ...], dtype: torch.dtype, group: str = "tp"
+    ) -> PeerBuffer:
+        """Collective: one buffer shared with the group's peers over IPC."""
+        nbytes = math.prod(shape) * dtype.itemsize
+        arena = self.peer_arena(nbytes + 8192, group)
+        _arenas.append(arena)  # the arena owns the memory
+        return arena.alloc(name, nbytes)
+
     def symmetric(self, name: str) -> Any:
         raise NotImplementedError(
             "symmetric buffers from resources.memory are not in the prototype"
         )
 
 
+_arenas: list[PeerTransport] = []
 groups = _Groups()
 comm = _Comm()

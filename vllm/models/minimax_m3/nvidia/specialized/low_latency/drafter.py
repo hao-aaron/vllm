@@ -40,7 +40,6 @@ head, FP32 Gumbel sampling, an unquantized Markov head, at most
 `MARKOV_MAX_REQUESTS` requests.
 """
 
-import weakref
 from typing import Any
 
 import torch
@@ -475,7 +474,7 @@ class FusedMarkovSampler:
         return True
 
     def warm_up(self, n_spec: int) -> None:
-        """Collective, at start-up (`warm_up_drafters`): the draft LM head's
+        """Collective, at start-up (the target's `warmup`): the draft LM head's
         peer logits, allocated and compiled before memory profiling."""
         peer = self._peer_logits(n_spec)
         if peer is not None:
@@ -656,24 +655,9 @@ def _patch_norms(model: nn.Module) -> int:
     return count
 
 
-# The samplers attach_drafter installed in this process; the model state warms them up
-# at start-up (warm_up_drafters).
-_ATTACHED: list[weakref.ref] = []
-
-
-def attach_drafter(model: nn.Module, vllm_config: Any) -> None:
-    """Give a MiniMax-M3 DSpark draft model the fused Markov sampling when the
-    specialized decode is on (the caller checks the switch; the stock draft
-    model is left as it is otherwise)."""
-    # Batch-sharded sampling shards the Markov loop across ranks instead; a model-level
-    # sample_sequential would turn that off.
-    if vllm_config.parallel_config.enable_batch_sharded_sampling:
-        return
-    sampler = FusedMarkovSampler(model)
-    model.sample_sequential = sampler
-    model._specialized_decode_drafter = True
-    _ATTACHED.append(weakref.ref(sampler))
-    model.combine_hidden_states = ShardedContextFc(model, model.combine_hidden_states)
+def build_drafter(model: nn.Module, vllm_config: Any) -> FusedMarkovSampler | None:
+    """The fused Markov sampler of a MiniMax-M3 DSpark draft model, with its
+    hidden-size norms on the row kernel and fused with their MXFP8 quantize."""
     logger.info(
         "DSpark drafter: %d hidden-size norms on the row kernel.", _patch_norms(model)
     )
@@ -681,11 +665,4 @@ def attach_drafter(model: nn.Module, vllm_config: Any) -> None:
 
     # The norms' forward (the row kernel above) on an already reduced input.
     attach_fused_norms(model, lambda norm: norm.forward)
-
-
-def warm_up_drafters(n_spec: int) -> None:
-    """Collective (every rank, at start-up): warm up every attached sampler."""
-    for ref in list(_ATTACHED):
-        sampler = ref()
-        if sampler is not None:
-            sampler.warm_up(n_spec)
+    return FusedMarkovSampler(model)

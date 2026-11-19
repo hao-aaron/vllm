@@ -38,8 +38,9 @@ from typing import Any
 
 import torch
 
+from vllm.specialized.services import PeerTransport
+
 from . import _arch
-from ._comm import PeerTransport
 from ._exchange import HIDDEN, bucket, push_workspace
 
 H = HIDDEN

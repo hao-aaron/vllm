@@ -14,6 +14,11 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.model_executor.models.utils import PPMissingLayer
+from vllm.v1.worker.gpu.model_states.accessors import (
+    get_input_embeddings,
+    get_language_model,
+    get_lm_head,
+)
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -71,21 +76,11 @@ def share_target_lm_head(
     return head
 
 
-def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
-    """The target's lm_head — from get_language_model() for
-    *ForConditionalGeneration targets, else the top-level module."""
-    return getattr(target_language_model, "lm_head", None) or getattr(
-        target_model, "lm_head", None
-    )
-
-
 def maybe_share_target_embed(
-    draft_model: nn.Module, draft_inner: nn.Module, target_inner: nn.Module
+    draft_model: nn.Module, draft_inner: nn.Module, target_model: nn.Module
 ) -> None:
     """Share the target input embedding with the drafter when needed."""
-    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
-        target_inner, "embedding", None
-    )
+    target_embed = get_input_embeddings(target_model)
     if isinstance(target_embed, PPMissingLayer):
         target_embed = None
     # The drafter does not use the target's LoRA adapter.
@@ -127,19 +122,13 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             vllm_config=vllm_config, model_config=draft_model_config
         )
 
-    target_language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    target_inner = target_language_model.model
     draft_inner = eagle_model.model
 
-    maybe_share_target_embed(eagle_model, draft_inner, target_inner)
+    maybe_share_target_embed(eagle_model, draft_inner, target_model)
 
     draft_head = share_target_lm_head(
         eagle_model,
-        get_target_lm_head(target_model, target_language_model),
+        get_lm_head(target_model),
         speculative_config.draft_lm_head_quantization,
     )
     if draft_head is not None:
@@ -158,6 +147,8 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     # every module in the draft that holds a buffer reference so that
     # the per-layer indexer and sparse-attention backends all point to
     # the target's buffer.
+    # Not yet an accessor: the target backbone's shared top-k buffer.
+    target_inner = getattr(get_language_model(target_model), "model", None)
     if hasattr(target_inner, "topk_indices_buffer"):
         target_buffer = target_inner.topk_indices_buffer
         if target_buffer is not None:

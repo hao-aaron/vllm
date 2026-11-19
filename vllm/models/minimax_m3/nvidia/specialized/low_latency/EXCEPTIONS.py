@@ -3,14 +3,11 @@
 # ruff: noqa: E501
 """Core internals this directory still reaches directly (Rule 1).
 
-Kept exact by tests/specialized/test_rule1_lint.py; each entry is a
-missing piece of `vllm.specialized`."""
+Kept exact by tests/specialized/test_rules.py; each entry is a missing piece
+of `vllm.specialized`, and each MUTATIONS entry a write to be removed."""
 
 EXCEPTIONS = {
     "vllm._custom_ops": "fused CUDA op in the core extension",
-    "vllm.config": "engine settings at build",
-    "vllm.distributed.device_communicators.cuda_wrapper": "peer transport; not in services yet",
-    "vllm.distributed.parallel_state": "peer transport; not in services yet",
     "vllm.forward_context": "step metadata; needs prepare_inputs",
     "vllm.model_executor.layers.fused_allreduce_gemma_rms_norm": "shared layer ops",
     "vllm.model_executor.layers.fused_moe.moe_output": "MoE output types",

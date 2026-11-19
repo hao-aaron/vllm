@@ -41,6 +41,7 @@ from .model import (
     _num_fused_shared_experts,
     get_sparse_topk_buffer_width,
     get_spec_layer_idx_from_weight_name,
+    wire_kpool_stage,
 )
 
 
@@ -206,6 +207,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    # What a specialized subclass may override besides the `Model` hooks.
+    EXTENSION_POINTS = ("predictor_cls", "indexer_kpool_stage")
     predictor_cls: type[Glm5NextMultiTokenPredictor] = Glm5NextMultiTokenPredictor
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -224,6 +227,11 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             Glm5NextMoE,
             enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
+        wire_kpool_stage(self, Glm5NextMTP)
+
+    def indexer_kpool_stage(self) -> typing.Any:
+        """Extension point: see `Glm5NextForCausalLM.indexer_kpool_stage`."""
+        return None
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers

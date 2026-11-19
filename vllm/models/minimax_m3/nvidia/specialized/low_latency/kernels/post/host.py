@@ -24,7 +24,8 @@ import threading
 
 import torch
 
-from .._comm import MAX_PEERS
+from vllm.specialized.services import MAX_PEERS
+
 from .._exchange import CLUSTER, PUSH_PARAMS_BYTES, PUSH_PARAMS_FMT
 
 H = 6144

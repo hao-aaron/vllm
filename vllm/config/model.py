@@ -394,8 +394,6 @@ class ModelConfig:
     specialized_choice: str | None = None
     """Set by routing: module of the chosen specialized directory, "" for the
     general model, None before routing."""
-    specialized_verified: bool = False
-    """Set once routing has re-checked the choice on the resolved config."""
     sleep_preserve_parameter_names: list[str] = field(default_factory=list)
     """Parameter-name globs to preserve across level-2 sleep.
     Use target globs for frozen Engram table weights and scales omitted by the

@@ -3,11 +3,10 @@
 # ruff: noqa: E501
 """Core internals this directory still reaches directly (Rule 1).
 
-Kept exact by tests/specialized/test_rule1_lint.py; each entry is a
-missing piece of `vllm.specialized`."""
+Kept exact by tests/specialized/test_rules.py; each entry is a missing piece
+of `vllm.specialized`, and each MUTATIONS entry a write to be removed."""
 
 EXCEPTIONS = {
-    "vllm.config": "engine settings at build",
     "vllm.forward_context": "step metadata; needs prepare_inputs",
     "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16": "CuTe DSL GEMMs; shared-op candidate",
     "vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm": "CuTe DSL GEMMs; shared-op candidate",
@@ -27,6 +26,5 @@ EXCEPTIONS = {
 MUTATIONS = {
     "indexer.forward = ...": "patches forward of a general module",
     "module.quant_method = ...": "swaps a general layer's quant_method",
-    "sparse_indexer.SPECIALIZED_KPOOL = ...": "general-tier module global",
     "w.forward = ...": "patches forward of a general module",
 }

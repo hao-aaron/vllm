@@ -41,8 +41,9 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.specialized.services import PeerBuffer, PeerTransport
+
 from . import _arch, _dtypes, _exchange
-from ._comm import PeerBuffer, PeerTransport
 
 HIDDEN = 6144
 HEAD_DIM = 128

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks of the specialized-directory rules: imports and mutations match
-EXCEPTIONS.py (Rule 1), declarations are import-light, and every directory
-has mirrored tests (Rule 4)."""
+EXCEPTIONS.py and subclasses override only what they may (Rule 1),
+declarations are import-light, and every directory has mirrored tests (Rule 4)."""
 
 import ast
 import importlib
@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 from vllm.specialized import _lint
-from vllm.specialized._routing import LANGUAGE_MODEL
 
 DIRS = _lint.directories()
 REPO = _lint.VLLM_ROOT.parent
@@ -37,6 +36,8 @@ def test_rule1_matches_exceptions(directory):
         f"new={sorted(set(found.mutations) - set(mutations))} "
         f"stale={sorted(set(mutations) - set(found.mutations))}"
     )
+    # Hooks, accessors and EXTENSION_POINTS only; never __init__.
+    assert not _lint.overrides(directory)
 
 
 @pytest.mark.parametrize("directory", DIRS, ids=_id)
@@ -68,10 +69,9 @@ def _class_exists(directory: Path, ref: str) -> bool:
 def test_model_refs_and_routing_entry(directory):
     module = _lint.module_of(directory / "__init__.py")
     d = importlib.import_module(module)
-    refs = d.MODEL.values() if isinstance(d.MODEL, dict) else [d.MODEL]
-    refs = [*refs, *getattr(d, "DRAFT_MODEL", {}).values()]
+    refs = [*d.MODEL.values(), *getattr(d, "DRAFT_MODEL", {}).values()]
     for ref in refs:
-        assert ref == LANGUAGE_MODEL or _class_exists(directory, ref), ref
+        assert _class_exists(directory, ref), ref
     family = ".".join(module.split(".")[:3])
     table = importlib.import_module(f"{family}.routing").SPECIALIZED
     listed = {f"{family}.{rel}" for rels in table.values() for rel in rels}

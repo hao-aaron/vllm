@@ -34,11 +34,10 @@ def _settings(quant: dict, **over):
             use_replayssm=False,
             use_kda_recoverssm=False,
         ),
-        kernel_config=NS(moe_backend="auto"),
         scheduler_config=NS(async_scheduling=True, max_num_seqs=256),
         speculative_config=None,
         kv_transfer_config=None,
-        compilation_config=NS(cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32, 64]),
+        additional_config={"minimax_m3_fused_finalize_max_tokens": 64},
     )
     for path, value in over.items():
         obj = s
@@ -55,8 +54,9 @@ def _base(family: str) -> RouteConfig:
             f"{GLM}.nvidia.specialized.low_latency"
         ).GEOMETRY
         hf, ckpt, quant = NS(**geometry), "fp8", {"weight_block_size": [128, 128]}
+        experts = None
     else:
-        hf, ckpt, quant = NS(), "mxfp8", {"moe_quant_algo": "NVFP4"}
+        hf, ckpt, quant, experts = NS(), "modelopt_mxfp8", {}, "nvfp4"
     return RouteConfig(
         platform="cuda",
         arch="sm100",
@@ -66,9 +66,11 @@ def _base(family: str) -> RouteConfig:
         dtype="bfloat16",
         max_model_len=8192,
         checkpoint=ckpt,
+        expert_quantization=experts,
         hf_config=hf,
         kv_cache_dtype="fp8",
         attention_backend=None,
+        moe_backend="auto",
         tp=4,
         pp=1,
         dp=1,
@@ -79,6 +81,7 @@ def _base(family: str) -> RouteConfig:
         speculation=None,
         num_speculative_tokens=0,
         graph_mode="FULL_AND_PIECEWISE",
+        capture_sizes=frozenset({1, 2, 4, 8, 16, 32, 64}),
         compile=False,
         role="colocated",
         features=frozenset(),
@@ -170,6 +173,15 @@ TABLE = [
         "general",
     ),
     (MM, "block 64", {"block_size": 64}, {}, True, "general"),
+    (MM, "bf16 experts", {"expert_quantization": None}, {}, True, "general"),
+    (
+        MM,
+        "finalize cap 32",
+        {},
+        {"additional_config": {}},
+        True,
+        "general",
+    ),
     (MM, "nvfp4 kv", {"kv_cache_dtype": "nvfp4"}, {}, True, "general"),
     (
         MM,
@@ -196,19 +208,12 @@ TABLE = [
         "general",
     ),
     (MM, "sleep mode", {"features": frozenset({"sleep_mode"})}, {}, True, "general"),
-    (
-        MM,
-        "megamoe",
-        {},
-        {"kernel_config.moe_backend": "deep_gemm_mega_moe"},
-        True,
-        "general",
-    ),
+    (MM, "megamoe", {"moe_backend": "deep_gemm_mega_moe"}, {}, True, "general"),
     (
         MM,
         "no small graphs",
+        {"capture_sizes": frozenset({4, 128})},
         {},
-        {"compilation_config.cudagraph_capture_sizes": [128]},
         True,
         "general",
     ),
@@ -231,6 +236,14 @@ def test_routing_table(
     )
     cfg = dataclasses.replace(base, settings=settings, **over)
     assert _route(family, cfg, pinned) == expected
+
+
+def test_decline_names_the_flag():
+    support = importlib.import_module(f"{MM}.nvidia.specialized.low_latency").SUPPORTS
+    cfg = dataclasses.replace(_base(MM), block_size=64)
+    assert support.reasons(cfg) == [
+        "block_size is 64, needs 128 (set --block-size 128)"
+    ]
 
 
 def test_worker_recheck_uses_rank_local_facts_only():

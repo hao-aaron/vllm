@@ -392,16 +392,16 @@ class SpecializedDecode(LayerStages):
                         layer.self_attn,
                         self.policy.tokens("dsa_value_up", "cute"),
                     )
+        # The sparse indexers reach it through `indexer_kpool_stage`.
+        self.kpool: Any = None
         if self.policy.enabled("dsa_kpool"):
-            from vllm.models.glm5next.nvidia import sparse_indexer
-
             from ..kpool import KpoolStage
 
             attentions = [
                 layer.self_attn for layer in self.layers if layer.layer_kind == "mla"
             ]
             kpool = KpoolStage(attentions, MAX_TOKENS, self.layers[0].hc_attn_fn.device)
-            sparse_indexer.SPECIALIZED_KPOOL = kpool
+            self.kpool = kpool
             logger.info(
                 "Specialized decode kpool kernels (fused index remap: %s)", kpool.fuse
             )

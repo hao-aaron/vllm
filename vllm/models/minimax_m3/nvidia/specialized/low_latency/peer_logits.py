@@ -86,22 +86,13 @@ class PeerShards:
     ) -> None:
         from vllm.specialized import services
 
-        from .kernels._comm import make_transport
-
         group = services.groups.tp
         self.world, self.rank = group.size, group.rank
         self.shard = weight.shape[0]
         self.dtype = weight.dtype
         self.max_rows = max_rows
         nbytes = max_rows * self.shard * weight.element_size()
-        self._transport = make_transport(
-            "auto",
-            group=group.device_group,
-            cpu_group=group.cpu_group,
-            rank=self.rank,
-            world=self.world,
-            capacity=nbytes + extra_bytes + 8192,
-        )
+        self._transport = services.comm.peer_arena(nbytes + extra_bytes + 8192)
         logits = self._transport.alloc(name, nbytes)
         flags = self._transport.alloc(name + "_flags", 8 * self.world)
         self.local = logits.local.view(self.dtype).view(max_rows, self.shard)

@@ -123,6 +123,14 @@ class ModelState(ABC):
             supported_tasks.append("realtime")
         return tuple(supported_tasks)
 
+    def attach_draft(self, draft: nn.Module) -> None:
+        """Called once the target and its draft model are both loaded."""
+        return None
+
+    def warmup(self) -> None:
+        """JIT compile and autotune, once, before memory profiling."""
+        return None
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         return None
 

@@ -88,12 +88,6 @@ SUPPORTS = Support(
 )
 
 
-def defaults(cfg: RouteConfig) -> dict:
-    return {"compilation_config.cudagraph_mode": "FULL_AND_PIECEWISE"}
-
-
-MODEL = {
-    "Glm5NextForConditionalGeneration": "model:LowLatencyGlm5NextVL",
-    "Glm5NextForCausalLM": "model:LowLatencyGlm5Next",
-}
+# The VL wrapper stays general and builds this text model through the registry.
+MODEL = {"Glm5NextForCausalLM": "model:LowLatencyGlm5Next"}
 DRAFT_MODEL = {"mtp": "draft:LowLatencyGlm5NextMTP"}

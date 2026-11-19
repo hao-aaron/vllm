@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import torch
 
+from vllm.specialized.services import PeerTransport
+
 from .. import _arch
-from .._comm import PeerTransport
 from .._exchange import bucket, push_workspace
 from ..allreduce_norm import RCTR_STRIDE, RouterExchangeSlot
 from . import host as gemv

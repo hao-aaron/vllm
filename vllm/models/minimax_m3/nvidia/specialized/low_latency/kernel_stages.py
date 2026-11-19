@@ -109,12 +109,13 @@ from .stock import (
 )
 
 if TYPE_CHECKING:
+    from vllm.specialized.services import PeerTransport
+
     from ...model import (
         MiniMaxM3DecoderLayer,
         MiniMaxM3Model,
         MiniMaxM3MoE,
     )
-    from .kernels._comm import PeerTransport
     from .runtime.decode import DecodeStep
     from .stages import LayerInput, PendingFFN
 
@@ -527,7 +528,8 @@ class KernelContext:
             ok[stage] = bool(flag)
 
     def _allocate_peer_memory(self, want: list[str]) -> None:
-        from .kernels._comm import make_transport
+        from vllm.specialized import services
+
         from .kernels._exchange import exchange_words, push_workspace
 
         needs_g3 = any(s in want for s in ("front", "o_proj", "allreduce_norm", "moe"))
@@ -554,14 +556,7 @@ class KernelContext:
             + n_rx * rx_bytes
             + n_allocs * _ARENA_ALIGN
         )
-        self.transport = make_transport(
-            "auto",
-            group=self.device_group,
-            cpu_group=self.cpu_group,
-            rank=self.rank,
-            world=self.tp,
-            capacity=capacity,
-        )
+        self.transport = services.comm.peer_arena(capacity)
         logger.info(
             "specialized decode: %s peer transport, %d ranks, %d B arena",
             self.transport.kind,

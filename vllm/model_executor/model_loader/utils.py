@@ -95,10 +95,10 @@ def initialize_model(
     if model_config is None:
         model_config = vllm_config.model_config
     if model_class is None:
-        model_class, _ = get_model_architecture(model_config)
+        model_class, arch = get_model_architecture(model_config)
         from vllm.specialized._routing import model_class as specialized_class
 
-        model_class = specialized_class(vllm_config, model_config, model_class)
+        model_class = specialized_class(vllm_config, model_config, model_class, arch)
 
     from vllm.model_executor.models.expert_substitution import (
         as_expert_substitution_model,

@@ -10,11 +10,10 @@ import importlib
 import importlib.metadata
 import importlib.util
 from dataclasses import dataclass, field
-from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.specialized.declare import DEFAULT_KEYS, FEATURES, RouteConfig, Support
+from vllm.specialized.declare import FEATURES, RouteConfig, Support
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -22,7 +21,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 MODES = ("auto", "off", "require")
-LANGUAGE_MODEL = "language_model"
 # Libraries probed for `Support.libraries`.
 PROBED_LIBRARIES = ("flashinfer-python", "nvidia-cutlass-dsl", "torch")
 
@@ -32,7 +30,6 @@ class Decision:
     family: str | None
     choice: str | None = None
     lines: list[str] = field(default_factory=list)
-    defaults: dict[str, Any] = field(default_factory=dict)
 
 
 def platform_key() -> str:
@@ -104,6 +101,22 @@ def _features(cfg: "VllmConfig") -> frozenset[str]:
     return frozenset(k for k, v in used.items() if v)
 
 
+def _checkpoint(cfg: "VllmConfig") -> str:
+    """Core's canonical quantization name, after aliases are resolved."""
+    if cfg.quant_config is not None:
+        return cfg.quant_config.get_name()
+    return cfg.model_config.quantization or "none"
+
+
+def _expert_quantization(cfg: "VllmConfig") -> str | None:
+    """The routed experts' format when the checkpoint names one apart."""
+    quant = getattr(cfg.model_config.hf_config, "quantization_config", None)
+    if quant is not None and not isinstance(quant, dict):
+        quant = quant.to_dict()
+    algo = (quant or {}).get("moe_quant_algo")
+    return str(algo).lower() if algo else None
+
+
 def route_config(cfg: "VllmConfig") -> RouteConfig:
     from vllm.config import CompilationMode
 
@@ -125,10 +138,12 @@ def route_config(cfg: "VllmConfig") -> RouteConfig:
         libraries=_libraries(),
         dtype=str(mc.dtype).removeprefix("torch."),
         max_model_len=mc.max_model_len,
-        checkpoint=mc.quantization or "none",
+        checkpoint=_checkpoint(cfg),
+        expert_quantization=_expert_quantization(cfg),
         hf_config=mc.hf_text_config,
         kv_cache_dtype=str(cc.cache_dtype),
         attention_backend=None if backend is None else backend.name,
+        moe_backend=cfg.kernel_config.moe_backend,
         tp=pc.tensor_parallel_size,
         pp=pc.pipeline_parallel_size,
         dp=pc.data_parallel_size,
@@ -141,76 +156,13 @@ def route_config(cfg: "VllmConfig") -> RouteConfig:
         speculation=None if spec is None else spec.method,
         num_speculative_tokens=0 if spec is None else spec.num_speculative_tokens,
         graph_mode=None if graph_mode is None else graph_mode.name,
+        capture_sizes=frozenset(cfg.compilation_config.cudagraph_capture_sizes or ()),
         compile=cfg.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE,
         role=role,
         features=_features(cfg),
         block_size=cc.block_size,
         settings=cfg,
     )
-
-
-def _get(cfg: Any, key: str) -> Any:
-    obj = cfg
-    for part in key.split("."):
-        obj = getattr(obj, part)
-    return obj
-
-
-def _set(cfg: Any, key: str, value: Any) -> None:
-    *path, last = key.split(".")
-    obj = cfg
-    for part in path:
-        obj = getattr(obj, part)
-    setattr(obj, last, value)
-
-
-def _is_unset(cfg: Any, key: str) -> bool:
-    if key == "cache_config.block_size":
-        # Platforms fill a block size before routing; only the user's counts.
-        return not cfg.cache_config.user_specified_block_size
-    value = _get(cfg, key)
-    return value is None or value == "auto"
-
-
-def _coerce(key: str, value: Any) -> Any:
-    if key == "compilation_config.cudagraph_mode" and isinstance(value, str):
-        from vllm.config import CUDAGraphMode
-
-        return CUDAGraphMode[value]
-    if key == "attention_config.backend" and isinstance(value, str):
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-        return AttentionBackendEnum[value]
-    return value
-
-
-def _apply_defaults(cfg: "VllmConfig", mod: ModuleType) -> dict[str, Any]:
-    """Fill the directory's defaults into unset keys; returns what was filled."""
-    fn = getattr(mod, "defaults", None)
-    if fn is None:
-        return {}
-    proposed = fn(route_config(cfg))
-    filled = {}
-    for key, value in proposed.items():
-        if key not in DEFAULT_KEYS:
-            raise ValueError(f"{mod.__name__}.defaults sets {key}, not allowed")
-        if _is_unset(cfg, key):
-            filled[key] = (_get(cfg, key), value)
-            _set(cfg, key, _coerce(key, value))
-        else:
-            logger.info(
-                "%s: keeping user setting %s=%s (default %s)",
-                mod.__name__,
-                key,
-                _get(cfg, key),
-                value,
-            )
-    return filled
-
-
-def _undo(cfg: "VllmConfig", filled: dict[str, Any]) -> None:
-    for key, (old, _) in filled.items():
-        _set(cfg, key, old)
 
 
 def _short(module: str, family: str) -> str:
@@ -222,7 +174,7 @@ def _matches_pin(module: str, pin: str) -> bool:
 
 
 def route(cfg: "VllmConfig") -> Decision:
-    """Pick a directory; applies its defaults to `cfg`. Runs once, at startup."""
+    """Pick a directory on the resolved config. Never changes a setting."""
     mc = cfg.model_config
     family = family_of(mc)
     d = Decision(family=family)
@@ -252,16 +204,11 @@ def route(cfg: "VllmConfig") -> Decision:
         if mode == "auto" and not support.default_on:
             reasons_by[name] = ["default_on=False (pin it or use require)"]
             continue
-        if isinstance(mod.MODEL, dict) and arch not in mod.MODEL:
-            reasons_by[name] = [f"no MODEL for architecture {arch}"]
-            continue
-        filled = _apply_defaults(cfg, mod)
         reasons = support.reasons(route_config(cfg))
         if reasons:
-            _undo(cfg, filled)
             reasons_by[name] = reasons
             continue
-        d.choice, d.defaults = name, {k: v for k, (_, v) in filled.items()}
+        d.choice = name
         break
     if d.choice is None and mode != "auto":
         detail = "; ".join(
@@ -271,10 +218,6 @@ def route(cfg: "VllmConfig") -> Decision:
     d.lines.append(f"{arch}: {_short(d.choice, family) if d.choice else 'general'}")
     for n, r in reasons_by.items():
         d.lines.append(f"  {_short(n, family)}: {'; '.join(r)}")
-    if d.defaults:
-        d.lines.append(
-            "  defaults: " + ", ".join(f"{k}={v}" for k, v in d.defaults.items())
-        )
     return d
 
 
@@ -302,9 +245,9 @@ def _map_legacy_switch(cfg: "VllmConfig") -> None:
 
 
 def route_and_record(cfg: "VllmConfig") -> None:
-    """VllmConfig hook: route, record the choice on the model config, print."""
+    """VllmConfig hook, last in `__post_init__`: route, record, print."""
     mc = cfg.model_config
-    # Once per engine: derived configs (draft overrides) share this model config.
+    # Once per engine: derived configs (the draft's) reuse the stored choice.
     if mc is None or mc.is_submodel_config or mc.specialized_choice is not None:
         return
     _map_legacy_switch(cfg)
@@ -312,28 +255,6 @@ def route_and_record(cfg: "VllmConfig") -> None:
     mc.specialized_choice = d.choice or ""
     for line in d.lines:
         logger.info("Specialized routing: %s", line)
-
-
-def verify_resolved(cfg: "VllmConfig") -> None:
-    """Re-check the choice once core has resolved every setting."""
-    mc = cfg.model_config
-    if mc is None or mc.is_submodel_config or mc.specialized_verified:
-        return
-    mc.specialized_verified = True
-    if not mc.specialized_choice:
-        return
-    mod = importlib.import_module(mc.specialized_choice)
-    reasons = mod.SUPPORTS.reasons(route_config(cfg))
-    if not reasons:
-        return
-    msg = f"{mc.specialized_choice} declined after config resolution: " + "; ".join(
-        reasons
-    )
-    if mc.specialized_model == "auto":
-        logger.warning("Specialized routing: %s; using the general model.", msg)
-        mc.specialized_choice = ""
-    else:
-        raise ValueError(msg)
 
 
 def _rank_local(support: Support) -> Support:
@@ -365,50 +286,34 @@ def _worker_agrees(cfg: "VllmConfig", choice: str) -> bool:
 _agreed: dict[str, bool] = {}
 
 
-def _arch_of(model_config: "ModelConfig") -> str:
-    return (model_config.architectures or [""])[0]
-
-
 def model_class(
-    vllm_config: "VllmConfig", model_config: "ModelConfig", general_cls: type
+    vllm_config: "VllmConfig",
+    model_config: "ModelConfig",
+    general_cls: type,
+    arch: str,
 ) -> type:
-    """The class to build: the chosen directory's MODEL / DRAFT_MODEL, or general."""
+    """The class to build for one architecture resolution: the chosen directory's
+    MODEL entry for it, DRAFT_MODEL for the draft, otherwise the general class."""
     target = vllm_config.model_config
     choice = target.specialized_choice
-    spec = vllm_config.speculative_config
-    is_draft = spec is not None and model_config is spec.draft_model_config
     if not choice:
         return general_cls
     mod = importlib.import_module(choice)
-    table = mod.MODEL if isinstance(mod.MODEL, dict) else {}
-    if is_draft:
-        pass
-    elif model_config.is_submodel_config:
-        # A wrapper's language model: specialized only when MODEL maps the
-        # wrapper to "language_model" (the wrapper then stays general).
-        if LANGUAGE_MODEL not in table.values() or general_cls.__name__ not in table:
-            return general_cls
-    elif model_config is not target or table.get(_arch_of(target)) == LANGUAGE_MODEL:
+    spec = vllm_config.speculative_config
+    if spec is not None and model_config is spec.draft_model_config:
+        ref = getattr(mod, "DRAFT_MODEL", {}).get(spec.method)
+    else:
+        ref = mod.MODEL.get(arch)
+    if ref is None:  # unlisted architectures stay general
         return general_cls
     if choice not in _agreed:
         _agreed[choice] = _worker_agrees(vllm_config, choice)
+        if not _agreed[choice] and target.specialized_model != "auto":
+            raise ValueError(f"a rank declines {choice}")
         if not _agreed[choice]:
-            if target.specialized_model != "auto":
-                raise ValueError(f"a rank declines {choice}")
             logger.warning("Specialized routing: a rank declines %s; general", choice)
     if not _agreed[choice]:
         return general_cls
-    if not is_draft:
-        ref = mod.MODEL
-        if isinstance(ref, dict):  # one class per registered architecture
-            ref = ref.get(general_cls.__name__)
-            if ref is None:
-                raise ValueError(f"{choice} has no MODEL for {general_cls.__name__}")
-    else:
-        assert spec is not None
-        ref = getattr(mod, "DRAFT_MODEL", {}).get(spec.method)
-        if ref is None:
-            return general_cls
     module, _, cls_name = ref.partition(":")
     cls = getattr(importlib.import_module(f"{choice}.{module}"), cls_name)
     logger.info_once("Specialized model: building %s.%s", choice, cls_name)

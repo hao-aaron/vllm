@@ -5,9 +5,9 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
+from vllm.v1.worker.gpu.model_states.accessors import get_lm_head
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
-    get_target_lm_head,
     maybe_share_target_embed,
 )
 
@@ -46,20 +46,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
-    target_language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    # MuseGlimmerForCausalLM marks its inner MuseGlimmerModel as the language
-    # model, so get_language_model() already returns the inner module and has
-    # no .model of its own.
-    target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
 
-    maybe_share_target_embed(dflash_model, draft_inner, target_inner)
+    maybe_share_target_embed(dflash_model, draft_inner, target_model)
 
-    target_lm_head = get_target_lm_head(target_model, target_language_model)
+    target_lm_head = get_lm_head(target_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
     if (
         target_lm_head is not None

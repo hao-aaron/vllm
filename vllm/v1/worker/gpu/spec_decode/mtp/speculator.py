@@ -3,6 +3,7 @@
 
 import torch.nn as nn
 
+from vllm.v1.worker.gpu.model_states.accessors import draft_hook
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
@@ -18,10 +19,11 @@ class MTPSpeculator(TargetDependentARSpeculator):
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         draft_model = load_eagle_model(target_model, self.vllm_config)
-        if hasattr(draft_model.model, "set_prefill_rows"):
+        set_prefill_rows = draft_hook(draft_model, "set_prefill_rows")
+        if set_prefill_rows is not None:
             # bind before capture; replay reads the indices updated in place
             # by prepare_prefill_inputs, including rejected and padded rows.
-            draft_model.model.set_prefill_rows(self.last_token_indices)
+            set_prefill_rows(self.last_token_indices)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
             spec_config.draft_model_config.hf_config

@@ -14,7 +14,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 
 from collections.abc import Iterable
 from functools import partial
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -139,15 +139,13 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
+from .fused_finalize import fused_finalize_max_tokens
+
 if TYPE_CHECKING:
     from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import GemmRsAr
 
 logger = init_logger(__name__)
 
-# Largest batch whose MoE top-k finalize runs inside the next layer's fused
-# all-reduce + input norm + MXFP8 quantization. Larger batches finalize in the
-# MoE and use the regular fused all-reduce + norm.
-FUSED_MOE_FINALIZE_MAX_TOKENS = 32
 
 _QKV_FUSED_EPILOGUE_MIN_TOKENS = 512
 
@@ -1415,9 +1413,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
-    # Most tokens whose MoE top-k finalize is deferred to the next layer.
-    fused_finalize_max_tokens: ClassVar[int] = FUSED_MOE_FINALIZE_MAX_TOKENS
-
     fall_back_to_pt_during_load = False
     supports_aux_hidden_states_over_pp = True
 
@@ -1511,7 +1506,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         if not supports_fused_moe_finalize(vllm_config):
             return
-        max_tokens = self.fused_finalize_max_tokens
+        max_tokens = fused_finalize_max_tokens(vllm_config)
         layers = self.layers[self.start_layer : self.end_layer]
         deferring = [
             layer.block_sparse_moe
@@ -1655,7 +1650,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
-    backbone_cls: ClassVar[type[MiniMaxM3Model]] = MiniMaxM3Model
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
     packed_modules_mapping = {
@@ -1686,7 +1680,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = self.backbone_cls(
+        self.model = MiniMaxM3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:

@@ -666,8 +666,8 @@ class FusedRemap:
 
 class KpoolStage:
     """The kpool indexer decode kernels inside planned steps (stage
-    `dsa_kpool`), reached from the stock indexer through
-    `sparse_indexer.SPECIALIZED_KPOOL`.
+    `dsa_kpool`), reached from the stock indexer through the model's
+    `indexer_kpool_stage` extension point.
 
     With `fuse` every DSA layer's index group converts through `FusedRemap`:
     the indexer then leaves its uniform decode rows as pool ids (`defer`) and
