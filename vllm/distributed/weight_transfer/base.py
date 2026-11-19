@@ -754,17 +754,23 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
                 self._warned_unpausable = True
             yield
             return
-        if not self._holds_pause:
-            if client.is_paused():
-                yield
-                return
+        paused = client.is_paused()
+        if paused and not self._holds_pause:
+            yield
+            return
+        if not paused:
+            # Set first: a pause that times out client-side may still land.
+            self._holds_pause = True
             client.pause_generation(
                 mode=self.pause_mode, clear_cache=self.pause_clear_cache
             )
-            self._holds_pause = True
         yield
-        client.resume_generation()
-        self._holds_pause = False
+        try:
+            client.resume_generation()
+            self._holds_pause = False
+        except Exception:
+            # The weights are installed; the next send_weights retries the resume.
+            logger.exception("Failed to resume generation after a weight update")
 
     @classmethod
     @abstractmethod
