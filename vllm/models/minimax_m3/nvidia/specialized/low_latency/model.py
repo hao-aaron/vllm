@@ -8,7 +8,7 @@ import weakref
 import torch
 import torch.nn as nn
 
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.models.minimax_m3.nvidia.model import MiniMaxM3SparseForCausalLM
 from vllm.specialized import Model
@@ -17,6 +17,7 @@ from .config import MAX_REQUESTS, MAX_SPECULATIVE_TOKENS, decode_config
 from .peer_logits import peer_logits, peer_logits_unsupported
 from .runtime.decode import SpecializedDecode
 from .runtime.warmup import warm_up
+from .step import AttnStep
 
 logger = init_logger(__name__)
 
@@ -25,6 +26,7 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
     _decode: SpecializedDecode | None = None
     _peer_logits = None
     _draft: weakref.ref | None = None
+    _attn: AttnStep | None = None
 
     def process_weights_after_loading(self) -> None:
         super().process_weights_after_loading()
@@ -44,6 +46,39 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
                 MAX_REQUESTS * (1 + MAX_SPECULATIVE_TOKENS),
                 "target_logits",
             )
+
+    def prepare_attn(
+        self,
+        input_batch,
+        cudagraph_mode,
+        block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture: bool = False,
+        ubatch_idx: int = 0,
+    ):
+        """Also keeps the step's metadata for the next forward's plan (FULL
+        captures pass for_capture=True with mode NONE)."""
+        metadata = super().prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture,
+            ubatch_idx,
+        )
+        groups = kv_cache_config.kv_cache_groups
+        slots = {
+            name: slot_mapping
+            for slot_mapping, group in zip(slot_mappings, groups)
+            for name in group.layer_names
+        }
+        full = for_capture or cudagraph_mode == CUDAGraphMode.FULL
+        self._attn = AttnStep(metadata, slots, full)
+        return metadata
 
     def attach_draft(self, draft: nn.Module) -> None:
         self._draft = weakref.ref(draft)
@@ -69,7 +104,11 @@ class LowLatencyMiniMaxM3(Model, MiniMaxM3SparseForCausalLM):
         **kwargs,
     ):
         decode = self._decode
-        step = None if decode is None else decode.plan(positions, intermediate_tensors)
+        step = (
+            None
+            if decode is None
+            else decode.plan(positions, intermediate_tensors, self._attn)
+        )
         if decode is None or step is None:
             return super().forward(
                 input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs

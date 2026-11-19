@@ -71,7 +71,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 import torch.distributed as dist
 
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import (
     MoEOutput,
@@ -80,6 +79,7 @@ from vllm.model_executor.layers.fused_moe.moe_output import (
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
+from . import step as step_ctx
 from .config import PAGE_SIZE, CacheDtypes, DecodeConfig
 from .kernels import FRONT_MAX_ROWS, MAX_ROWS, PAIR_MAX_ROWS, fallback_stages
 from .kernels._mxfp8 import mxfp8_linear_nk
@@ -940,8 +940,7 @@ class KernelContext:
         """int32 [rows, max_pages]: row t's request's block-table row (logical
         KV page -> physical page), from the main attention metadata; once per
         block table and step."""
-        attn_metadata = get_forward_context().attn_metadata
-        assert isinstance(attn_metadata, dict)
+        attn_metadata = step_ctx.current().metadata
         decode = attn_metadata[attn.layer_name].decode  # type: ignore[attr-defined]
         block_table = decode.block_table
         key = block_table.data_ptr()
@@ -1107,8 +1106,7 @@ class KernelFront(_KernelStage, FrontStage):
             raise TypeError(
                 f"kernel front: the previous FFN's output is a {type(pending)}"
             )
-        slot_mappings = get_forward_context().slot_mapping
-        assert isinstance(slot_mappings, dict)
+        slot_mappings = step_ctx.current().slots
         index_cache = attn.indexer.index_cache
         assert lk.q_fp8 is not None and lk.q_bf16 is not None
         assert lk.index_q is not None and lk.r_mid is not None

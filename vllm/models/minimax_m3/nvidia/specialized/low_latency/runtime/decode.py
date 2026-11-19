@@ -37,12 +37,11 @@ from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 import torch
 from torch import nn
 
-from vllm.config import CUDAGraphMode
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.sequence import IntermediateTensors
 
 from ..config import DecodeConfig, max_rows
 from ..stages import Stages, StepStages
+from ..step import AttnStep, planned
 from ..stock import stock_stages
 
 if TYPE_CHECKING:
@@ -58,6 +57,7 @@ class DecodeStep(NamedTuple):
     # The implementation of every stage for this step.
     stages: StepStages
     executor: "SpecializedDecode"
+    attn: AttnStep
 
     def run(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> DecodeOutput:
         """The backbone's output after its embedding."""
@@ -93,17 +93,12 @@ def default_stages(
     return stages.for_cache_dtypes(config.cache_dtypes)
 
 
-def captures_pure_decode(prefixes: list[str]) -> bool:
-    """Whether the forward being captured into a CUDA graph is a FULL graph of
-    a pure decode step: not a PIECEWISE capture (Model Runner V2 captures FULL
-    graphs with the forward context's mode NONE, and PIECEWISE ones, which
-    report capturing too, with PIECEWISE), and attention metadata without
-    prefills for every attention layer and index cache in `prefixes`."""
-    context = get_forward_context()
-    attn_metadata = context.attn_metadata
-    if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE or not isinstance(
-        attn_metadata, dict
-    ):
+def captures_pure_decode(attn: AttnStep, prefixes: list[str]) -> bool:
+    """Whether the step being captured is a FULL graph of a pure decode step:
+    not a PIECEWISE capture, and attention metadata without prefills for every
+    attention layer and index cache in `prefixes`."""
+    attn_metadata = attn.metadata
+    if not attn.full_graph or not isinstance(attn_metadata, dict):
         return False
     for prefix in prefixes:
         metadata = attn_metadata.get(prefix)
@@ -189,6 +184,7 @@ class SpecializedDecode:
         self,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
+        attn: AttnStep | None,
     ) -> DecodeStep | None:
         """The step this forward runs, or None to run the stock layers: only
         FULL CUDA graph captures of pure decode steps of up to `max_rows`
@@ -197,22 +193,30 @@ class SpecializedDecode:
         if (
             intermediate_tensors is not None
             or not 0 < rows <= self.max_rows
-            or not is_forward_context_available()
+            or attn is None  # from the model's prepare_attn hook
         ):
             return None
         if not torch.cuda.is_current_stream_capturing():
             # The eager run before each capture (and every eager step) runs the stock
             # layers, which also compiles the stock kernels.
             return None
-        if not captures_pure_decode(self._prefixes):
+        if not captures_pure_decode(attn, self._prefixes):
             return None
-        return DecodeStep(rows=rows, stages=self.stages.select(rows), executor=self)
+        return DecodeStep(
+            rows=rows, stages=self.stages.select(rows), executor=self, attn=attn
+        )
 
     def run(
         self, step: DecodeStep, x: torch.Tensor, positions: torch.Tensor
     ) -> DecodeOutput:
         """The decoder layers and the final norm of the step, on the embedding
         `x`; returns what `MiniMaxM3Model.forward` returns."""
+        with planned(step.attn):
+            return self._run(step, x, positions)
+
+    def _run(
+        self, step: DecodeStep, x: torch.Tensor, positions: torch.Tensor
+    ) -> DecodeOutput:
         backbone = self.backbone
         aux_layers = backbone.aux_hidden_state_layers
         aux_hidden_states: list[torch.Tensor] = []
