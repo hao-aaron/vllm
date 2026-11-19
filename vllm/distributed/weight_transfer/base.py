@@ -394,9 +394,8 @@ class TrainerInitInfo:
     backend: ClassVar[str]
 
     rank: int = field(kw_only=True)
-    pause_mode: "PauseMode | None" = field(default="keep", kw_only=True)
-    """How `send_weights` pauses generation around the apply; `None` leaves
-    pausing to the caller."""
+    pause_mode: "PauseMode" = field(default="keep", kw_only=True)
+    """How `send_weights` pauses generation around the apply."""
     pause_clear_cache: bool = field(default=True, kw_only=True)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -413,9 +412,9 @@ class TrainerInitInfo:
 
 
 def check_pause_mode(init_info: TrainerInitInfo) -> None:
-    if init_info.pause_mode not in (None, "abort", "wait", "keep"):
+    if init_info.pause_mode not in ("abort", "wait", "keep"):
         raise ValueError(
-            "pause_mode must be 'abort', 'wait', 'keep' or None, "
+            "pause_mode must be 'abort', 'wait' or 'keep', "
             f"got {init_info.pause_mode!r}"
         )
 
@@ -644,11 +643,10 @@ class VLLMWeightSyncClient(Protocol):
     inference side already accepts). Concurrency that some backends need
     (e.g. NCCL must run `update_weights` concurrently with the trainer-side
     broadcast) is the engine's responsibility, not the client's, so the
-    protocol stays a flat four-method surface that any wrapper can implement.
+    protocol stays a flat surface that any wrapper can implement.
 
     The protocol is structural (PEP 544), so user implementations need only
-    define these four methods — no import or subclassing required. Clients that
-    also implement `SupportsPauseGeneration` let `send_weights` pause for you.
+    define these methods — no import or subclassing required.
     """
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None: ...
@@ -659,18 +657,11 @@ class VLLMWeightSyncClient(Protocol):
 
     def finish_weight_update(self, weight_version: str | None = None) -> None: ...
 
-
-@runtime_checkable
-class SupportsPauseGeneration(Protocol):
-    """Optional client surface that lets `send_weights` pause generation."""
-
     def pause_generation(
         self, mode: "PauseMode" = "keep", clear_cache: bool = True
     ) -> None: ...
 
     def resume_generation(self) -> None: ...
-
-    def is_paused(self) -> bool: ...
 
 
 class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
@@ -725,9 +716,8 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         # `is_sender`, so non-sender ranks never touch the wire.
         self.client = client
         self.source = source
-        self.pause_mode: PauseMode | None = "keep"
+        self.pause_mode: PauseMode = "keep"
         self.pause_clear_cache = True
-        self._warned_unpausable = False
 
     def _apply_pause_config(self, init_info: TrainerInitInfo) -> None:
         """Take the pause settings from the init info.
@@ -740,28 +730,15 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
 
     @contextmanager
     def _pause_for_update(self) -> Iterator[None]:
-        """Pause generation around the apply unless the caller already paused.
+        """Pause generation on the sender around the apply; resume on success.
 
-        Resumes only on success: after a failure generation stays paused (a
-        retry then runs under that pause) until the caller resumes it.
+        After a failure generation stays paused until a retry succeeds or the
+        caller resumes it, so partial weights never serve.
         """
+        if not self.is_sender:
+            yield
+            return
         client = self.client
-        if not self.is_sender or self.pause_mode is None:
-            yield
-            return
-        if not isinstance(client, SupportsPauseGeneration):
-            if not self._warned_unpausable:
-                logger.warning(
-                    "%s does not implement SupportsPauseGeneration; "
-                    "send_weights will not pause generation.",
-                    type(client).__name__,
-                )
-                self._warned_unpausable = True
-            yield
-            return
-        if client.is_paused():
-            yield
-            return
         try:
             client.pause_generation(
                 mode=self.pause_mode, clear_cache=self.pause_clear_cache

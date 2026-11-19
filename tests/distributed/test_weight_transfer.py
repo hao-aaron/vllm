@@ -996,6 +996,12 @@ def trainer_send_from_source(
         def finish_weight_update(self, weight_version=None):
             pass
 
+        def pause_generation(self, mode="keep", clear_cache=True):
+            pass
+
+        def resume_generation(self):
+            pass
+
     engine = WeightTransferTrainerFactory.trainer_init(
         NCCLTrainerInitInfo(
             master_address=master_address,
@@ -1086,6 +1092,12 @@ def test_sparse_nccl_checkpoint_chunks_to_ep_local_experts_cpu(monkeypatch):
 
         def finish_weight_update(self):
             self.order.append("finish")
+
+        def pause_generation(self, mode="keep", clear_cache=True):
+            pass
+
+        def resume_generation(self):
+            pass
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -1810,24 +1822,26 @@ class RecordingClient:
     def finish_weight_update(self, weight_version: str | None = None) -> None:
         self.order.append("finish")
 
-
-class PausingRecordingClient(RecordingClient):
-    """A RecordingClient that also implements the pause methods."""
-
-    def __init__(self, paused: bool = False):
-        super().__init__()
-        self.paused = paused
+    # Pauses are tracked apart from `order`, which records the update lifecycle.
+    paused = False
 
     def pause_generation(self, mode="keep", clear_cache=True) -> None:
-        self.order.append(f"pause:{mode}")
         self.paused = True
 
     def resume_generation(self) -> None:
-        self.order.append("resume")
         self.paused = False
 
-    def is_paused(self) -> bool:
-        return self.paused
+
+class PausingRecordingClient(RecordingClient):
+    """A RecordingClient that also records pauses in `order`."""
+
+    def pause_generation(self, mode="keep", clear_cache=True) -> None:
+        self.order.append(f"pause:{mode}")
+        super().pause_generation(mode, clear_cache)
+
+    def resume_generation(self) -> None:
+        self.order.append("resume")
+        super().resume_generation()
 
 
 def _module_with(*pairs):
@@ -1960,15 +1974,13 @@ class TestTrainerManagedPause:
     """`send_weights` pauses only around the apply, via the ModelExpress engine."""
 
     @staticmethod
-    def _engine(client, **kwargs):
+    def _engine(client):
         from vllm.distributed.weight_transfer.modelexpress_trainer import (
             ModelExpressTrainerInitInfo,
         )
 
         return WeightTransferTrainerFactory.trainer_init(
-            ModelExpressTrainerInitInfo(
-                rank=0, worker_init_info={"model_name": "m"}, **kwargs
-            ),
+            ModelExpressTrainerInitInfo(rank=0, worker_init_info={"model_name": "m"}),
             client=client,
         )
 
@@ -1982,13 +1994,6 @@ class TestTrainerManagedPause:
         assert client.last_update_info == {"version_id": "v1"}
         assert not client.paused
 
-    @pytest.mark.parametrize("paused, pause_mode", [(True, "keep"), (False, None)])
-    def test_leaves_pause_to_caller(self, paused, pause_mode):
-        client = PausingRecordingClient(paused=paused)
-        self._engine(client, pause_mode=pause_mode).send_weights("v1")
-        assert client.order == ["init", "start", "update", "finish"]
-        assert client.paused == paused
-
     def test_failed_update_stays_paused(self):
         class FailingUpdate(PausingRecordingClient):
             def update_weights(self, update_info):
@@ -2001,15 +2006,9 @@ class TestTrainerManagedPause:
         assert client.paused
         assert "resume" not in client.order
 
-        # A retry runs under the leftover pause and leaves it to the caller.
+        # A successful retry pauses again and resumes.
         client.update_weights = lambda update_info: None
         engine.send_weights("v1")
-        assert client.paused
-        assert client.order.count("pause:keep") == 1
-
-        # Once the caller resumes, the next send pauses and resumes again.
-        client.resume_generation()
-        engine.send_weights("v2")
         assert client.order.count("pause:keep") == 2
         assert not client.paused
 
