@@ -1213,6 +1213,11 @@ class ShardedRDTTrainerWeightTransferEngine(
             )
             if k in os.environ
         }
+        # A UCX keepalive that fails on a hung worker leaves the producer unable
+        # to connect a restarted one; eviction already handles dead workers.
+        env_vars["UCX_KEEPALIVE_INTERVAL"] = os.environ.get(
+            "UCX_KEEPALIVE_INTERVAL", "inf"
+        )
         gpu_ids = ray.get_gpu_ids()
         if gpu_ids:
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
