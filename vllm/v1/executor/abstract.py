@@ -381,6 +381,18 @@ class Executor(ABC):
         exception."""
         raise NotImplementedError
 
+    def collective_rpc_deferred(
+        self, method: str, args: tuple = (), kwargs: dict | None = None
+    ) -> Future[list]:
+        """Call a worker method that returns a Future, without waiting for it.
+
+        Returns a Future for all workers' results. Here the workers are in this
+        process, so their Futures are gathered directly.
+        """
+        from vllm.v1.executor.deferred import gather_futures
+
+        return gather_futures(self.collective_rpc(method, args=args, kwargs=kwargs))
+
     def shutdown(self) -> None:
         """Shutdown the executor."""
         self.collective_rpc("shutdown")

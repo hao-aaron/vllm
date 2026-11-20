@@ -1733,11 +1733,12 @@ class Worker(WorkerBase):
         if self.weight_transfer_engine is not None:
             self.weight_transfer_engine.shutdown()
 
-    def stage_weights(self, update_info: dict | list[dict]) -> None:
-        """Start the engine's `stage_weights` on a background thread and return.
+    def stage_weights(self, update_info: dict | list[dict]) -> Future[None]:
+        """Start the engine's `stage_weights` on a background thread.
 
-        It runs while the engine serves; `start_weight_update` waits for it. A
-        later call overwrites the earlier staged version.
+        Returns its Future: the executor reports it to the caller when it is
+        done. `start_weight_update` waits for it. A later call overwrites the
+        earlier staged version.
         """
         self._check_weight_transfer_engine()
         engine = self.weight_transfer_engine
@@ -1751,7 +1752,9 @@ class Worker(WorkerBase):
             self._local_update_info(update_info)
         )
         if not engine.supports_staging:
-            return
+            done: Future[None] = Future()
+            done.set_result(None)
+            return done
         if self._staging_executor is None:
             device_index = self.device.index if self.device is not None else None
 
@@ -1769,22 +1772,13 @@ class Worker(WorkerBase):
         self._staging_future = self._staging_executor.submit(
             engine.stage_weights, typed_update_info
         )
-
-    def staging_done(self) -> bool:
-        """Whether the last `stage_weights` finished; raises its error, once."""
-        future = self._staging_future
-        if future is None:
-            return True
-        if not future.done():
-            return False
-        self._staging_future = None
-        future.result()
-        return True
+        return self._staging_future
 
     def _wait_for_staging(self) -> None:
+        # The staging error already went to the stage_weights caller.
         if (future := self._staging_future) is not None:
             self._staging_future = None
-            future.result()
+            future.exception()
 
     def has_incomplete_weight_update(self) -> bool:
         return bool(self._incomplete_weight_updates)

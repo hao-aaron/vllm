@@ -380,10 +380,10 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
-    async def stage_weights_async(self, update_info: Any) -> None:
+    def stage_weights(self, update_info: Any) -> None:
         raise NotImplementedError
 
-    async def staging_done_async(self) -> bool:
+    async def stage_weights_async(self, update_info: Any) -> None:
         raise NotImplementedError
 
     async def handle_fault(
@@ -477,6 +477,9 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
+
+    def stage_weights(self, update_info: Any) -> None:
+        self.engine_core.stage_weights(update_info).result()
 
     def sleep(
         self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True
@@ -1137,6 +1140,9 @@ class SyncMPClient(MPClient):
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
+    def stage_weights(self, update_info: Any) -> None:
+        self.call_utility("stage_weights", update_info)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1496,17 +1502,8 @@ class AsyncMPClient(MPClient):
         )
 
     async def stage_weights_async(self, update_info: Any) -> None:
-        # Every engine, as the status poll checks every engine.
-        await self.call_utility_all_async(
-            "collective_rpc", "stage_weights", None, (), {"update_info": update_info}
-        )
-
-    async def staging_done_async(self) -> bool:
-        """Whether every worker of every engine finished `stage_weights`."""
-        per_engine = await self.call_utility_all_async(
-            "collective_rpc", "staging_done", None, (), None
-        )
-        return all(all(workers) for workers in per_engine)
+        # Each engine's utility returns once all its workers finished staging.
+        await self.call_utility_all_async("stage_weights", update_info)
 
     async def compute_weight_checksums_async(self) -> list[dict[str, str]]:
         per_engine = await self.call_utility_all_async("compute_weight_checksums")

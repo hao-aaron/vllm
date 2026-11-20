@@ -1247,6 +1247,12 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def stage_weights(self, update_info: Any) -> Future[list]:
+        """Start staging on every worker; the Future completes when all are done."""
+        return self.model_executor.collective_rpc_deferred(
+            "stage_weights", kwargs={"update_info": update_info}
+        )
+
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
 

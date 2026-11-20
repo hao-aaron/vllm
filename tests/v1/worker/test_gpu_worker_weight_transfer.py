@@ -116,21 +116,21 @@ class _StagingEngine(_RecordingEngine):
         self.staged.append(update_info)
 
 
-def test_start_waits_for_staging_and_reraises_its_error():
+def test_start_waits_for_staging_and_error_goes_to_stage_caller():
     engine = _StagingEngine()
     worker = _make_worker(engine)
 
-    worker.stage_weights({"v": 1})
-    assert not worker.staging_done()
+    future = worker.stage_weights({"v": 1})
+    assert not future.done()
     engine.release.set()
     worker.start_weight_update()
     assert engine.staged == [{"v": 1}]
     worker.finish_weight_update()
 
-    worker.stage_weights({"fail": True})
+    future = worker.stage_weights({"fail": True})
     with pytest.raises(ValueError, match="stage failed"):
-        worker.start_weight_update()
-    # The error is reported once; the next update proceeds unstaged.
+        future.result(timeout=10)
+    # The stage caller got the error; the next update proceeds unstaged.
     worker.start_weight_update()
     assert worker._weight_update_active
 
@@ -145,10 +145,9 @@ def test_staging_rejected_inside_update_and_on_live_model():
         worker.stage_weights({"v": 1})
     worker.finish_weight_update()
 
-    worker.stage_weights({"touch_live_model": True})
+    future = worker.stage_weights({"touch_live_model": True})
     with pytest.raises(RuntimeError, match="cannot run in stage_weights"):
-        while not worker.staging_done():
-            pass
+        future.result(timeout=10)
 
 
 def test_reload_weights_sets_current_config():

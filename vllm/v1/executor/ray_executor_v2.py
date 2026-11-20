@@ -563,6 +563,7 @@ class RayExecutorV2(MultiprocExecutor):
             if getattr(self, "shutting_down", False):
                 return
             self.shutting_down = True
+        self._close_deferred()
 
         for handle in getattr(self, "ray_worker_handles", []):
             try:
