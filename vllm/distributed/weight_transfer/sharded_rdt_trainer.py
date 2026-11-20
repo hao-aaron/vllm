@@ -574,9 +574,8 @@ class _RDTProducerServer:
                 return
             self._live -= ids
             for block in list(self._holds.values()):
-                for c in ids & block.holders.keys():
-                    self._drop_holder(block, c, every=True)
-            for block in list(self._shared.values()):
+                for c in ids:
+                    block.holders.pop(c, None)
                 self._maybe_free(block)  # it may have waited on them
             for unit in list(self._resident):
                 self._release_if_done(unit)
@@ -895,15 +894,11 @@ class _RDTProducerServer:
             self._drop_holder(block, consumer_id)
             self._last_progress = time.monotonic()
 
-    def _drop_holder(
-        self, block: _Block, consumer_id: int, every: bool = False
-    ) -> None:
-        """Drop one (or `every`) copy `consumer_id` holds of `block`. Caller
-        holds `_lock`."""
-        if block.holders.get(consumer_id, 0) > 0:
-            block.holders[consumer_id] = 0 if every else block.holders[consumer_id] - 1
-            if not block.holders[consumer_id]:
-                del block.holders[consumer_id]
+    def _drop_holder(self, block: _Block, consumer_id: int) -> None:
+        """Drop one copy `consumer_id` holds of `block`. Caller holds `_lock`."""
+        left = block.holders.pop(consumer_id, 0) - 1
+        if left > 0:
+            block.holders[consumer_id] = left
         self._maybe_free(block)
         self._room.notify_all()  # end_sync waits for every free
 
