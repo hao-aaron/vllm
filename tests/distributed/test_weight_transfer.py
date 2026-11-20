@@ -1971,27 +1971,28 @@ class TestTrainerClients:
 
 
 class TestTrainerManagedPause:
-    """`send_weights` pauses only around the apply, via the ModelExpress engine."""
+    """`send_weights` pauses only around the apply (`_pause_for_update`)."""
 
-    @staticmethod
-    def _engine(client):
-        from vllm.distributed.weight_transfer.modelexpress_trainer import (
-            ModelExpressTrainerInitInfo,
-        )
+    class _Engine(TrainerWeightTransferEngine):
+        @classmethod
+        def trainer_init(cls, init_info, *, client, source=None):
+            engine = cls(client=client)
+            engine._apply_pause_config(init_info)
+            return engine
 
-        return WeightTransferTrainerFactory.trainer_init(
-            ModelExpressTrainerInitInfo(rank=0, worker_init_info={"model_name": "m"}),
-            client=client,
-        )
+        def send_weights(self):
+            with self._pause_for_update():
+                self.client.start_weight_update()
+                self.client.update_weights({"names": []})
+                self.client.finish_weight_update()
+
+    def _engine(self, client):
+        return self._Engine.trainer_init(TrainerInitInfo(rank=0), client=client)
 
     def test_pauses_around_apply(self):
         client = PausingRecordingClient()
-        self._engine(client).send_weights("v1")
-        assert client.order == [
-            "init", "pause:keep", "start", "update", "finish", "resume"
-        ]  # fmt: skip
-        assert client.last_init_info == {"model_name": "m"}
-        assert client.last_update_info == {"version_id": "v1"}
+        self._engine(client).send_weights()
+        assert client.order == ["pause:keep", "start", "update", "finish", "resume"]
         assert not client.paused
 
     def test_failed_update_stays_paused(self):
@@ -2002,13 +2003,13 @@ class TestTrainerManagedPause:
         client = FailingUpdate()
         engine = self._engine(client)
         with pytest.raises(RuntimeError, match="boom"):
-            engine.send_weights("v1")
+            engine.send_weights()
         assert client.paused
         assert "resume" not in client.order
 
         # A successful retry pauses again and resumes.
         client.update_weights = lambda update_info: None
-        engine.send_weights("v1")
+        engine.send_weights()
         assert client.order.count("pause:keep") == 2
         assert not client.paused
 

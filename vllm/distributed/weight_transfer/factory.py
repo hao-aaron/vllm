@@ -292,9 +292,3 @@ WeightTransferTrainerFactory.register_engine(
     "vllm.distributed.weight_transfer.m2n_trainer",
     "M2NTrainerWeightTransferEngine",
 )
-
-WeightTransferTrainerFactory.register_engine(
-    "modelexpress",
-    "vllm.distributed.weight_transfer.modelexpress_trainer",
-    "ModelExpressTrainerWeightTransferEngine",
-)
