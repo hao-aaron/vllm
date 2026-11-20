@@ -302,6 +302,9 @@ def trainer_broadcast_tensor_uid(
         def resume_generation(self):
             pass
 
+        def stage_weights(self, update_info):
+            pass
+
     dtype = getattr(torch, tensor_dtype)
     model = torch.nn.Module()
     test_module = torch.nn.Module()

@@ -1137,6 +1137,9 @@ def _m2n_trainer_send(
         def resume_generation(self):
             pass
 
+        def stage_weights(self, update_info):
+            pass
+
     class Tiny(torch.nn.Module):
         def __init__(self):
             super().__init__()

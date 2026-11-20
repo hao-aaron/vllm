@@ -1002,6 +1002,9 @@ def trainer_send_from_source(
         def resume_generation(self):
             pass
 
+        def stage_weights(self, update_info):
+            pass
+
     engine = WeightTransferTrainerFactory.trainer_init(
         NCCLTrainerInitInfo(
             master_address=master_address,
@@ -1097,6 +1100,9 @@ def test_sparse_nccl_checkpoint_chunks_to_ep_local_experts_cpu(monkeypatch):
             pass
 
         def resume_generation(self):
+            pass
+
+        def stage_weights(self, update_info):
             pass
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
@@ -1831,6 +1837,9 @@ class RecordingClient:
     def resume_generation(self) -> None:
         self.paused = False
 
+    def stage_weights(self, update_info: dict) -> None:
+        self.order.append("stage")
+
 
 class PausingRecordingClient(RecordingClient):
     """A RecordingClient that also records pauses in `order`."""
@@ -1872,7 +1881,7 @@ class TestTrainerClients:
 
     def test_clients_forward_pause_mode(self, monkeypatch):
         """The server defaults to `abort`, so the mode must reach it."""
-        captured = {}
+        captured: dict = {}
 
         def fake_post(self, path, json=None, params=None):
             captured.update(path=path, params=params)
@@ -1916,6 +1925,10 @@ class TestTrainerClients:
         (update_req,), _ = handle.update_weights.remote.call_args
         assert isinstance(update_req, WeightTransferUpdateRequest)
         assert update_req.update_info == {"names": ["w"]}
+
+        client.stage_weights({"names": ["w"]})
+        (stage_req,), _ = handle.stage_weights.remote.call_args
+        assert isinstance(stage_req, WeightTransferUpdateRequest)
 
         client.finish_weight_update("step-42")
         handle.finish_weight_update.remote.assert_called_once_with()
@@ -1997,8 +2010,11 @@ class TestTrainerManagedPause:
 
     def test_failed_update_stays_paused(self):
         class FailingUpdate(PausingRecordingClient):
+            fail = True
+
             def update_weights(self, update_info):
-                raise RuntimeError("boom")
+                if self.fail:
+                    raise RuntimeError("boom")
 
         client = FailingUpdate()
         engine = self._engine(client)
@@ -2008,7 +2024,7 @@ class TestTrainerManagedPause:
         assert "resume" not in client.order
 
         # A successful retry pauses again and resumes.
-        client.update_weights = lambda update_info: None
+        client.fail = False
         engine.send_weights()
         assert client.order.count("pause:keep") == 2
         assert not client.paused

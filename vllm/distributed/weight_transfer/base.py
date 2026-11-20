@@ -466,6 +466,9 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     supports_draft_weight_update: bool = True
 
+    supports_staging: ClassVar[bool] = False
+    """Whether `stage_weights` does anything; see its docstring."""
+
     defers_processing: bool = False
     """Whether `update_weights` returns before the weights are on the device.
 
@@ -613,6 +616,14 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         # next step uses the new weights.
         torch.accelerator.synchronize()
 
+    def stage_weights(self, update_info: TUpdateInfo) -> None:
+        """Fetch the next version without touching live weights. No-op by default.
+
+        Blocking: the worker runs it on a background thread while the engine
+        serves, so it must follow the staging rules in the weight transfer docs.
+        `start_weight_update` waits for it before the apply.
+        """
+
     @abstractmethod
     def receive_weights(self, update_info: TUpdateInfo) -> None:
         """Receive weights from the trainer and load them into the model.
@@ -650,6 +661,8 @@ class VLLMWeightSyncClient(Protocol):
     """
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None: ...
+
+    def stage_weights(self, update_info: WeightTransferUpdatePayload) -> None: ...
 
     def start_weight_update(self) -> None: ...
 

@@ -64,9 +64,9 @@ class HTTPVLLMWeightSyncClient:
     """Talks to a vLLM server over the RLHF HTTP routes.
 
     Mirrors `vllm/entrypoints/rl/online/api_router.py`:
-    `/init_weight_transfer_engine`, `/start_weight_update`, `/update_weights`,
-    `/finish_weight_update`, `/shutdown_weight_transfer_engine`, `/pause`,
-    `/resume`.
+    `/init_weight_transfer_engine`, `/stage_weights`, `/start_weight_update`,
+    `/update_weights`, `/finish_weight_update`,
+    `/shutdown_weight_transfer_engine`, `/pause`, `/resume`.
     """
 
     def __init__(self, base_url: str, timeout: float = 300) -> None:
@@ -101,6 +101,11 @@ class HTTPVLLMWeightSyncClient:
 
     def shutdown_weight_transfer_engine(self) -> None:
         self._post("shutdown_weight_transfer_engine")
+
+    def stage_weights(self, update_info: WeightTransferUpdatePayload) -> None:
+        self._post(
+            "stage_weights", {"update_info": _json_safe_update_payload(update_info)}
+        )
 
     def start_weight_update(self) -> None:
         self._post("start_weight_update")
@@ -168,6 +173,12 @@ class RayVLLMWeightSyncClient:
         import ray
 
         ray.get([h.shutdown_weight_transfer_engine.remote() for h in self.handles])
+
+    def stage_weights(self, update_info: WeightTransferUpdatePayload) -> None:
+        import ray
+
+        request = WeightTransferUpdateRequest(update_info=update_info)
+        ray.get([h.stage_weights.remote(request) for h in self.handles])
 
     def start_weight_update(self) -> None:
         import ray

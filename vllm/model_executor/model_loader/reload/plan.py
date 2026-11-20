@@ -42,6 +42,7 @@ from .geometry import (
     byte_runs,
     merge_writes,
 )
+from .staging import check_not_staging
 
 if TYPE_CHECKING:
     from vllm.distributed.weight_transfer.base import ParamMeta
@@ -108,6 +109,7 @@ def plan_loads(model: torch.nn.Module, metadata: "Iterable[ParamMeta]") -> LoadP
         RuntimeError: the model cannot be planned.
 
     """
+    check_not_staging("plan_loads")
     check_plannable(model)
     if not direct_reload_active(model):
         raise RuntimeError(

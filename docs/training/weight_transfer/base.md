@@ -139,14 +139,16 @@ inference engines in their own abstractions, and each reaches vLLM its own way.
 weight sync engines remain control plane agnostic.
 
 The contract is only this: **however the wrapper is shaped, it must bottom out in
-the same six calls** — `init_weight_transfer_engine` once at setup, then
+the same seven calls** — `init_weight_transfer_engine` once at setup, then
 `pause_generation` → `start_weight_update` → one or more `update_weights` →
-`finish_weight_update` → `resume_generation` per round. Everything a trainer
-engine needs from the inference side goes through them.
+`finish_weight_update` → `resume_generation` per round, plus
+[`stage_weights`](staging.md) before the pause for backends that stage. Everything
+a trainer engine needs from the inference side goes through them.
 
 ```python
 class VLLMWeightSyncClient(Protocol):
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None: ...
+    def stage_weights(self, update_info: dict[str, Any]) -> None: ...
     def start_weight_update(self) -> None: ...
     def update_weights(self, update_info: dict[str, Any]) -> None: ...
     def finish_weight_update(self, weight_version: str | None = None) -> None: ...
@@ -155,8 +157,8 @@ class VLLMWeightSyncClient(Protocol):
 ```
 
 It is a `@runtime_checkable` structural `Protocol` (PEP 544), which is what makes
-adapting cheap: **any object with those six methods already satisfies it**. An existing
-wrapper in your framework can usually become a client by gaining six forwarding
+adapting cheap: **any object with those seven methods already satisfies it**. An existing
+wrapper in your framework can usually become a client by gaining seven forwarding
 methods.
 
 Two implementations ship with vLLM:
@@ -178,6 +180,9 @@ class MyFrameworkWeightSyncClient:
     def init_weight_transfer_engine(self, init_info):
         # Fan out to every replica and block: all of them receive weights.
         self.pool.broadcast_rpc("init_weight_transfer_engine", init_info=init_info)
+
+    def stage_weights(self, update_info):
+        self.pool.broadcast_rpc("stage_weights", update_info=update_info)
 
     def start_weight_update(self):
         self.pool.broadcast_rpc("start_weight_update")
@@ -421,6 +426,7 @@ The base class provides:
 2. `update_weights(update_info_dict)`, a thin wrapper for `receive_weights`: it parses the dict into the typed dataclass, calls `receive_weights`, and synchronizes the device — unless the engine sets `defers_processing`, below.
 3. `parse_init_info` / `parse_update_info`, which convert API-level dicts into the typed dataclasses and raise `ValueError` on a bad payload.
 4. `set_weight_update_target` / `reset_weight_update_target`, used to retarget an update at the speculative draft model.
+5. `stage_weights(update_info)`, a no-op unless the engine sets `supports_staging`. See [Staging Weights](staging.md).
 
 !!! note "Read wire params from the handshake, not the payload"
     Anything the two sides must agree on — `packed`, buffer geometry — arrives
