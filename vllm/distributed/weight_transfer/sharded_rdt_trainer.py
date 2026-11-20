@@ -21,7 +21,7 @@ import warnings
 import weakref
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar, Self
 
@@ -106,6 +106,9 @@ class ShardedRDTTrainerInitInfo(TrainerInitInfo):
     update_retries: int = 1
     """Times the sender retries a failed `update_weights` call before it
     evicts the deployment; a retry of a finished pull is a no-op."""
+    rpc_timeout_s: float = 120.0
+    """Seconds the sender waits for a deployment's init, start (which plans
+    on the first sync) or finish before it evicts the deployment."""
     num_rdt_buffers: int | None = None
     """Deprecated and ignored: use `num_buffers`."""
     buffer_presize_gb: float | None = None
@@ -128,6 +131,8 @@ class ShardedRDTTrainerInitInfo(TrainerInitInfo):
         validate_int("num_buffers", self.num_buffers, minimum=1)
         validate_int("num_consumers", self.num_consumers, minimum=1)
         validate_int("update_retries", self.update_retries, minimum=0)
+        if not self.rpc_timeout_s > 0:
+            raise ValueError(f"rpc_timeout_s={self.rpc_timeout_s} must be > 0")
         if not 0 < self.evict_after_s < self.stall_timeout_s:
             raise ValueError(
                 f"evict_after_s={self.evict_after_s} must be in "
@@ -153,6 +158,7 @@ class _Block:
     offset: int
     sync_idx: int
     holders: Counter[int] = field(default_factory=Counter)  # copies Ray holds
+    taken: set[int] = field(default_factory=set)  # consumers served a copy
     flat: torch.Tensor | None = None  # None while its pack is in flight
 
 
@@ -750,6 +756,7 @@ class _RDTProducerServer:
                 self._shared[share] = self._holds[offset] = block
                 self._packed_count += 1
             block.holders[consumer_id] += 1
+            block.taken.add(consumer_id)
             flat = block.flat
             self._serve_wait += time.perf_counter() - t0
             self._served_count += 1
@@ -790,20 +797,18 @@ class _RDTProducerServer:
     def _maybe_free(self, block: _Block) -> None:
         """Free `block` once Ray holds no copy of it and it is not current, or
         is packed and every live sharer has pulled it. Caller holds `_lock`."""
-        if block.holders:
-            return
+        if block.holders or self._holds.get(block.offset) is not block:
+            return  # held, or freed already
         if self._shared.get(block.key) is block:
             if block.flat is None:
                 return  # its pack is in flight; the packer frees it
-            share_key, seq = block.key
             if any(
-                self._share_key(c) == share_key and (c, seq) not in self._pulled
+                self._share_key(c) == block.key[0] and c not in block.taken
                 for c in self._live
             ):
                 return
         self._blocks.pop(block.offset, None)
-        if self._holds.get(block.offset) is block:
-            del self._holds[block.offset]
+        del self._holds[block.offset]
         if self._shared.get(block.key) is block:
             del self._shared[block.key]
         self._room.notify_all()
@@ -890,7 +895,9 @@ class _RDTProducerServer:
             self._drop_holder(block, consumer_id)
             self._last_progress = time.monotonic()
 
-    def _drop_holder(self, block: _Block, consumer_id: int, every: bool = False) -> None:
+    def _drop_holder(
+        self, block: _Block, consumer_id: int, every: bool = False
+    ) -> None:
         """Drop one (or `every`) copy `consumer_id` holds of `block`. Caller
         holds `_lock`."""
         if block.holders.get(consumer_id, 0) > 0:
@@ -1569,7 +1576,7 @@ class _SyncRound:
         self._producers = engine._producers()
 
     def run_replica(self, r: int) -> None:
-        """start -> update -> finish on deployment `r`; any failure evicts it."""
+        """Start -> update -> finish on deployment `r`; any failure evicts it."""
         from vllm.distributed.weight_transfer.sharded_rdt_engine import (
             ShardedRDTWeightTransferUpdateInfo,
         )
@@ -1578,10 +1585,11 @@ class _SyncRound:
         update = asdict(ShardedRDTWeightTransferUpdateInfo(sync_idx=self.sync_idx))
         try:
             if r in engine._rejoining:
-                client.init_weight_transfer_engine(engine.get_worker_init_payload(r))
+                payload = engine.get_worker_init_payload(r)
+                self._bounded(client.init_weight_transfer_engine, payload)
                 engine._rejoining.discard(r)
             self._enter(r, "start")
-            client.start_weight_update()
+            self._bounded(client.start_weight_update)
             self._enter(r, "update")
             for attempt in range(engine._init_info.update_retries + 1):
                 try:
@@ -1593,7 +1601,7 @@ class _SyncRound:
                     logger.warning("[rdt-retry] deployment %d update: %r", r, e)
                     self._enter(r, "update")  # still live?
             self._enter(r, "finish")
-            client.finish_weight_update()
+            self._bounded(client.finish_weight_update)
         except _Evicted:
             return
         except Exception as e:
@@ -1608,15 +1616,32 @@ class _SyncRound:
 
     def _enter(self, r: int, phase: str) -> None:
         with self._cond:
-            if self.phase[r] in ("evicting", "evicted"):
-                raise _Evicted
+            if self._closed or self.phase[r] in ("evicting", "evicted"):
+                raise _Evicted  # evicted, or the sync is over
             self.phase[r] = phase
 
-    def evict(self, r: int, reason: str) -> None:
-        """Drop deployment `r` from this sync on every producer; returns once
-        they all have, so the sync ends with no block held for it."""
+    def _bounded(self, fn: Callable[..., Any], *args: Any) -> None:
+        """Call `fn` on a daemon thread; raise if it takes over `rpc_timeout_s`
+        (a client need not have a timeout of its own)."""
+        done: Future = Future()
+
+        def call() -> None:
+            try:
+                done.set_result(fn(*args))
+            except BaseException as e:
+                done.set_exception(e)
+
+        threading.Thread(target=call, daemon=True).start()
+        done.result(timeout=self.engine._init_info.rpc_timeout_s)
+
+    def evict(self, r: int, reason: str, only_in: str | None = None) -> None:
+        """Drop deployment `r` from this sync on every producer (if it is in
+        phase `only_in`, when given); returns once they all have, so the sync
+        ends with no block held for it."""
         with self._cond:
-            if self.phase[r] in ("evicting", "evicted", "done"):
+            if self.phase[r] in ("evicting", "evicted", "done") or (
+                only_in is not None and self.phase[r] != only_in
+            ):
                 return
             self.phase[r] = "evicting"  # fences its finish
             self.reasons[r] = reason
@@ -1640,8 +1665,9 @@ class _SyncRound:
     def failure(self) -> str | None:
         """Why the sync failed: every deployment was evicted."""
         if self.phase and all(p == "evicted" for p in self.phase.values()):
-            return f"sharded RDT sync {self.sync_idx}: every deployment was evicted: " + (
-                "; ".join(f"{r}: {why}" for r, why in sorted(self.reasons.items()))
+            return (
+                f"sharded RDT sync {self.sync_idx}: every deployment was evicted: "
+                + ("; ".join(f"{r}: {why}" for r, why in sorted(self.reasons.items())))
             )
         return None
 
@@ -1673,12 +1699,13 @@ class _SyncRound:
             waiting = {c for s in snaps for c in s["waiting"]}
             for c in sorted(owing):
                 r = c // self.per_replica
-                if self.phase.get(r) != "update":
-                    continue  # start and finish have their own outcome
                 if c in holding:
-                    self.evict(r, f"stalled: consumer {c} holds served buckets")
+                    why = f"stalled: consumer {c} holds served buckets"
                 elif c not in waiting:
-                    self.evict(r, f"stalled: consumer {c} has no pull in flight")
+                    why = f"stalled: consumer {c} has no pull in flight"
+                else:
+                    continue
+                self.evict(r, why, only_in="update")
 
     def wait(self) -> None:
         """Until every deployment finished or was evicted."""
