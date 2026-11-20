@@ -380,6 +380,12 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    def stage_weights(self, update_info: Any) -> None:
+        raise NotImplementedError
+
+    async def stage_weights_async(self, update_info: Any) -> None:
+        raise NotImplementedError
+
     async def handle_fault(
         self, fault_tolerance_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
@@ -471,6 +477,9 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
+
+    def stage_weights(self, update_info: Any) -> None:
+        self.engine_core.stage_weights(update_info).result()
 
     def sleep(
         self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True
@@ -963,6 +972,14 @@ class MPClient(EngineCoreClient):
         return dict(self._kv_event_sources)
 
 
+def _fail_utility_results(utility_results: dict[int, AnyFuture]):
+    """Fail utility calls still waiting when the output loop stops."""
+    while utility_results:
+        _, future = utility_results.popitem()
+        if not future.done():
+            future.set_exception(EngineDeadError())
+
+
 def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
@@ -1045,6 +1062,7 @@ class SyncMPClient(MPClient):
             except Exception as e:
                 outputs_queue.put_nowait(e)
             finally:
+                _fail_utility_results(utility_results)
                 # Close sockets.
                 shutdown_socket.close(linger=0)
                 out_socket.close(linger=0)
@@ -1130,6 +1148,9 @@ class SyncMPClient(MPClient):
 
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
+
+    def stage_weights(self, update_info: Any) -> None:
+        self.call_utility("stage_weights", update_info)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
@@ -1297,6 +1318,8 @@ class AsyncMPClient(MPClient):
                 outputs_queue.put_nowait(e)
             except asyncio.CancelledError:
                 outputs_queue.put_nowait(EngineDeadError())
+            finally:
+                _fail_utility_results(utility_results)
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask"
@@ -1488,6 +1511,10 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+
+    async def stage_weights_async(self, update_info: Any) -> None:
+        # Each engine's utility returns once all its workers finished staging.
+        await self.call_utility_all_async("stage_weights", update_info)
 
     async def compute_weight_checksums_async(self) -> list[dict[str, str]]:
         per_engine = await self.call_utility_all_async("compute_weight_checksums")

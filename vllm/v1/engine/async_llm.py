@@ -1439,6 +1439,13 @@ class AsyncLLM(EngineClient):
         """Release the trainer connection without shutting down inference."""
         await self.collective_rpc("shutdown_weight_transfer_engine")
 
+    async def stage_weights(self, request: WeightTransferUpdateRequest) -> None:
+        """Stage the next version on every worker while the engine keeps serving.
+
+        Returns once all workers have finished staging.
+        """
+        await self.engine_core.stage_weights_async(request.update_info)
+
     async def start_weight_update(self) -> None:
         """Start a new weight update."""
         await self.collective_rpc("start_weight_update")

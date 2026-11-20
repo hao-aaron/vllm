@@ -30,6 +30,13 @@ class RLOfflineMixin(OfflineInferenceMixin):
         """Release the trainer connection without shutting down inference."""
         self.llm_engine.collective_rpc("shutdown_weight_transfer_engine")
 
+    def stage_weights(self, request: WeightTransferUpdateRequest | dict) -> None:
+        """Stage the next version on every worker; returns when staging is done."""
+        update_info_dict = (
+            request["update_info"] if isinstance(request, dict) else request.update_info
+        )
+        self.llm_engine.engine_core.stage_weights(update_info_dict)
+
     def start_weight_update(self) -> None:
         """Start a new weight update."""
         self.llm_engine.collective_rpc("start_weight_update")

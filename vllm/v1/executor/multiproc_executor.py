@@ -69,6 +69,11 @@ from vllm.utils.torch_utils import (
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
+from vllm.v1.executor.deferred import (
+    DEFERRED_KWARG,
+    DeferredResults,
+    DeferredSender,
+)
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.metrics.stats import SchedulerIterationDetails
 from vllm.v1.outputs import (
@@ -148,6 +153,7 @@ class FutureWrapper(Future):
 
 
 class MultiprocExecutor(Executor):
+    _deferred: DeferredResults | None = None
     supports_pp: bool = True
 
     def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):
@@ -590,6 +596,26 @@ class MultiprocExecutor(Executor):
 
         return future if non_block else future.result()
 
+    def collective_rpc_deferred(
+        self, method: str, args: tuple = (), kwargs: dict | None = None
+    ) -> Future[list]:
+        """Acked at once; each worker reports its Future's result over ZMQ."""
+        if self._deferred is None:
+            self._deferred = DeferredResults()
+        token, future = self._deferred.register(self.world_size)
+        kwargs = dict(kwargs or {})
+        kwargs[DEFERRED_KWARG] = (self._deferred.address, token)
+        try:
+            self.collective_rpc(method, args=args, kwargs=kwargs)
+        except BaseException:
+            self._deferred.discard(token)
+            raise
+        return future
+
+    def _close_deferred(self) -> None:
+        if (deferred := getattr(self, "_deferred", None)) is not None:
+            deferred.close("Executor shut down")
+
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):
         """Ensure that all worker processes are terminated. Assumes workers have
@@ -644,6 +670,7 @@ class MultiprocExecutor(Executor):
 
     def shutdown(self):
         """Properly shut down the executor and its workers."""
+        self._close_deferred()
         if not getattr(self, "shutting_down", False):
             worker_count = len(getattr(self, "workers", None) or [])
             logger.debug(
@@ -744,6 +771,7 @@ class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
     READY_STR = "READY"
+    _deferred_sender: DeferredSender | None = None
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
 
@@ -1201,6 +1229,7 @@ class WorkerProc:
     ) -> None:
         """Execute one RPC in a separate frame from the dequeue loop."""
         method, args, kwargs, output_rank = rpc_request
+        deferred = kwargs.pop(DEFERRED_KWARG, None) if kwargs else None
         try:
             if isinstance(method, str):
                 func = getattr(self.worker, method)
@@ -1210,6 +1239,12 @@ class WorkerProc:
             watchdog = get_watch_dog()
             watchdog.feed()
             output = func(*args, **kwargs)
+            if deferred is not None:
+                # Ack now; the result goes over the side channel when it is done.
+                if self._deferred_sender is None:
+                    self._deferred_sender = DeferredSender(self.rank)
+                self._deferred_sender.send_when_done(output, *deferred)
+                output = None
             # Feed again: the RPC itself may run close to the watchdog
             # timeout, so the pre-call feed can go stale while the result
             # is serialized/enqueued in handle_output().
