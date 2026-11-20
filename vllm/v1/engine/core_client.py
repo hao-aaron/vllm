@@ -972,6 +972,14 @@ class MPClient(EngineCoreClient):
         return dict(self._kv_event_sources)
 
 
+def _fail_utility_results(utility_results: dict[int, AnyFuture]):
+    """Fail utility calls still waiting when the output loop stops."""
+    while utility_results:
+        _, future = utility_results.popitem()
+        if not future.done():
+            future.set_exception(EngineDeadError())
+
+
 def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
@@ -1054,6 +1062,7 @@ class SyncMPClient(MPClient):
             except Exception as e:
                 outputs_queue.put_nowait(e)
             finally:
+                _fail_utility_results(utility_results)
                 # Close sockets.
                 shutdown_socket.close(linger=0)
                 out_socket.close(linger=0)
@@ -1309,6 +1318,8 @@ class AsyncMPClient(MPClient):
                 outputs_queue.put_nowait(e)
             except asyncio.CancelledError:
                 outputs_queue.put_nowait(EngineDeadError())
+            finally:
+                _fail_utility_results(utility_results)
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask"
