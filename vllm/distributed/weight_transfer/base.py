@@ -426,6 +426,10 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     supports_draft_weight_update: bool = True
 
+    restarts_open_update: bool = False
+    """Whether `start_weight_update` may abandon an update that never
+    finished (a trainer that lost track of it) instead of refusing."""
+
     defers_processing: bool = False
     """Deprecated, always False: every engine applies its updates by the time
     `update_weights` returns."""

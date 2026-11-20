@@ -224,6 +224,9 @@ class ShardedRDTWeightTransferEngine(
     update_info_cls = ShardedRDTWeightTransferUpdateInfo
     # The plan belongs to one model's tensors.
     supports_draft_weight_update = False
+    # Every sync resends the whole model, so an abandoned update is safe to
+    # start over.
+    restarts_open_update = True
 
     def __init__(
         self,
@@ -258,6 +261,8 @@ class ShardedRDTWeightTransferEngine(
         # dropped.
         self._arena: torch.Tensor | None = None
         self._slot_bytes = 0
+        # the last sync received in full: a retried update of it is a no-op
+        self._received_sync: int | None = None
 
     def init_transfer_engine(self, init_info: ShardedRDTWeightTransferInitInfo) -> None:
         """Check the configuration and bind the producers. Touches no model
@@ -541,6 +546,9 @@ class ShardedRDTWeightTransferEngine(
         )
 
         validate_int("sync_idx", update_info.sync_idx, minimum=0)
+        if update_info.sync_idx == self._received_sync:
+            logger.info("Sharded RDT sync %d: already received", update_info.sync_idx)
+            return
         if (
             not self._planned
             or self._hooks is None
@@ -608,6 +616,7 @@ class ShardedRDTWeightTransferEngine(
             land(ready)
         for name in self._written:  # for direct reload's completeness check
             mark_loaded(self.model, name)
+        self._received_sync = sync_idx
         logger.info(
             "Sharded RDT sync %d: %d pulls, %.1f MiB, %d fallbacks, in %.2f s "
             "(waiting %.2f s, fetching %.2f s, applying %.2f s)",
@@ -707,6 +716,7 @@ class ShardedRDTWeightTransferEngine(
 
     def _drop_plan(self) -> None:
         self._planned = False
+        self._received_sync = None
         self._buckets, self._written = [], []
         if self._arena is not None:
             deregister_nixl_memory(self._arena)

@@ -311,3 +311,76 @@ def test_a_source_out_of_order_fails_the_sync(cpu_ipc):
     with pytest.raises(RuntimeError, match="metadata order"):
         engine.send_weights()
     assert server._error is not None
+
+
+# ------------------------------------------------------------ fault tolerance
+
+
+class _Deployment(RecordingClient):
+    """One deployment's client whose `update_weights` pulls every bucket
+    itself, failing in sync 1 as `fault` says."""
+
+    def __init__(self, server, consumer_id, nbuckets, fault=None):
+        super().__init__()
+        self.server, self.c, self.n, self.fault = server, consumer_id, nbuckets, fault
+        self.received: set[int] = set()
+
+    def update_weights(self, update_info):
+        super().update_weights(update_info)
+        sync = update_info["sync_idx"]
+        fault = self.fault if sync == 0 else None
+        if fault == "crash":
+            raise ConnectionError("connection reset by peer")
+        if fault == "lost_request":
+            threading.Event().wait()  # the call never arrives, nor returns
+        if sync not in self.received:  # a retry of a received sync is a no-op
+            for seq in range(self.n):
+                self.server.bucket(self.c, seq, sync)
+                if fault == "frozen":
+                    threading.Event().wait()  # stuck mid-read: never frees it
+                for key in [k for k in self.server.outstanding if k[1] == self.c]:
+                    self.server.outstanding.remove(key)
+                    self.server._freed_bucket(*key)  # the read is done
+            self.received.add(sync)
+        if fault == "lost_response" and self.order.count("update") == 1:
+            raise TimeoutError("read timed out")
+
+
+@pytest.mark.parametrize("fault", ["crash", "lost_request", "frozen", "lost_response"])
+def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault):
+    """Deployment 1 fails in sync 0: the sync finishes on deployment 0 (a lost
+    response is retried instead), and deployment 1 rejoins in sync 1."""
+    monkeypatch.setattr(trainer_mod.ray, "get", lambda r, timeout=None: r)
+    pairs = _pairs(4)
+    clients = [_Deployment(None, c, len(pairs), fault if c else None) for c in (0, 1)]
+    engine = _engine(
+        _Source(pairs),
+        client=clients,
+        num_consumers=2,
+        buffer_bytes=32,
+        evict_after_s=1.0,
+    )
+    server = _attach_server(engine)
+    server._share_every = 1  # the deployments share blocks
+    for client in clients:
+        client.server = server
+    for c in (0, 1):
+        server.register_consumer(c, [[(n, ((0, 8),))] for n, _ in pairs])
+    actor = SimpleNamespace(
+        **{
+            m: SimpleNamespace(remote=getattr(server, m))
+            for m in ("evict", "snapshot", "set_gather_error")
+        }
+    )
+    engine._server_names = ["rk0"]
+    monkeypatch.setattr(trainer_mod.ray, "get_actor", lambda *a, **k: actor)
+
+    synced = engine.send_weights()
+    assert synced == ([0, 1] if fault == "lost_response" else [0])
+    assert clients[0].order == ["start", "update", "finish"]
+    assert not server._holds, "an evicted deployment kept arena blocks"
+
+    assert engine.send_weights() == [0, 1]
+    rejoined = fault != "lost_response"  # an evicted deployment is re-initialized
+    assert ("init" in clients[1].order) == rejoined
+    assert clients[1].order[-3:] == ["start", "update", "finish"]

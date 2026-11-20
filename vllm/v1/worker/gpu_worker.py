@@ -1766,10 +1766,13 @@ class Worker(WorkerBase):
             )
 
         if self._weight_update_active:
-            raise RuntimeError(
-                "start_weight_update called while a weight update is already "
-                "active. Call finish_weight_update first."
-            )
+            if not self.weight_transfer_engine.restarts_open_update:
+                raise RuntimeError(
+                    "start_weight_update called while a weight update is already "
+                    "active. Call finish_weight_update first."
+                )
+            logger.warning("start_weight_update: abandoning an unfinished update")
+            self._end_weight_update(refresh=False)
 
         draft_model = self.get_draft_model() if is_draft else None
         try:

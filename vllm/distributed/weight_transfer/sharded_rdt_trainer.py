@@ -22,7 +22,7 @@ import weakref
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar, Self
 
 import ray
@@ -70,6 +70,9 @@ DEFAULT_GATHER_LOOKAHEAD = 2
 # dies mid-sync never frees its buckets, which would wedge the gather loop.
 DEFAULT_STALL_TIMEOUT_S = 300.0
 _STALL_POLL_S = 5.0
+# Seconds with no progress on any producer before the sender evicts the
+# deployments a stalled sync waits on.
+DEFAULT_EVICT_AFTER_S = 60.0
 # Storages at most this large share one export slot and CUDA-IPC handle.
 _EXPORT_RING_MAX_BYTES = 64 << 20
 
@@ -97,6 +100,12 @@ class ShardedRDTTrainerInitInfo(TrainerInitInfo):
     stall_timeout_s: float = DEFAULT_STALL_TIMEOUT_S
     """Seconds without progress before a producer fails the sync; the first
     sync's planning on the workers counts too."""
+    evict_after_s: float = DEFAULT_EVICT_AFTER_S
+    """Seconds without progress on every producer before the sender evicts
+    the deployments the sync waits on; below `stall_timeout_s`."""
+    update_retries: int = 1
+    """Times the sender retries a failed `update_weights` call before it
+    evicts the deployment; a retry of a finished pull is a no-op."""
     num_rdt_buffers: int | None = None
     """Deprecated and ignored: use `num_buffers`."""
     buffer_presize_gb: float | None = None
@@ -118,6 +127,12 @@ class ShardedRDTTrainerInitInfo(TrainerInitInfo):
         validate_int("buffer_bytes", self.buffer_bytes, minimum=1)
         validate_int("num_buffers", self.num_buffers, minimum=1)
         validate_int("num_consumers", self.num_consumers, minimum=1)
+        validate_int("update_retries", self.update_retries, minimum=0)
+        if not 0 < self.evict_after_s < self.stall_timeout_s:
+            raise ValueError(
+                f"evict_after_s={self.evict_after_s} must be in "
+                f"(0, stall_timeout_s={self.stall_timeout_s})"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,13 +146,13 @@ class _ServedBucket:
 @dataclass(slots=True)
 class _Block:
     """An arena block packed once for every replica's worker that shares its
-    bucket; freed once each has pulled and freed it, or its sync is over."""
+    bucket; freed once each live sharer has pulled it and Ray freed every
+    copy, or its sync is over."""
 
     key: tuple[int, int]  # (share key, seq)
     offset: int
     sync_idx: int
-    pending: int  # live sharers yet to pull it
-    out: int = 0  # served copies Ray still holds
+    holders: Counter[int] = field(default_factory=Counter)  # copies Ray holds
     flat: torch.Tensor | None = None  # None while its pack is in flight
 
 
@@ -297,6 +312,9 @@ class _RDTProducerServer:
         # per sync
         self._sync_idx = -1
         self._live: frozenset[int] = frozenset()
+        # evictions sent for a sync this rank has not begun yet
+        self._early_evictions: dict[int, set[int]] = {}
+        self._waiting: Counter[int] = Counter()  # pulls inside `bucket`
         self._packed: dict[int, Counter[int]] = {}  # per share key, by unit
         self._pulled: set[tuple[int, int]] = set()  # (consumer, seq) served
         self._resident: list[int] = []  # published, not released
@@ -393,12 +411,19 @@ class _RDTProducerServer:
                 self._error = None
             self._sync_idx = int(sync_idx)
             self._live = frozenset(int(c) for c in live_consumer_ids)
+            self._live -= self._early_evictions.pop(self._sync_idx, set())
+            self._early_evictions = {
+                s: c for s, c in self._early_evictions.items() if s > self._sync_idx
+            }
             self._packed = {}
             self._pulled = set()
             self._serve_wait, self._served_count, self._packed_count = 0.0, 0, 0
             self._reused_count = 0
             self._shared = {}
-            for block in list(self._holds.values()):  # left by an earlier sync
+            # copies an earlier sync left are held by consumers it evicted or
+            # failed: nothing will read them for real, so drop them
+            for block in list(self._holds.values()):
+                block.holders.clear()
                 self._maybe_free(block)
             for unit in self._resident:  # left by a failed sync
                 self._drop_import(unit)
@@ -504,7 +529,7 @@ class _RDTProducerServer:
             )
             self._wait_for(
                 self._room,
-                lambda: any(b.out > 0 for b in self._holds.values()),
+                lambda: any(b.holders for b in self._holds.values()),
                 "Ray's frees of the served buckets",
             )
             freed, self._freed_pending = self._freed_pending, []
@@ -530,6 +555,48 @@ class _RDTProducerServer:
             self._error = RuntimeError(message)
             self._failed_sync = self._sync_idx if sync_idx is None else sync_idx
             self._notify_all()
+
+    def evict(self, consumer_ids: Collection[int], sync_idx: int) -> None:
+        """Drop `consumer_ids` from sync `sync_idx`: their pulls are refused,
+        their copies are dropped, and nothing waits on them any more."""
+        ids = {int(c) for c in consumer_ids}
+        with self._lock:
+            if sync_idx > self._sync_idx:  # this rank has not begun it yet
+                self._early_evictions.setdefault(sync_idx, set()).update(ids)
+                return
+            if sync_idx < self._sync_idx or not ids & self._live:
+                return
+            self._live -= ids
+            for block in list(self._holds.values()):
+                for c in ids & block.holders.keys():
+                    self._drop_holder(block, c, every=True)
+            for block in list(self._shared.values()):
+                self._maybe_free(block)  # it may have waited on them
+            for unit in list(self._resident):
+                self._release_if_done(unit)
+            self._last_progress = time.monotonic()
+            self._notify_all()
+
+    def snapshot(self, sync_idx: int) -> dict[str, Any]:
+        """What sync `sync_idx` waits on here, for the sender's stall monitor:
+        seconds since progress, and the live consumers that still owe pulls,
+        hold served copies, or have a pull parked in `bucket`."""
+        with self._lock:
+            if sync_idx != self._sync_idx:
+                return {"sync_idx": self._sync_idx}
+            pulled = Counter(c for c, _ in self._pulled)
+            holding = {c for b in self._holds.values() for c in b.holders}
+            return {
+                "sync_idx": self._sync_idx,
+                "idle_s": time.monotonic() - self._last_progress,
+                "owing": sorted(
+                    c
+                    for c in self._live
+                    if c in holding or pulled[c] < len(self._buckets.get(c, ()))
+                ),
+                "holding": sorted(holding & self._live),
+                "waiting": sorted(c for c in self._waiting if c in self._live),
+            }
 
     # ---------------- consumer-facing ----------------
 
@@ -603,9 +670,21 @@ class _RDTProducerServer:
         deployment gets the same block, packed once.
 
         Raises:
-            ValueError: an unregistered bucket, or a sync this producer left.
+            ValueError: an unregistered bucket, a sync this producer left, or
+                a consumer evicted from the sync.
 
         """
+        with self._lock:
+            self._waiting[consumer_id] += 1
+        try:
+            return self._serve(consumer_id, seq, sync_idx)
+        finally:
+            with self._lock:
+                self._waiting[consumer_id] -= 1
+                if not self._waiting[consumer_id]:
+                    del self._waiting[consumer_id]
+
+    def _serve(self, consumer_id: int, seq: int, sync_idx: int) -> list[torch.Tensor]:
         t0 = time.perf_counter()
         with self._lock:
             try:
@@ -643,7 +722,7 @@ class _RDTProducerServer:
             # the unit stays resident until every bucket reading it is packed
 
             def blocked() -> bool:
-                if self._sync_idx != sync_idx:
+                if self._sync_idx != sync_idx or consumer_id not in self._live:
                     return False
                 block = self._shared.get(share)
                 if block is not None:
@@ -662,14 +741,14 @@ class _RDTProducerServer:
                 block is None and (published is None or published.tensors is None)
             ):
                 raise ValueError(f"pull for sync {sync_idx}, now {self._sync_idx}")
+            if consumer_id not in self._live:
+                raise ValueError(f"consumer {consumer_id} left sync {sync_idx}")
             if block is None:
                 offset = self._carve(spec.nbytes)
-                sharers = sum(self._share_key(c) == share[0] for c in self._live)
-                block = _Block(share, offset, sync_idx, pending=sharers)
+                block = _Block(share, offset, sync_idx)
                 self._shared[share] = self._holds[offset] = block
                 self._packed_count += 1
-            block.pending -= 1
-            block.out += 1
+            block.holders[consumer_id] += 1
             flat = block.flat
             self._serve_wait += time.perf_counter() - t0
             self._served_count += 1
@@ -687,11 +766,9 @@ class _RDTProducerServer:
                 )
             except BaseException:
                 with self._lock:  # drop the block; waiting sharers pack anew
-                    block.out -= 1
                     block.flat = None
                     self._shared.pop(share, None)
-                    block.pending = 0
-                    self._maybe_free(block)
+                    self._drop_holder(block, consumer_id)
                 raise
             with self._lock:
                 block.flat = flat
@@ -699,9 +776,10 @@ class _RDTProducerServer:
                 if sync_idx == self._sync_idx:
                     self._packed.setdefault(share[0], Counter())[spec.unit] += 1
                     self._release_if_done(spec.unit)
+                self._maybe_free(block)  # its sharers may have left mid-pack
         del published, tensors
         served = flat.view(flat.shape)  # its own object, for its own free
-        self._track_free(served, block.offset)
+        self._track_free(served, block, consumer_id)
         return [served]
 
     def _share_key(self, consumer_id: int) -> int:
@@ -709,10 +787,19 @@ class _RDTProducerServer:
         return consumer_id % self._share_every if self._share_every else consumer_id
 
     def _maybe_free(self, block: _Block) -> None:
-        """Free `block` once Ray holds no copy and no live sharer will pull it
-        (or its sync is over). Caller holds `_lock`."""
-        if block.out > 0 or (block.pending > 0 and block.sync_idx == self._sync_idx):
+        """Free `block` once Ray holds no copy of it and it is not current, or
+        is packed and every live sharer has pulled it. Caller holds `_lock`."""
+        if block.holders:
             return
+        if self._shared.get(block.key) is block:
+            if block.flat is None:
+                return  # its pack is in flight; the packer frees it
+            share_key, seq = block.key
+            if any(
+                self._share_key(c) == share_key and (c, seq) not in self._pulled
+                for c in self._live
+            ):
+                return
         self._blocks.pop(block.offset, None)
         if self._holds.get(block.offset) is block:
             del self._holds[block.offset]
@@ -790,20 +877,27 @@ class _RDTProducerServer:
             torch.cuda.current_stream(flat.device).synchronize()
         return flat
 
-    def _track_free(self, flat: torch.Tensor, offset: int) -> None:
-        """Release this copy of the block at `offset` once Ray drops its last
+    def _track_free(self, flat: torch.Tensor, block: _Block, consumer_id: int) -> None:
+        """Release `consumer_id`'s copy of `block` once Ray drops its last
         reference to `flat` (the consumer's read is done)."""
-        weakref.finalize(flat, self._freed_bucket, offset)
+        weakref.finalize(flat, self._freed_bucket, block, consumer_id)
 
-    def _freed_bucket(self, offset: int) -> None:
-        """Ray freed a served copy of the block at `offset`."""
+    def _freed_bucket(self, block: _Block, consumer_id: int) -> None:
+        """Ray freed `consumer_id`'s copy of `block`; a no-op if the consumer
+        was evicted, which already dropped its copies."""
         with self._lock:
-            block = self._holds.get(offset)
-            if block is not None:
-                block.out -= 1
-                self._maybe_free(block)
-                self._room.notify_all()  # end_sync waits for every free
+            self._drop_holder(block, consumer_id)
             self._last_progress = time.monotonic()
+
+    def _drop_holder(self, block: _Block, consumer_id: int, every: bool = False) -> None:
+        """Drop one (or `every`) copy `consumer_id` holds of `block`. Caller
+        holds `_lock`."""
+        if block.holders.get(consumer_id, 0) > 0:
+            block.holders[consumer_id] = 0 if every else block.holders[consumer_id] - 1
+            if not block.holders[consumer_id]:
+                del block.holders[consumer_id]
+        self._maybe_free(block)
+        self._room.notify_all()  # end_sync waits for every free
 
     def _release_if_done(self, unit: int) -> None:
         """Release `unit` once every live consumer registered and all its
@@ -860,14 +954,31 @@ class ShardedRDTTrainerWeightTransferEngine(
     def __init__(
         self,
         *,
-        client: VLLMWeightSyncClient,
+        client: VLLMWeightSyncClient | Sequence[VLLMWeightSyncClient],
         source: WeightSource,
         is_sender: bool = True,
         init_info: ShardedRDTTrainerInitInfo,
     ) -> None:
+        # one client per deployment lets a sync go on without a failed one
+        clients = list(client) if isinstance(client, Sequence) else [client]
         super().__init__(
-            client=client, source=source, is_sender=is_sender, rank=init_info.rank
+            client=clients[0], source=source, is_sender=is_sender, rank=init_info.rank
         )
+        if len(clients) > 1 and (
+            init_info.num_consumers % len(clients)
+            or init_info.workers_per_replica
+            not in (0, init_info.num_consumers // len(clients))
+        ):
+            raise ValueError(
+                f"{len(clients)} deployment clients cannot split "
+                f"num_consumers={init_info.num_consumers} "
+                f"(workers_per_replica={init_info.workers_per_replica})"
+            )
+        if len(clients) > 1 and not init_info.workers_per_replica:
+            init_info.workers_per_replica = init_info.num_consumers // len(clients)
+        self._clients = clients
+        # deployments evicted from a sync: the next sync initializes them again
+        self._rejoining: set[int] = set()
         self._init_info = init_info
         self._server: Any = None
         self._server_name: str | None = None
@@ -909,7 +1020,7 @@ class ShardedRDTTrainerWeightTransferEngine(
         cls,
         init_info: ShardedRDTTrainerInitInfo,
         *,
-        client: VLLMWeightSyncClient,
+        client: VLLMWeightSyncClient | Sequence[VLLMWeightSyncClient],
         source: WeightSource | None = None,
     ) -> Self:
         if source is None:
@@ -941,12 +1052,14 @@ class ShardedRDTTrainerWeightTransferEngine(
         # names is that barrier.
         engine._server_names = engine._all_gather_server_names(world, engine.rank)
         if engine.is_sender:
-            engine.client.init_weight_transfer_engine(engine.get_worker_init_payload())
+            for r, client in enumerate(engine._clients):
+                client.init_weight_transfer_engine(engine.get_worker_init_payload(r))
         return engine
 
-    def get_worker_init_payload(self) -> dict:
+    def get_worker_init_payload(self, replica_rank: int | None = None) -> dict:
         """The worker-side init payload, from retained state; no collective,
-        so a restarted inference engine can rejoin between syncs.
+        so a restarted inference engine can rejoin between syncs. With one
+        client per deployment, `replica_rank` names the deployment.
 
         Raises:
             RuntimeError: before `trainer_init` gathered the server names.
@@ -972,6 +1085,11 @@ class ShardedRDTTrainerWeightTransferEngine(
                 workers_per_replica=ii.workers_per_replica,
                 buffer_bytes=ii.buffer_bytes,
                 num_buffers=ii.num_buffers,
+                **(
+                    {"replica_rank": replica_rank, "num_replicas": len(self._clients)}
+                    if replica_rank is not None and len(self._clients) > 1
+                    else {}
+                ),
             )
         )
 
@@ -1132,51 +1250,67 @@ class ShardedRDTTrainerWeightTransferEngine(
 
     # ---------------- per sync ----------------
 
-    def send_weights(self, live_consumer_ids: Collection[int] | None = None) -> None:
+    def send_weights(
+        self, live_consumer_ids: Collection[int] | None = None
+    ) -> list[int] | None:
         """Gather this rank's weights and serve them to the consumers.
 
         `live_consumer_ids` restricts the sync to the consumers still alive
-        (every rank must get the same set); `None` serves all of them.
+        (every rank must get the same set); `None` serves all of them. On the
+        sender, a deployment that fails or stalls is evicted and the sync goes
+        on without it; it is initialized again at the next sync. Returns, on
+        the sender, the deployments that finished the sync.
+
+        Raises:
+            RuntimeError: every deployment was evicted.
+
         """
         self._sync_idx += 1
+        num_consumers = self._init_info.num_consumers
         if live_consumer_ids is None:
-            live = list(range(self._init_info.num_consumers))
+            live = list(range(num_consumers))
         else:
             live = sorted(set(int(c) for c in live_consumer_ids))
             logger.warning(
                 "[rdt-degraded] serving %d/%d live consumers",
                 len(live),
-                self._init_info.num_consumers,
+                num_consumers,
             )
         if not self.is_sender:
             self._run_gather_loop(None, live)
-            return
-        from vllm.distributed.weight_transfer.sharded_rdt_engine import (
-            ShardedRDTWeightTransferUpdateInfo,
-        )
-
+            return None
+        per = num_consumers // len(self._clients)
+        replicas = [
+            r for r in range(len(self._clients)) if set(live) & set(self._consumers(r))
+        ]
+        sync = _SyncRound(self, replicas, per)
+        threads = [
+            threading.Thread(
+                target=sync.run_replica, args=(r,), name=f"rdt-replica-{r}", daemon=True
+            )
+            for r in replicas
+        ]
+        threading.Thread(target=sync.monitor, name="rdt-monitor", daemon=True).start()
+        for t in threads:
+            t.start()
         try:
-            self.client.start_weight_update()
-        except BaseException as e:
-            # the other ranks are gathering this sync: fail it on their producers
-            self._fail_producers(f"start_weight_update failed: {e!r}")
-            raise
-        update = asdict(ShardedRDTWeightTransferUpdateInfo(sync_idx=self._sync_idx))
-        with ThreadPoolExecutor(max_workers=1) as exe:
-            # the workers pull inside update_weights, alongside the gathers
-            future = exe.submit(self.client.update_weights, update)
-            future.add_done_callback(self._fail_producers_on_error)
-            self._run_gather_loop(future, live)
-            future.result()
-        self.client.finish_weight_update()
+            self._run_gather_loop(sync.failure, live)
+            sync.wait()
+        finally:
+            sync.close()
+        if reason := sync.failure():
+            raise RuntimeError(reason)
+        return sorted(sync.synced)
 
-    def _fail_producers_on_error(self, update_future) -> None:
-        """A failed `update_weights` (a worker's pull failed) fails the sync
-        on every producer at once, so no rank waits out the stall watchdog
-        for releases that will not come."""
-        error = update_future.exception()
-        if error is not None:
-            self._fail_producers(f"update_weights failed: {error!r}")
+    def _consumers(self, replica: int) -> range:
+        per = self._init_info.num_consumers // len(self._clients)
+        return range(replica * per, (replica + 1) * per)
+
+    def _producers(self) -> list[Any]:
+        return [
+            ray.get_actor(name, namespace=self._init_info.trainer_actor_namespace)
+            for name in self._server_names or []
+        ]
 
     def _fail_producers(self, message: str) -> None:
         """Fail this sync on every producer."""
@@ -1187,7 +1321,9 @@ class ShardedRDTTrainerWeightTransferEngine(
                 )
                 actor.set_gather_error.remote(message, self._sync_idx)
 
-    def _run_gather_loop(self, update_future, live: list[int]) -> None:
+    def _run_gather_loop(
+        self, aborted: Callable[[], str | None] | None, live: list[int]
+    ) -> None:
         """Gather and publish this rank's units in order, holding at most
         `gather_lookahead + 1` unreleased ones. Runs on every rank."""
         assert self.source is not None
@@ -1225,8 +1361,8 @@ class ShardedRDTTrainerWeightTransferEngine(
                 spent[0] += t1 - t0
                 spent[1] += t2 - t1
                 spent[2] += time.perf_counter() - t2
-                if update_future is not None and update_future.done():
-                    update_future.result()  # a worker failed: stop gathering
+                if aborted is not None and (reason := aborted()):
+                    raise RuntimeError(reason)
             while pending:
                 ray.get(pending.pop(0))
             t0 = time.perf_counter()
@@ -1403,3 +1539,152 @@ class ShardedRDTTrainerWeightTransferEngine(
             ray.kill(self._server)
         self._server = None
         self._inflight.clear()
+
+
+class _SyncRound:
+    """One sync on the sender: each deployment runs start, update and finish
+    on its own thread; a deployment whose call fails, or that a stalled sync
+    waits on, is evicted from every producer and the rest go on."""
+
+    def __init__(
+        self,
+        engine: ShardedRDTTrainerWeightTransferEngine,
+        replicas: list[int],
+        per_replica: int,
+    ) -> None:
+        self.engine, self.sync_idx = engine, engine._sync_idx
+        self.per_replica = per_replica
+        self.phase = dict.fromkeys(replicas, "init")
+        self.synced: set[int] = set()
+        self.reasons: dict[int, str] = {}
+        self._cond = threading.Condition()
+        self._closed = False
+        self._producers = engine._producers()
+
+    def run_replica(self, r: int) -> None:
+        """start -> update -> finish on deployment `r`; any failure evicts it."""
+        from vllm.distributed.weight_transfer.sharded_rdt_engine import (
+            ShardedRDTWeightTransferUpdateInfo,
+        )
+
+        engine, client = self.engine, self.engine._clients[r]
+        update = asdict(ShardedRDTWeightTransferUpdateInfo(sync_idx=self.sync_idx))
+        try:
+            if r in engine._rejoining:
+                client.init_weight_transfer_engine(engine.get_worker_init_payload(r))
+                engine._rejoining.discard(r)
+            self._enter(r, "start")
+            client.start_weight_update()
+            self._enter(r, "update")
+            for attempt in range(engine._init_info.update_retries + 1):
+                try:
+                    client.update_weights(update)
+                    break
+                except Exception as e:
+                    if attempt == engine._init_info.update_retries:
+                        raise
+                    logger.warning("[rdt-retry] deployment %d update: %r", r, e)
+                    self._enter(r, "update")  # still live?
+            self._enter(r, "finish")
+            client.finish_weight_update()
+        except _Evicted:
+            return
+        except Exception as e:
+            self.evict(r, f"{self.phase.get(r)} failed: {e!r}")
+            return
+        with self._cond:
+            if self.phase[r] != "finish":
+                return  # evicted while finishing: not counted as synced
+            self.phase[r] = "done"
+            self.synced.add(r)
+            self._cond.notify_all()
+
+    def _enter(self, r: int, phase: str) -> None:
+        with self._cond:
+            if self.phase[r] in ("evicting", "evicted"):
+                raise _Evicted
+            self.phase[r] = phase
+
+    def evict(self, r: int, reason: str) -> None:
+        """Drop deployment `r` from this sync on every producer; returns once
+        they all have, so the sync ends with no block held for it."""
+        with self._cond:
+            if self.phase[r] in ("evicting", "evicted", "done"):
+                return
+            self.phase[r] = "evicting"  # fences its finish
+            self.reasons[r] = reason
+            self.engine._rejoining.add(r)
+        logger.warning(
+            "[rdt-evict] sync %d: deployment %d: %s", self.sync_idx, r, reason
+        )
+        consumers = list(self.engine._consumers(r))
+        with contextlib.suppress(Exception):
+            ray.get(
+                [p.evict.remote(consumers, self.sync_idx) for p in self._producers],
+                timeout=self.engine._init_info.stall_timeout_s,
+            )
+        with self._cond:
+            self.phase[r] = "evicted"
+            self._cond.notify_all()
+            failure = self.failure()
+        if failure:
+            self.engine._fail_producers(failure)
+
+    def failure(self) -> str | None:
+        """Why the sync failed: every deployment was evicted."""
+        if self.phase and all(p == "evicted" for p in self.phase.values()):
+            return f"sharded RDT sync {self.sync_idx}: every deployment was evicted: " + (
+                "; ".join(f"{r}: {why}" for r, why in sorted(self.reasons.items()))
+            )
+        return None
+
+    def monitor(self) -> None:
+        """Evict the deployments a stalled sync waits on: once no producer has
+        progressed for `evict_after_s`, every consumer that owes pulls and
+        either holds served copies (stuck mid-read) or has no pull in flight
+        anywhere (never pulled, or stopped). A consumer parked in a pull is
+        waiting on someone else, so it stays."""
+        after = self.engine._init_info.evict_after_s
+        poll = min(_STALL_POLL_S, after / 4)
+        while True:
+            with self._cond:
+                if self._cond.wait_for(lambda: self._closed, timeout=poll):
+                    return
+            try:
+                snaps = ray.get(
+                    [p.snapshot.remote(self.sync_idx) for p in self._producers],
+                    timeout=poll,
+                )
+            except Exception:
+                continue  # a producer is busy or gone: the watchdog covers it
+            if any(s["sync_idx"] != self.sync_idx for s in snaps):
+                continue
+            if min(s["idle_s"] for s in snaps) < after:
+                continue
+            owing = {c for s in snaps for c in s["owing"]}
+            holding = {c for s in snaps for c in s["holding"]}
+            waiting = {c for s in snaps for c in s["waiting"]}
+            for c in sorted(owing):
+                r = c // self.per_replica
+                if self.phase.get(r) != "update":
+                    continue  # start and finish have their own outcome
+                if c in holding:
+                    self.evict(r, f"stalled: consumer {c} holds served buckets")
+                elif c not in waiting:
+                    self.evict(r, f"stalled: consumer {c} has no pull in flight")
+
+    def wait(self) -> None:
+        """Until every deployment finished or was evicted."""
+        with self._cond:
+            self._cond.wait_for(
+                lambda: all(p in ("done", "evicted") for p in self.phase.values())
+            )
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+class _Evicted(Exception):
+    """The deployment was evicted while its call ran."""
