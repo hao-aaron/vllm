@@ -596,6 +596,7 @@ class _RDTProducerServer:
                 ),
                 "holding": sorted(holding & self._live),
                 "waiting": sorted(c for c in self._waiting if c in self._live),
+                "pulled": {c: pulled[c] for c in self._live},
             }
 
     # ---------------- consumer-facing ----------------
@@ -1301,6 +1302,12 @@ class ShardedRDTTrainerWeightTransferEngine(
         if reason := sync.failure():
             raise RuntimeError(reason)
         return sorted(sync.synced)
+
+    def set_deployment_client(self, replica: int, client: VLLMWeightSyncClient) -> None:
+        """Point deployment `replica` at a replacement (e.g. a restarted
+        server at a new address); the next sync initializes it."""
+        self._clients[replica] = client
+        self._rejoining.add(replica)
 
     def _consumers(self, replica: int) -> range:
         per = self._init_info.num_consumers // len(self._clients)
