@@ -342,11 +342,15 @@ class _Deployment(RecordingClient):
                     self.server.outstanding.remove(key)
                     self.server._freed_bucket(*key)  # the read is done
             self.received.add(sync)
+        if fault == "hang_after_pull":
+            threading.Event().wait()  # pulled everything; the reply never comes
         if fault == "lost_response" and self.order.count("update") == 1:
             raise TimeoutError("read timed out")
 
 
-@pytest.mark.parametrize("fault", ["crash", "lost_request", "frozen", "lost_response"])
+@pytest.mark.parametrize(
+    "fault", ["crash", "lost_request", "frozen", "hang_after_pull", "lost_response"]
+)
 def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault):
     """Deployment 1 fails in sync 0: the sync finishes on deployment 0 (a lost
     response is retried instead), and deployment 1 rejoins in sync 1."""
@@ -359,6 +363,7 @@ def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault)
         num_consumers=2,
         buffer_bytes=32,
         evict_after_s=1.0,
+        rpc_timeout_s=2.0,
     )
     server = _attach_server(engine)
     server._share_every = 1  # the deployments share blocks
