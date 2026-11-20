@@ -12,6 +12,7 @@ docs/training/weight_transfer/sharded_rdt.md.
 
 import itertools
 import math
+import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -65,6 +66,9 @@ def check_ray_rdt_version() -> None:
 def _ray_experimental() -> Any:
     from vllm.distributed.nixl_utils import alias_nixl_for_ray
 
+    # UCX keepalive failing on a hung peer breaks this process's other UCX
+    # connections; eviction handles hung workers. Set before Ray's NIXL agent.
+    os.environ.setdefault("UCX_KEEPALIVE_INTERVAL", "inf")
     alias_nixl_for_ray()
     import ray.experimental
 
