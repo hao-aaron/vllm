@@ -72,7 +72,7 @@ def cpu_ipc(monkeypatch):
     monkeypatch.setattr(trainer_mod, "rebuild_cuda_tensor", lambda *a: registry[a[0]])
     monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
     # server calls run inline: a call's "ref" is its result
-    monkeypatch.setattr(trainer_mod.ray, "get", lambda result: result)
+    monkeypatch.setattr(trainer_mod.ray, "get", lambda result, timeout=None: result)
     patch_for_cpu(monkeypatch)
 
 
@@ -311,3 +311,132 @@ def test_a_source_out_of_order_fails_the_sync(cpu_ipc):
     with pytest.raises(RuntimeError, match="metadata order"):
         engine.send_weights()
     assert server._error is not None
+
+
+# ------------------------------------------------------------ fault tolerance
+
+
+class _Deployment(RecordingClient):
+    """One deployment's client whose `update_weights` pulls every bucket
+    itself, failing in sync 1 as `fault` says."""
+
+    def __init__(self, server, consumer_id, nbuckets, fault=None):
+        super().__init__()
+        self.server, self.c, self.n, self.fault = server, consumer_id, nbuckets, fault
+        self.received: set[int] = set()
+
+    def update_weights(self, update_info):
+        super().update_weights(update_info)
+        sync = update_info["sync_idx"]
+        fault = self.fault if sync == 0 else None
+        if fault == "crash":
+            raise ConnectionError("connection reset by peer")
+        if fault == "lost_request":
+            threading.Event().wait()  # the call never arrives, nor returns
+        if sync not in self.received:  # a retry of a received sync is a no-op
+            for seq in range(self.n):
+                self.server.bucket(self.c, seq, sync)
+                if fault == "frozen":
+                    threading.Event().wait()  # stuck mid-read: never frees it
+                for key in [k for k in self.server.outstanding if k[1] == self.c]:
+                    self.server.outstanding.remove(key)
+                    self.server._freed_bucket(*key)  # the read is done
+            self.received.add(sync)
+        if fault == "hang_after_pull":
+            threading.Event().wait()  # pulled everything; the reply never comes
+        if fault == "lost_response" and self.order.count("update") == 1:
+            raise TimeoutError("read timed out")
+
+
+def _two_deployments(monkeypatch, clients, pairs):
+    """A sender engine and its producer, whose two deployments share blocks."""
+    engine = _engine(
+        _Source(pairs),
+        client=clients,
+        num_consumers=2,
+        buffer_bytes=32,
+        evict_after_s=1.0,
+        rpc_timeout_s=2.0,
+    )
+    server = _attach_server(engine)
+    server._share_every = 1
+    for client in clients:
+        client.server = server
+    for c in (0, 1):
+        server.register_consumer(c, [[(n, ((0, 8),))] for n, _ in pairs])
+    actor = SimpleNamespace(
+        **{
+            m: SimpleNamespace(remote=getattr(server, m))
+            for m in ("evict", "snapshot", "set_gather_error")
+        }
+    )
+    engine._server_names = ["rk0"]
+    monkeypatch.setattr(trainer_mod.ray, "get_actor", lambda *a, **k: actor)
+    return engine, server
+
+
+@pytest.mark.parametrize(
+    "fault", ["crash", "lost_request", "frozen", "hang_after_pull", "lost_response"]
+)
+def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault):
+    """Deployment 1 fails in sync 0: the sync finishes on deployment 0 (a lost
+    response is retried instead), and deployment 1 rejoins in sync 1."""
+    pairs = _pairs(4)
+    clients = [_Deployment(None, c, len(pairs), fault if c else None) for c in (0, 1)]
+    engine, server = _two_deployments(monkeypatch, clients, pairs)
+
+    synced = engine.send_weights()
+    assert synced == ([0, 1] if fault == "lost_response" else [0])
+    assert clients[0].order == ["start", "update", "finish"]
+    assert not server._holds, "an evicted deployment kept arena blocks"
+
+    assert engine.send_weights() == [0, 1]
+    rejoined = fault != "lost_response"  # an evicted deployment is re-initialized
+    assert ("init" in clients[1].order) == rejoined
+    assert clients[1].order[-3:] == ["start", "update", "finish"]
+
+
+def test_a_deployment_rejoins_outside_the_sync(cpu_ipc, monkeypatch):
+    """While `rejoin` plans deployment 1, a sync leaves it out instead of
+    waiting on it; then it joins with no init inside the sync. A rejoin of a
+    deployment that already finished a running sync uncounts it."""
+    planning, planned = threading.Event(), threading.Event()
+    hold, release = threading.Event(), threading.Event()
+
+    class _Planning(_Deployment):
+        def start_weight_update(self):
+            super().start_weight_update()
+            if not planned.is_set():
+                planning.set()
+                planned.wait()
+
+    class _SlowFinish(_Deployment):
+        def finish_weight_update(self, weight_version=None):
+            super().finish_weight_update(weight_version)
+            if hold.is_set():
+                release.wait()
+
+    pairs = _pairs(4)
+    clients = [_SlowFinish(None, 0, len(pairs)), _Planning(None, 1, len(pairs))]
+    engine, server = _two_deployments(monkeypatch, clients, pairs)
+    rejoin = threading.Thread(target=engine.rejoin, args=(1,))
+    rejoin.start()
+    planning.wait()
+
+    assert engine.send_weights() == [0]
+    assert not server._holds, "the sync kept blocks for the planning deployment"
+    planned.set()
+    rejoin.join()
+    assert engine.send_weights() == [0, 1]
+    assert clients[1].order == ["init", "start", "start", "update", "finish"]
+
+    hold.set()
+    result = []
+    sync = threading.Thread(target=lambda: result.append(engine.send_weights()))
+    sync.start()
+    while engine._round is None or engine._round.phase.get(1) != "done":
+        time.sleep(0.01)
+    engine.rejoin(1)  # e.g. restarted right after it finished
+    release.set()
+    sync.join()
+    assert result == [[0]]

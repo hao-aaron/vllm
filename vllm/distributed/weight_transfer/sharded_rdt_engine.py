@@ -224,6 +224,9 @@ class ShardedRDTWeightTransferEngine(
     update_info_cls = ShardedRDTWeightTransferUpdateInfo
     # The plan belongs to one model's tensors.
     supports_draft_weight_update = False
+    # Every sync resends the whole model, so an abandoned update is safe to
+    # start over.
+    restarts_open_update = True
 
     def __init__(
         self,
@@ -241,6 +244,7 @@ class ShardedRDTWeightTransferEngine(
                 f"distributed_executor_backend='ray', got {backend!r}: the "
                 "workers must be Ray actors with tensor transport."
             )
+        self._init_info: ShardedRDTWeightTransferInitInfo | None = None
         self._metas: list[ParamMeta] | None = None
         self._units: dict[str, int] = {}
         self._router: RdtRouter | None = None
@@ -258,10 +262,13 @@ class ShardedRDTWeightTransferEngine(
         # dropped.
         self._arena: torch.Tensor | None = None
         self._slot_bytes = 0
+        # the last sync received in full: a retried update of it is a no-op
+        self._received_sync: int | None = None
 
     def init_transfer_engine(self, init_info: ShardedRDTWeightTransferInitInfo) -> None:
         """Check the configuration and bind the producers. Touches no model
-        state; the plan is built at the next `start_weight_update`.
+        state; the plan is built at the next `start_weight_update`, and an
+        identical init keeps the current one.
 
         Raises:
             ValueError: invalid settings or metadata.
@@ -272,6 +279,8 @@ class ShardedRDTWeightTransferEngine(
         """
         from vllm.model_executor.model_loader.reload import check_plannable
 
+        if self._planned and init_info == self._init_info:
+            return  # a rejoin of a live worker: its plan and registration hold
         validate_int("buffer_bytes", init_info.buffer_bytes, minimum=1)
         validate_int("num_buffers", init_info.num_buffers, minimum=1)
         validate_int("num_consumers", init_info.num_consumers, minimum=0)
@@ -327,6 +336,7 @@ class ShardedRDTWeightTransferEngine(
         producers = _resolve_producers(init_info)
 
         self._drop_plan()
+        self._init_info = init_info
         self._metas = metas
         nbytes = [meta_nbytes(m) for m in metas]
         self._units = {
@@ -541,6 +551,9 @@ class ShardedRDTWeightTransferEngine(
         )
 
         validate_int("sync_idx", update_info.sync_idx, minimum=0)
+        if update_info.sync_idx == self._received_sync:
+            logger.info("Sharded RDT sync %d: already received", update_info.sync_idx)
+            return
         if (
             not self._planned
             or self._hooks is None
@@ -608,6 +621,7 @@ class ShardedRDTWeightTransferEngine(
             land(ready)
         for name in self._written:  # for direct reload's completeness check
             mark_loaded(self.model, name)
+        self._received_sync = sync_idx
         logger.info(
             "Sharded RDT sync %d: %d pulls, %.1f MiB, %d fallbacks, in %.2f s "
             "(waiting %.2f s, fetching %.2f s, applying %.2f s)",
@@ -707,6 +721,7 @@ class ShardedRDTWeightTransferEngine(
 
     def _drop_plan(self) -> None:
         self._planned = False
+        self._received_sync = None
         self._buckets, self._written = [], []
         if self._arena is not None:
             deregister_nixl_memory(self._arena)
@@ -714,6 +729,7 @@ class ShardedRDTWeightTransferEngine(
 
     def shutdown(self) -> None:
         self._drop_plan()
+        self._init_info = None
         self._metas = None
         self._producers = []
         self._hooks = None
