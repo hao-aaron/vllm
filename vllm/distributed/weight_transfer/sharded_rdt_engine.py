@@ -244,6 +244,7 @@ class ShardedRDTWeightTransferEngine(
                 f"distributed_executor_backend='ray', got {backend!r}: the "
                 "workers must be Ray actors with tensor transport."
             )
+        self._init_info: ShardedRDTWeightTransferInitInfo | None = None
         self._metas: list[ParamMeta] | None = None
         self._units: dict[str, int] = {}
         self._router: RdtRouter | None = None
@@ -266,7 +267,8 @@ class ShardedRDTWeightTransferEngine(
 
     def init_transfer_engine(self, init_info: ShardedRDTWeightTransferInitInfo) -> None:
         """Check the configuration and bind the producers. Touches no model
-        state; the plan is built at the next `start_weight_update`.
+        state; the plan is built at the next `start_weight_update`, and an
+        identical init keeps the current one.
 
         Raises:
             ValueError: invalid settings or metadata.
@@ -277,6 +279,8 @@ class ShardedRDTWeightTransferEngine(
         """
         from vllm.model_executor.model_loader.reload import check_plannable
 
+        if self._planned and init_info == self._init_info:
+            return  # a rejoin of a live worker: its plan and registration hold
         validate_int("buffer_bytes", init_info.buffer_bytes, minimum=1)
         validate_int("num_buffers", init_info.num_buffers, minimum=1)
         validate_int("num_consumers", init_info.num_consumers, minimum=0)
@@ -332,6 +336,7 @@ class ShardedRDTWeightTransferEngine(
         producers = _resolve_producers(init_info)
 
         self._drop_plan()
+        self._init_info = init_info
         self._metas = metas
         nbytes = [meta_nbytes(m) for m in metas]
         self._units = {
@@ -724,6 +729,7 @@ class ShardedRDTWeightTransferEngine(
 
     def shutdown(self) -> None:
         self._drop_plan()
+        self._init_info = None
         self._metas = None
         self._producers = []
         self._hooks = None

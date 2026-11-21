@@ -72,7 +72,7 @@ def cpu_ipc(monkeypatch):
     monkeypatch.setattr(trainer_mod, "rebuild_cuda_tensor", lambda *a: registry[a[0]])
     monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
     # server calls run inline: a call's "ref" is its result
-    monkeypatch.setattr(trainer_mod.ray, "get", lambda result: result)
+    monkeypatch.setattr(trainer_mod.ray, "get", lambda result, timeout=None: result)
     patch_for_cpu(monkeypatch)
 
 
@@ -348,15 +348,8 @@ class _Deployment(RecordingClient):
             raise TimeoutError("read timed out")
 
 
-@pytest.mark.parametrize(
-    "fault", ["crash", "lost_request", "frozen", "hang_after_pull", "lost_response"]
-)
-def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault):
-    """Deployment 1 fails in sync 0: the sync finishes on deployment 0 (a lost
-    response is retried instead), and deployment 1 rejoins in sync 1."""
-    monkeypatch.setattr(trainer_mod.ray, "get", lambda r, timeout=None: r)
-    pairs = _pairs(4)
-    clients = [_Deployment(None, c, len(pairs), fault if c else None) for c in (0, 1)]
+def _two_deployments(monkeypatch, clients, pairs):
+    """A sender engine and its producer, whose two deployments share blocks."""
     engine = _engine(
         _Source(pairs),
         client=clients,
@@ -366,7 +359,7 @@ def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault)
         rpc_timeout_s=2.0,
     )
     server = _attach_server(engine)
-    server._share_every = 1  # the deployments share blocks
+    server._share_every = 1
     for client in clients:
         client.server = server
     for c in (0, 1):
@@ -379,6 +372,18 @@ def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault)
     )
     engine._server_names = ["rk0"]
     monkeypatch.setattr(trainer_mod.ray, "get_actor", lambda *a, **k: actor)
+    return engine, server
+
+
+@pytest.mark.parametrize(
+    "fault", ["crash", "lost_request", "frozen", "hang_after_pull", "lost_response"]
+)
+def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault):
+    """Deployment 1 fails in sync 0: the sync finishes on deployment 0 (a lost
+    response is retried instead), and deployment 1 rejoins in sync 1."""
+    pairs = _pairs(4)
+    clients = [_Deployment(None, c, len(pairs), fault if c else None) for c in (0, 1)]
+    engine, server = _two_deployments(monkeypatch, clients, pairs)
 
     synced = engine.send_weights()
     assert synced == ([0, 1] if fault == "lost_response" else [0])
@@ -389,3 +394,30 @@ def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault)
     rejoined = fault != "lost_response"  # an evicted deployment is re-initialized
     assert ("init" in clients[1].order) == rejoined
     assert clients[1].order[-3:] == ["start", "update", "finish"]
+
+
+def test_a_deployment_rejoins_outside_the_sync(cpu_ipc, monkeypatch):
+    """While `rejoin` plans deployment 1, a sync leaves it out instead of
+    waiting on it; then it joins with no init inside the sync."""
+    planning, planned = threading.Event(), threading.Event()
+
+    class _Planning(_Deployment):
+        def start_weight_update(self):
+            super().start_weight_update()
+            if not planned.is_set():
+                planning.set()
+                planned.wait()
+
+    pairs = _pairs(4)
+    clients = [_Deployment(None, 0, len(pairs)), _Planning(None, 1, len(pairs))]
+    engine, server = _two_deployments(monkeypatch, clients, pairs)
+    rejoin = threading.Thread(target=engine.rejoin, args=(1,))
+    rejoin.start()
+    planning.wait()
+
+    assert engine.send_weights() == [0]
+    assert not server._holds, "the sync kept blocks for the planning deployment"
+    planned.set()
+    rejoin.join()
+    assert engine.send_weights() == [0, 1]
+    assert clients[1].order == ["init", "start", "start", "update", "finish"]

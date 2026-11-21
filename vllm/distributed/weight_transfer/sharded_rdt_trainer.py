@@ -647,21 +647,26 @@ class _RDTProducerServer:
             )
         key = self._share_key(consumer_id)
         with self._lock:
+            known = None
             for other, theirs in self._buckets.items():
-                if other != consumer_id and self._share_key(other) == key:
-                    if theirs != served:
-                        raise ValueError(
-                            f"consumer {consumer_id} registered other buckets "
-                            f"than consumer {other}, the same worker of another "
-                            "deployment: deployments must be identical"
-                        )
-                    served = theirs
-                    break
+                if self._share_key(other) != key:
+                    continue
+                if theirs == served:
+                    known = theirs
+                elif other != consumer_id:
+                    raise ValueError(
+                        f"consumer {consumer_id} registered other buckets "
+                        f"than consumer {other}, the same worker of another "
+                        "deployment: deployments must be identical"
+                    )
+            if known is None:  # new buckets: drop the sources built for others
+                self._sources[key] = {}
+                self._seqs[key] = {}
+                for seq, b in enumerate(served):
+                    self._seqs[key].setdefault(b.unit, []).append(seq)
+            else:  # a rejoin: keep the sources its peers are being served from
+                served = known
             self._buckets[consumer_id] = served
-            self._sources[key] = {}
-            self._seqs[key] = {}
-            for seq, b in enumerate(served):
-                self._seqs[key].setdefault(b.unit, []).append(seq)
             self._needs[consumer_id] = Counter(b.unit for b in served)
             for unit in list(self._resident):
                 self._release_if_done(unit)
@@ -979,6 +984,10 @@ class ShardedRDTTrainerWeightTransferEngine(
         self._clients = clients
         # deployments evicted from a sync: the next sync initializes them again
         self._rejoining: set[int] = set()
+        # deployments `rejoin` is preparing: syncs leave them out meanwhile
+        self._preparing: set[int] = set()
+        self._state_lock = threading.Lock()
+        self._round: _SyncRound | None = None
         self._init_info = init_info
         self._server: Any = None
         self._server_name: str | None = None
@@ -1255,11 +1264,12 @@ class ShardedRDTTrainerWeightTransferEngine(
     ) -> list[int] | None:
         """Gather this rank's weights and serve them to the consumers.
 
-        `live_consumer_ids` restricts the sync to the consumers still alive
-        (every rank must get the same set); `None` serves all of them. On the
-        sender, a deployment that fails or stalls is evicted and the sync goes
-        on without it; it is initialized again at the next sync. Returns, on
-        the sender, the deployments that finished the sync.
+        `live_consumer_ids` restricts the sync to the consumers still alive;
+        `None` serves all of them. The sender's set rules: it evicts the rest
+        on every producer, so other ranks may pass `None`. On the sender, a
+        deployment that fails or stalls is evicted and the sync goes on
+        without it; it is initialized again at the next sync. Returns, on the
+        sender, the deployments that finished the sync.
 
         Raises:
             RuntimeError: every deployment was evicted.
@@ -1280,10 +1290,20 @@ class ShardedRDTTrainerWeightTransferEngine(
             self._run_gather_loop(None, live)
             return None
         per = num_consumers // len(self._clients)
-        replicas = [
-            r for r in range(len(self._clients)) if set(live) & set(self._consumers(r))
-        ]
-        sync = _SyncRound(self, replicas, per)
+        with self._state_lock:
+            replicas = [
+                r
+                for r in range(len(self._clients))
+                if r not in self._preparing and set(live) & set(self._consumers(r))
+            ]
+            sync = self._round = _SyncRound(self, replicas, per)
+        served = {c for r in replicas for c in self._consumers(r)} & set(live)
+        if left_out := sorted(set(range(num_consumers)) - served):
+            # other ranks may begin the sync with them: drop them there too
+            ray.get(
+                [p.evict.remote(left_out, self._sync_idx) for p in sync._producers],
+                timeout=self._init_info.rpc_timeout_s,
+            )
         threading.Thread(target=sync.monitor, name="rdt-monitor", daemon=True).start()
         for r in replicas:
             name = f"rdt-replica-{r}"
@@ -1295,15 +1315,44 @@ class ShardedRDTTrainerWeightTransferEngine(
             sync.finish_up()
         finally:
             sync.close()
+            with self._state_lock:
+                self._round = None
         if reason := sync.failure():
             raise RuntimeError(reason)
         return sorted(sync.synced)
 
-    def set_deployment_client(self, replica: int, client: VLLMWeightSyncClient) -> None:
-        """Point deployment `replica` at a replacement (e.g. a restarted
-        server at a new address); the next sync initializes it."""
-        self._clients[replica] = client
-        self._rejoining.add(replica)
+    def rejoin(self, replica: int, client: VLLMWeightSyncClient | None = None) -> None:
+        """Initialize and plan deployment `replica` (restarted, or replaced by
+        `client`) outside any sync, which would otherwise wait on its
+        planning; syncs leave it out until this returns. Sender only.
+
+        Raises:
+            Exception: its init or start failed; the next sync retries it.
+
+        """
+        with self._state_lock:
+            if client is not None:
+                self._clients[replica] = client
+            self._preparing.add(replica)
+            client, sync = self._clients[replica], self._round
+        if sync is not None and replica in sync.phase:
+            sync.evict(replica, "rejoining")
+        try:
+            timeout = self._init_info.rpc_timeout_s
+            _bounded(
+                timeout,
+                client.init_weight_transfer_engine,
+                self.get_worker_init_payload(replica),
+            )
+            _bounded(timeout, client.start_weight_update)
+        except BaseException:
+            with self._state_lock:
+                self._preparing.discard(replica)
+                self._rejoining.add(replica)
+            raise
+        with self._state_lock:
+            self._preparing.discard(replica)
+            self._rejoining.discard(replica)
 
     def _consumers(self, replica: int) -> range:
         per = self._init_info.num_consumers // len(self._clients)
@@ -1615,18 +1664,7 @@ class _SyncRound:
                 self.updating_since.setdefault(r, time.monotonic())
 
     def _bounded(self, fn: Callable[..., Any], *args: Any) -> None:
-        """Call `fn` on a daemon thread; raise if it takes over `rpc_timeout_s`
-        (a client need not have a timeout of its own)."""
-        done: Future = Future()
-
-        def call() -> None:
-            try:
-                done.set_result(fn(*args))
-            except BaseException as e:
-                done.set_exception(e)
-
-        threading.Thread(target=call, daemon=True).start()
-        done.result(timeout=self.engine._init_info.rpc_timeout_s)
+        _bounded(self.engine._init_info.rpc_timeout_s, fn, *args)
 
     def evict(self, r: int, reason: str, only_in: str | None = None) -> None:
         """Drop deployment `r` from this sync on every producer (if it is in
@@ -1725,6 +1763,21 @@ class _SyncRound:
         with self._cond:
             self._closed = True
             self._cond.notify_all()
+
+
+def _bounded(timeout: float, fn: Callable[..., Any], *args: Any) -> None:
+    """Call `fn` on a daemon thread; raise if it takes over `timeout` seconds
+    (a client need not have a timeout of its own)."""
+    done: Future = Future()
+
+    def call() -> None:
+        try:
+            done.set_result(fn(*args))
+        except BaseException as e:
+            done.set_exception(e)
+
+    threading.Thread(target=call, daemon=True).start()
+    done.result(timeout=timeout)
 
 
 class _Evicted(Exception):

@@ -397,6 +397,10 @@ def test_receive_arena_is_pinned_once_per_plan(monkeypatch):
         fleet.sync(_checkpoint(_TOY_SHAPES, seed=sync_idx), sync_idx)
         (arena,) = _PINNED
         assert arena.numel() == 3 * max(b.nbytes for b in fleet.engine._buckets)
+        # a rejoin re-sends the same init: the plan and its arena stay
+        fleet.engine.init_transfer_engine(fleet.engine._init_info)
+        (pinned,) = _PINNED
+        assert fleet.engine._planned and pinned is arena
     fleet.engine.shutdown()
     assert not _PINNED
 
