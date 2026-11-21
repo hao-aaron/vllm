@@ -982,10 +982,9 @@ class ShardedRDTTrainerWeightTransferEngine(
         if len(clients) > 1 and not init_info.workers_per_replica:
             init_info.workers_per_replica = init_info.num_consumers // len(clients)
         self._clients = clients
-        # deployments evicted from a sync: the next sync initializes them again
-        self._rejoining: set[int] = set()
-        # deployments `rejoin` is preparing: syncs leave them out meanwhile
-        self._preparing: set[int] = set()
+        # per deployment, "init" (evicted: the next sync initializes it) or
+        # "preparing" (`rejoin` runs: syncs leave it out); absent when ready
+        self._state: dict[int, str] = {}
         self._state_lock = threading.Lock()
         self._round: _SyncRound | None = None
         self._init_info = init_info
@@ -1294,16 +1293,28 @@ class ShardedRDTTrainerWeightTransferEngine(
             replicas = [
                 r
                 for r in range(len(self._clients))
-                if r not in self._preparing and set(live) & set(self._consumers(r))
+                if self._state.get(r) != "preparing"
+                and set(live) & set(self._consumers(r))
             ]
-            sync = self._round = _SyncRound(self, replicas, per)
-        served = {c for r in replicas for c in self._consumers(r)} & set(live)
-        if left_out := sorted(set(range(num_consumers)) - served):
-            # other ranks may begin the sync with them: drop them there too
-            ray.get(
-                [p.evict.remote(left_out, self._sync_idx) for p in sync._producers],
-                timeout=self._init_info.rpc_timeout_s,
-            )
+            reinit = {r for r in replicas if self._state.pop(r, None) == "init"}
+            sync = self._round = _SyncRound(self, replicas, per, reinit)
+        served = sorted({c for r in replicas for c in self._consumers(r)} & set(live))
+        left_out = sorted(set(range(num_consumers)) - set(served))
+        try:
+            if not replicas:
+                raise RuntimeError(
+                    f"sharded RDT sync {self._sync_idx}: no deployment to sync"
+                )
+            if left_out:  # other ranks may begin the sync with them
+                ray.get(
+                    [p.evict.remote(left_out, self._sync_idx) for p in sync._producers],
+                    timeout=self._init_info.rpc_timeout_s,
+                )
+        except BaseException as e:
+            self._fail_producers(repr(e))  # the other ranks are gathering
+            with self._state_lock:
+                self._round = None
+            raise
         threading.Thread(target=sync.monitor, name="rdt-monitor", daemon=True).start()
         for r in replicas:
             name = f"rdt-replica-{r}"
@@ -1311,7 +1322,7 @@ class ShardedRDTTrainerWeightTransferEngine(
                 target=sync.run_replica, args=(r,), name=name, daemon=True
             ).start()
         try:
-            self._run_gather_loop(sync.failure, live)
+            self._run_gather_loop(sync.failure, served)
             sync.finish_up()
         finally:
             sync.close()
@@ -1324,19 +1335,23 @@ class ShardedRDTTrainerWeightTransferEngine(
     def rejoin(self, replica: int, client: VLLMWeightSyncClient | None = None) -> None:
         """Initialize and plan deployment `replica` (restarted, or replaced by
         `client`) outside any sync, which would otherwise wait on its
-        planning; syncs leave it out until this returns. Sender only.
+        planning; syncs leave it out until this returns. It then stays
+        mid-update, not serving, until the next sync finishes. Sender only.
 
         Raises:
+            RuntimeError: a `rejoin` of it is already running.
             Exception: its init or start failed; the next sync retries it.
 
         """
         with self._state_lock:
+            if self._state.get(replica) == "preparing":
+                raise RuntimeError(f"deployment {replica} is already rejoining")
             if client is not None:
                 self._clients[replica] = client
-            self._preparing.add(replica)
+            self._state[replica] = "preparing"
             client, sync = self._clients[replica], self._round
-        if sync is not None and replica in sync.phase:
-            sync.evict(replica, "rejoining")
+        if sync is not None:
+            sync.leave(replica)
         try:
             timeout = self._init_info.rpc_timeout_s
             _bounded(
@@ -1347,12 +1362,10 @@ class ShardedRDTTrainerWeightTransferEngine(
             _bounded(timeout, client.start_weight_update)
         except BaseException:
             with self._state_lock:
-                self._preparing.discard(replica)
-                self._rejoining.add(replica)
+                self._state[replica] = "init"
             raise
         with self._state_lock:
-            self._preparing.discard(replica)
-            self._rejoining.discard(replica)
+            del self._state[replica]
 
     def _consumers(self, replica: int) -> range:
         per = self._init_info.num_consumers // len(self._clients)
@@ -1603,8 +1616,10 @@ class _SyncRound:
         engine: ShardedRDTTrainerWeightTransferEngine,
         replicas: list[int],
         per_replica: int,
+        reinit: set[int],
     ) -> None:
         self.engine, self.sync_idx = engine, engine._sync_idx
+        self.reinit = reinit  # deployments to initialize again first
         self.per_replica = per_replica
         self.phase = dict.fromkeys(replicas, "init")
         self.updating_since: dict[int, float] = {}
@@ -1623,10 +1638,9 @@ class _SyncRound:
         engine, client = self.engine, self.engine._clients[r]
         update = asdict(ShardedRDTWeightTransferUpdateInfo(sync_idx=self.sync_idx))
         try:
-            if r in engine._rejoining:
+            if r in self.reinit:
                 payload = engine.get_worker_init_payload(r)
                 self._bounded(client.init_weight_transfer_engine, payload)
-                engine._rejoining.discard(r)
             self._enter(r, "start")
             self._bounded(client.start_weight_update)
             self._enter(r, "update")
@@ -1677,7 +1691,8 @@ class _SyncRound:
                 return
             self.phase[r] = "evicting"  # fences its finish
             self.reasons[r] = reason
-            self.engine._rejoining.add(r)
+        with self.engine._state_lock:  # unless `rejoin` already prepares it
+            self.engine._state.setdefault(r, "init")
         logger.warning(
             "[rdt-evict] sync %d: deployment %d: %s", self.sync_idx, r, reason
         )
@@ -1693,6 +1708,14 @@ class _SyncRound:
             failure = self.failure()
         if failure:
             self.engine._fail_producers(failure)
+
+    def leave(self, r: int) -> None:
+        """Take deployment `r` out of this sync for `rejoin`: evict it, or
+        stop counting it as synced if it already finished."""
+        if r in self.phase:
+            self.evict(r, "rejoining")
+            with self._cond:
+                self.synced.discard(r)
 
     def failure(self) -> str | None:
         """Why the sync failed: every deployment was evicted."""

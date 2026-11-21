@@ -398,8 +398,10 @@ def test_a_failed_deployment_is_evicted_and_rejoins(cpu_ipc, monkeypatch, fault)
 
 def test_a_deployment_rejoins_outside_the_sync(cpu_ipc, monkeypatch):
     """While `rejoin` plans deployment 1, a sync leaves it out instead of
-    waiting on it; then it joins with no init inside the sync."""
+    waiting on it; then it joins with no init inside the sync. A rejoin of a
+    deployment that already finished a running sync uncounts it."""
     planning, planned = threading.Event(), threading.Event()
+    hold, release = threading.Event(), threading.Event()
 
     class _Planning(_Deployment):
         def start_weight_update(self):
@@ -408,8 +410,14 @@ def test_a_deployment_rejoins_outside_the_sync(cpu_ipc, monkeypatch):
                 planning.set()
                 planned.wait()
 
+    class _SlowFinish(_Deployment):
+        def finish_weight_update(self, weight_version=None):
+            super().finish_weight_update(weight_version)
+            if hold.is_set():
+                release.wait()
+
     pairs = _pairs(4)
-    clients = [_Deployment(None, 0, len(pairs)), _Planning(None, 1, len(pairs))]
+    clients = [_SlowFinish(None, 0, len(pairs)), _Planning(None, 1, len(pairs))]
     engine, server = _two_deployments(monkeypatch, clients, pairs)
     rejoin = threading.Thread(target=engine.rejoin, args=(1,))
     rejoin.start()
@@ -421,3 +429,14 @@ def test_a_deployment_rejoins_outside_the_sync(cpu_ipc, monkeypatch):
     rejoin.join()
     assert engine.send_weights() == [0, 1]
     assert clients[1].order == ["init", "start", "start", "update", "finish"]
+
+    hold.set()
+    result = []
+    sync = threading.Thread(target=lambda: result.append(engine.send_weights()))
+    sync.start()
+    while engine._round is None or engine._round.phase.get(1) != "done":
+        time.sleep(0.01)
+    engine.rejoin(1)  # e.g. restarted right after it finished
+    release.set()
+    sync.join()
+    assert result == [[0]]
